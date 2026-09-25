@@ -1,0 +1,4 @@
+.regtest/
+__pycache__/
+*.pyc
+.regtest-demo/
