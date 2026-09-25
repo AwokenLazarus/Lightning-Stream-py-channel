@@ -6,8 +6,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 SIGHASH_ALL = 0x01
+SIGHASH_SINGLE = 0x03
+SIGHASH_ANYONECANPAY = 0x80
 UNIFIED_FLAG = 0x20
 SIGHASH_ALL_UNIFIED = 0x21
+SIGHASH_SINGLE_ACP_UNIFIED = 0xA3  # SINGLE | ANYONECANPAY | UNIFIED (fee-input variant)
+
+OP_SHA256, OP_EQUALVERIFY, OP_CHECKSEQUENCEVERIFY = 0xA8, 0x88, 0xB2
 
 # UnifiedSighash script-type domain separator (Knots hf-sighash-opt-in).
 ST_BARE, ST_WITNESS_V0, ST_TAPROOT, ST_TAPSCRIPT = 0, 1, 2, 3

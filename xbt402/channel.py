@@ -20,8 +20,9 @@ from dataclasses import dataclass, asdict
 
 from . import ecc
 from .tx import (OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_DROP, OP_ELSE,
-                 OP_ENDIF, OP_IF, SIGHASH_ALL_UNIFIED, ST_WITNESS_V0, Tx, TxIn, TxOut,
-                 p2wpkh_spk, p2wsh_spk, push, script_num, tagged_hash, unified_sighash)
+                 OP_ENDIF, OP_IF, SIGHASH_ALL_UNIFIED, SIGHASH_SINGLE_ACP_UNIFIED, ST_WITNESS_V0,
+                 Tx, TxIn, TxOut, p2wpkh_script_code, p2wpkh_spk, p2wsh_spk, push, script_num,
+                 tagged_hash, unified_sighash)
 
 DUST = 546            # conservative dust floor for any output we create
 STATE_VSIZE = 190     # 1-in/2-out close: ~113 B base + ~229 B witness -> ~171 vB, plus room for a P2TR change
@@ -137,22 +138,66 @@ class ChannelParams:
         tx.inputs[0].witness = [sig, b"", self.script]
         return tx
 
+    def state_tx_a3(self, amount: int) -> Tx:
+        """Payee-only output: SIGHASH_SINGLE|ANYONECANPAY|UNIFIED (0xA3) lets the payee add fee inputs."""
+        if not DUST <= amount <= self.max_amount:
+            raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
+        return Tx(version=2, inputs=[self._funding_in()],
+                  outputs=[TxOut(amount, bytes.fromhex(self.payee_spk))], locktime=0)
+
+    def sighash_a3(self, tx: Tx) -> bytes:
+        return unified_sighash(tx, [self.funding_prevout()], 0, ST_WITNESS_V0, self.script,
+                               SIGHASH_SINGLE_ACP_UNIFIED)
+
+    def rollover_tx(self, amount: int, next_spk: bytes, next_capacity: int) -> Tx:
+        """Close that pays the payee and funds the next channel from the payer leftover."""
+        if not DUST <= amount <= self.max_amount:
+            raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
+        if next_capacity < DUST:
+            raise ChannelError("bad_amount", "next channel capacity below dust")
+        leftover = self.capacity - amount - next_capacity
+        if leftover < 0:
+            raise ChannelError("bad_amount", "rollover does not leave a non-negative fee")
+        return Tx(version=2, inputs=[self._funding_in()],
+                  outputs=[TxOut(amount, bytes.fromhex(self.payee_spk)),
+                           TxOut(next_capacity, next_spk)], locktime=0)
+
 
 class Payer:
-    """Client side: holds the payer key, signs ever-increasing cumulative amounts."""
+    """Client side: holds the payer key, signs ever-increasing cumulative amounts.
 
-    def __init__(self, params: ChannelParams, secret: int):
-        if ecc.pubkey(secret).hex() != params.payer_pub:
-            raise ChannelError("bad_key", "secret does not match payer_pub")
-        self.params, self.secret = params, secret
+    `backend` (a ChannelSigner) may supply signatures so this object never sees the secret —
+    that is the B2 policy-signer path. Tests still pass a raw `secret`.
+    """
+
+    def __init__(self, params: ChannelParams, secret: int = None, backend=None):
+        self.params, self.secret, self.backend = params, secret, backend
+        if backend is None:
+            if secret is None or ecc.pubkey(secret).hex() != params.payer_pub:
+                raise ChannelError("bad_key", "secret does not match payer_pub")
         self.signed = 0  # highest cumulative amount signed so far
 
     def sign_state(self, amount: int) -> bytes:
         if amount < self.signed:
             raise ChannelError("stale_amount", "never sign a lower cumulative amount")
-        tx = self.params.state_tx(amount)
-        sig = ecc.sign(self.secret, self.params.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
+        if self.backend is not None:
+            sig = self.backend.sign_state(self.params.channel_id, amount)
+            sig = bytes.fromhex(sig) if isinstance(sig, str) else sig
+        else:
+            tx = self.params.state_tx(amount)
+            sig = ecc.sign(self.secret, self.params.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
         self.signed = amount
+        return sig
+
+    def sign_state_a3(self, amount: int) -> bytes:
+        if amount < self.signed:
+            raise ChannelError("stale_amount", "never sign a lower cumulative amount")
+        if self.backend is not None:
+            sig = self.backend.sign_state_a3(self.params.channel_id, amount)
+            sig = bytes.fromhex(sig) if isinstance(sig, str) else sig
+        else:
+            tx = self.params.state_tx_a3(amount)
+            sig = ecc.sign(self.secret, self.params.sighash_a3(tx)) + bytes([SIGHASH_SINGLE_ACP_UNIFIED])
         return sig
 
 
@@ -192,3 +237,42 @@ class Payee:
         mine = ecc.sign(self.secret, self.params.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
         tx.inputs[0].witness = [self.best_sig, mine, b"\x01", self.params.script]
         return tx
+
+    def close_tx_with_fee_input(self, extra_prev: TxOut, extra_in: TxIn, extra_secret: int,
+                                extra_change: bytes, extra_fee: int, sig_a3: bytes) -> Tx:
+        """Complete a 0xA3 state by adding a fee input. Output 0 (payee) stays exactly as signed."""
+        if not sig_a3 or sig_a3[-1] != SIGHASH_SINGLE_ACP_UNIFIED:
+            raise ChannelError("bad_sighash", "fee-input variant needs SIGHASH_SINGLE|ACP|UNIFIED (0xA3)")
+        tx = self.params.state_tx_a3(self.best_amount)
+        tx.inputs.append(extra_in)
+        change = extra_prev.value - extra_fee
+        if change >= DUST:
+            tx.outputs.append(TxOut(change, extra_change))
+        prevouts = [self.params.funding_prevout(), extra_prev]
+        mine = ecc.sign(self.secret, unified_sighash(tx, prevouts, 0, ST_WITNESS_V0,
+                                                     self.params.script, SIGHASH_ALL_UNIFIED))
+        tx.inputs[0].witness = [sig_a3, mine + bytes([SIGHASH_ALL_UNIFIED]), b"\x01", self.params.script]
+        pub = ecc.pubkey(extra_secret)
+        sc = p2wpkh_script_code(pub)
+        h = unified_sighash(tx, prevouts, 1, ST_WITNESS_V0, sc, SIGHASH_ALL_UNIFIED)
+        tx.inputs[1].witness = [ecc.sign(extra_secret, h) + bytes([SIGHASH_ALL_UNIFIED]), pub]
+        return tx
+
+
+def sign_p2wpkh(secret: int, tx: Tx, prevouts, index: int = 0) -> Tx:
+    """Sign input `index` as P2WPKH with 0x21 (CPFP child, extra fee input)."""
+    pub = ecc.pubkey(secret)
+    sc = p2wpkh_script_code(pub)
+    h = unified_sighash(tx, prevouts, index, ST_WITNESS_V0, sc, SIGHASH_ALL_UNIFIED)
+    tx.inputs[index].witness = [ecc.sign(secret, h) + bytes([SIGHASH_ALL_UNIFIED]), pub]
+    return tx
+
+
+def cpfp_child(close_txid: str, vout: int, value: int, payee_spk: bytes, payee_secret: int,
+               fee: int) -> Tx:
+    """Child that spends the payee close output, bumping the parent (CPFP)."""
+    if value - fee < DUST:
+        raise ChannelError("bad_amount", "CPFP fee leaves dust")
+    tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(close_txid)[::-1], vout, 0xFFFFFFFD)],
+            outputs=[TxOut(value - fee, payee_spk)], locktime=0)
+    return sign_p2wpkh(payee_secret, tx, [TxOut(value, payee_spk)])

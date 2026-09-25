@@ -11,9 +11,11 @@ BLOCKS=${XBT402_BLOCKS:-300}
 ARGS=(-regtest -datadir="$DD" -rpcport="$RPCPORT" -port="$P2P" -bind=127.0.0.1 -rpcbind=127.0.0.1
       -rpcallowip=127.0.0.1 -discover=0 -listenonion=0 -upnp=0 -natpmp=0 -dnsseed=0 -fixedseeds=0
       -fallbackfee=0.0002 -txindex=1)
-if ! "$BIN/bitcoind" -version | head -1 | grep -q "Bitcoin Core daemon"; then
-  # RDTS applies from the hardfork until MTP passes -rdtsexpiry; set it a year out so RDTS is on
-  ARGS+=(-testactivationheight=blake2b@101 -blake2b_headline=xbt402 -rdtsexpiry=$(( $(date +%s) + 31536000 )))
+if "$BIN/bitcoind" -version | head -1 | grep -qi knots; then
+  # RDTS on (off on regtest unless -rdtsexpiry is set) + Knots #419 long coinbase maturity
+  ARGS+=(-testactivationheight=blake2b@101 -blake2b_headline=xbt402
+         -rdtsexpiry=$(( $(date +%s) + 31536000 ))
+         -testcoinbasematuritylong=200:200:6680)
 fi
 [ -n "${XBT402_CONNECT:-}" ] && ARGS+=(-connect="127.0.0.1:$XBT402_CONNECT")
 cli() { "$BIN/bitcoin-cli" -regtest -datadir="$DD" -rpcport="$RPCPORT" "$@"; }
@@ -30,6 +32,17 @@ case "${1:-}" in
     cli -named createwallet wallet_name=w load_on_startup=false >/dev/null 2>&1 || cli loadwallet w >/dev/null 2>&1 || true
     if [ "$BLOCKS" -gt 0 ] && [ "$(cli getblockcount)" -lt "$BLOCKS" ]; then
       cli generatetoaddress $((BLOCKS - $(cli getblockcount))) "$(cli -rpcwallet=w getnewaddress)" >/dev/null
+    fi
+    # #419: every coinbase needs 6,480 confirms. Set XBT402_MATURITY_PAD (e.g. 6800) so early
+    # wallet coinbases are spendable. Prefer generatetodescriptor raw(51) (~0.5s/1k).
+    if [ -n "${XBT402_MATURITY_PAD:-}" ] && "$BIN/bitcoind" -version | head -1 | grep -qi knots \
+       && [ "$(cli getblockcount)" -lt "$XBT402_MATURITY_PAD" ]; then
+      NEED=$((XBT402_MATURITY_PAD - $(cli getblockcount)))
+      if cli -rpcwallet=w generatetodescriptor "$NEED" "raw(51)" >/dev/null 2>&1; then
+        :
+      else
+        cli generatetoaddress "$NEED" "$(cli -rpcwallet=w getnewaddress)" >/dev/null
+      fi
     fi
     echo "node up: $("$BIN/bitcoind" -version | head -1 | sed 's/.*version //'), height $(cli getblockcount), rpc $RPCPORT, p2p $P2P, datadir $DD" ;;
   down) cli stop >/dev/null 2>&1 || true

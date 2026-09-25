@@ -25,10 +25,10 @@ from xbt402.tx import (OP_CHECKSIG, OP_ENDIF, OP_IF, ST_TAPROOT, ST_TAPSCRIPT,  
 PRESPLIT_SK = 0x9E5B11  # block 1's coinbase pays P2WPKH(this key): scripts/rules.sh mines it
 
 SAT = 100_000_000
-ROOT = os.environ.get("RULES_ROOT", "$HOME/lazarus-regtest/b1-xbt402")
-A = RPC(29563, f"{ROOT}/rules-a/regtest/.cookie")
-B = RPC(29573, f"{ROOT}/rules-b/regtest/.cookie")
-CORE = RPC(29583, f"{ROOT}/rules-core/regtest/.cookie")
+ROOT = os.environ.get("RULES_ROOT", os.path.expanduser("~/xbt-rnd/xbt-060/run"))
+A = RPC(int(os.environ.get("RULES_A_RPC", "30130")), f"{ROOT}/rules-a/regtest/.cookie")
+B = RPC(int(os.environ.get("RULES_B_RPC", "30132")), f"{ROOT}/rules-b/regtest/.cookie")
+CORE = RPC(int(os.environ.get("RULES_CORE_RPC", "30134")), f"{ROOT}/rules-core/regtest/.cookie")
 W = A.wallet("w")
 failures = []
 

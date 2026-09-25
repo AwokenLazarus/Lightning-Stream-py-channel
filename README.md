@@ -1,26 +1,32 @@
-# xbt402 / `xbt-channel` (P-003 B1): reference library, local only
+# xbt402 / `xbt-channel` (P-003 B1) wave 2
 
 x402 v2 scheme **`xbt-channel`**: HTTP 402 payments for AI agents on XBT over Spillman-style
-unidirectional channels (P2WSH: payee+payer pay path / CLTV refund). Every channel signature is
-`SIGHASH_ALL|UNIFIED` (0x21). Design, wire spec and threat model:
+unidirectional channels. Every channel signature is `SIGHASH_ALL|UNIFIED` (0x21). Spec:
 `~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment channels.md`.
 
-**No remote. Never push.** `xbt402/ecc.py` / `schnorr.py` are pure-Python prototypes (not constant time).
+**No remote. Never push.** Branch `wave2`. Keys for paid calls live in `ChannelSigner` (B2 hooks
+the same method names). `ecc.py` is libsecp256k1 via `coincurve`; `ecc_oracle.py` is the
+pure-Python test oracle.
 
 | Path | What |
 |---|---|
-| `xbt402/tx.py` | tx (de)serialization, scripts, bech32, `unified_sighash` (Knots hf-sighash-opt-in port), BIP143 (tests) |
-| `xbt402/ecc.py`, `schnorr.py` | secp256k1 ECDSA (RFC 6979, low-S, Jacobian), BIP340/341 helpers |
-| `xbt402/channel.py` | funding script, per-channel payee key from `payTo`, deterministic states, `Payer`, `Payee`, refund |
-| `xbt402/funding.py` | provider funding checks (script, capacity, expiry window, confs, **no coinbase funding**) |
-| `xbt402/x402_channel.py` | x402 v2 `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`, provider middleware, client SDK |
-| `tests/test_*.py` | 166 UnifiedSighash vectors, offline channel rules |
-| `tests/regtest_rules.py` + `scripts/rules.sh` | chain-rule experiment: Knots 29.4.2 A+B (RDTS on) + Core 29.0 |
-| `tests/regtest_channel.py` | older lifecycle test (run against `scripts/node.sh up`) |
-| `demo.sh` | all of the above, then 1,000 paid calls + close + refund-after-expiry (`scripts/demo_run.py`) |
+| `xbt402/ecc.py` | coincurve backend (`BACKEND`); oracle in `ecc_oracle.py` |
+| `xbt402/ledger.py` | SQLite WAL, one row per channel |
+| `xbt402/channel.py` | states, 0xA3 fee-input variant, rollover tx, CPFP child |
+| `xbt402/conditional.py` | hash-locked increment (XBT-055 / B4) |
+| `xbt402/watcher.py` | `close_due()` loop + CPFP |
+| `xbt402/asgi.py` | Starlette app / middleware |
+| `xbt402/client_httpx.py` | httpx transport |
+| `xbt402/signer.py` | ChannelSigner (secrets never leave) + B2 socket adapter |
+| `xbt402/mcp_server.py` | `xbt402_pay`, `xbt_channels`, `xbt_close`, `xbt_refunds_due` |
+| `xbt402/x402_channel.py` | provider + SDK (facilitator `/verify` `/settle` `/supported`) |
+| `demo.sh` | units + chain rules + 1,000 calls + conditional + MCP + close + refund |
 
-Nodes live under `~/lazarus-regtest/b1-xbt402/` (binaries `knots-29.4.2/`, `core-29.0/`; datadirs wiped
-on exit), on ports 29553-29584 and http 29402-29403, never the shared `:18443` rig. No miners are started:
-blocks come from `generatetoaddress`.
+Ports **30100–30199**, datadirs under `~/xbt-rnd/xbt-060/run/`. Isolated Knots 29.4.2 with RDTS
+and `#419` (`-testcoinbasematuritylong=200:200:6680`). No miners.
 
-verify: `cd ~/xbt-rnd/b1 && ./demo.sh && python3 ~/lazarus-regtest/killminer.py | grep -q 'killed nothing'`
+verify: `cd ~/xbt-rnd/b1 && ./demo.sh && python3 ~/xbt-rnd/tools/miners_left.py 30100-30199`
+
+B2 (XBT-062) should implement these signer methods: `xbt402_new_key`, `xbt402_attach`,
+`xbt402_sign_state`, `xbt402_sign_state_a3`, `xbt402_sign_close`, `xbt402_sign_refund`,
+`xbt402_fund`, `xbt402_channels`. Wrap with `SignerSocketAdapter`.

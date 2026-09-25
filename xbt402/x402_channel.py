@@ -34,6 +34,7 @@ from typing import Callable, Dict, Optional
 from . import ecc
 from .channel import DUST, ChannelError, ChannelParams, Payee, Payer, channel_payee_secret
 from .funding import FundingPolicy, check_funding
+from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
 SCHEME = "xbt-channel"
@@ -66,33 +67,42 @@ def network_id(first_blake2b_block_hash: str) -> str:
 
 
 # --- provider ---------------------------------------------------------------------------------
-@dataclass
-class ChannelState:
-    params: ChannelParams
-    best_cum: int = 0
-    best_sig: str = ""
-    seq: int = 0
-    spent_msat: int = 0
-    closed_txid: str = ""
+class RefundCustody:
+    """Store refunds at open; broadcast any whose expiry has been reached."""
 
-
-class Ledger:
-    """Latest (cum, sig) per channel, written atomically before a call is served. Prototype: one
-    JSON file. Production: a DB row per channel (SQLite WAL / Postgres), keys in the B2 signer."""
-
-    def __init__(self, path: str):
-        self.path, self.lock = path, threading.Lock()
-        self.channels: Dict[str, ChannelState] = {}
+    def __init__(self, path: str, broadcast: Callable[[str], str] = None):
+        self.path, self.broadcast, self.lock = path, broadcast, threading.Lock()
+        self.items = []
         if os.path.exists(path):
             with open(path) as f:
-                for cid, d in json.load(f).items():
-                    d["params"] = ChannelParams(**d["params"])
-                    self.channels[cid] = ChannelState(**d)
+                self.items = json.load(f)
 
-    def save(self):
+    def add(self, refund_hex: str, expiry: int, chan: str = ""):
+        with self.lock:
+            self.items.append({"hex": refund_hex, "expiry": expiry, "chan": chan, "txid": "", "done": False})
+            self._save()
+
+    def due(self, height: int) -> list:
+        out = []
+        with self.lock:
+            for it in self.items:
+                if it["done"] or height < it["expiry"]:
+                    continue
+                if not self.broadcast:
+                    continue
+                try:
+                    it["txid"] = self.broadcast(it["hex"])
+                    it["done"] = True
+                    out.append({"chan": it["chan"], "txid": it["txid"], "expiry": it["expiry"]})
+                except Exception as e:
+                    it["error"] = str(e)
+            self._save()
+        return out
+
+    def _save(self):
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({c: {**asdict(s), "params": s.params.to_dict()} for c, s in self.channels.items()}, f)
+            json.dump(self.items, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
@@ -206,8 +216,55 @@ class XbtChannelProvider:
                     out.append(self._close_locked(st))
         return out
 
+    def cpfp(self, close_txid: str, fee: int) -> str:
+        from .watcher import cpfp_from_close
+        with self.ledger.lock:
+            st = next((s for s in self.ledger.channels.values() if s.closed_txid == close_txid), None)
+            if not st:
+                raise ChannelError("unknown_channel", "no channel closed with that txid")
+            secret = channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry)
+        return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee)
+
+    def supported(self) -> dict:
+        return {"kinds": [{"scheme": SCHEME, "network": self.network}]}
+
+    def facilitator_verify(self, req: dict) -> dict:
+        pl = req.get("payload") or req
+        with self.ledger.lock:
+            st = self.ledger.channels.get(pl.get("chan", ""))
+            if not st:
+                raise ChannelError("unknown_channel")
+            self._apply(st, pl)
+            return {"valid": True, "chan": st.params.channel_id, "cum": str(st.best_cum)}
+
+    def facilitator_settle(self, req: dict) -> dict:
+        return self.close(req)
+
+    def offer_conditional(self, path: str, price: int, plaintext: bytes):
+        """Prepare a hash-locked deliverable for `path`. Returns (H, ciphertext, k)."""
+        k = os.urandom(32)
+        from .conditional import encrypt, sha256
+        h = sha256(k)
+        self._cond = getattr(self, "_cond", {})
+        self._cond[path] = {"k": k, "h": h, "price": price, "cipher": encrypt(plaintext, k),
+                            "plain": plaintext}
+        return h, self._cond[path]["cipher"], k
+
     # paid requests ----------------------------------------------------------------------
     def serve(self, method: str, path: str, headers: dict, body: bytes, url: str = ""):
+        if path in ("/x402/supported", "/verify", "/settle", "/supported"):
+            try:
+                if path.endswith("supported") and method == "GET":
+                    return 200, {"Content-Type": "application/json"}, json.dumps(self.supported()).encode()
+                if path.endswith("verify") and method == "POST":
+                    return 200, {"Content-Type": "application/json"}, json.dumps(
+                        self.facilitator_verify(json.loads(body))).encode()
+                if path.endswith("settle") and method == "POST":
+                    return 200, {"Content-Type": "application/json"}, json.dumps(
+                        self.facilitator_settle(json.loads(body))).encode()
+            except (ChannelError, KeyError, ValueError) as e:
+                return 400, {"Content-Type": "application/json"}, json.dumps(
+                    {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
         if path.startswith("/x402/xbt-channel/"):
             action = {"/x402/xbt-channel/open": self.open, "/x402/xbt-channel/close": self.close}.get(path)
             if not action or method != "POST":
@@ -220,8 +277,20 @@ class XbtChannelProvider:
         url = url or path
         price = self.price(method, path)
         hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
+        cond_offers = getattr(self, "_cond", {})
+        path_key = path.split("?", 1)[0]
         if not hdr:
-            return self._payment_required(url, price, "payment_required")
+            status, h, b = self._payment_required(url, price, "payment_required")
+            if path_key in cond_offers:
+                offer = json.loads(b)
+                offer["accepts"][0]["extra"]["conditional"] = {
+                    "hash": cond_offers[path_key]["h"].hex(), "amount": str(cond_offers[path_key]["price"]),
+                    "csvDelta": 10,
+                }
+                body_out = json.dumps(offer).encode()
+                h["PAYMENT-REQUIRED"] = b64json(offer)
+                return 402, h, body_out
+            return status, h, b
         try:
             pp = unb64json(hdr)
             acc, pl = pp["accepted"], pp["payload"]
@@ -237,18 +306,40 @@ class XbtChannelProvider:
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
                 return self._payment_required(url, price, "channel_closing", st)
             try:
-                self._apply(st, pl)
+                if not pl.get("hashlock"):
+                    self._apply(st, pl)
             except (ChannelError, ValueError) as e:
                 return self._payment_required(url, price, getattr(e, "code", "bad_payload"), st)
-            paid = st.best_cum * 1000
-            need = st.spent_msat + (price * 1000 if self.billing == "prepay" else 0)
-            if paid < need:
-                return self._payment_required(url, price, "insufficient_payment", st)
+            if pl.get("hashlock") and path_key in cond_offers:
+                from .conditional import ConditionalParams
+                offer = cond_offers[path_key]
+                if bytes.fromhex(pl["hashlock"]) != offer["h"]:
+                    return self._payment_required(url, price, "bad_hashlock", st)
+                cond = ConditionalParams(st.params, offer["h"], offer["price"])
+                uncond = st.best_cum
+                tx = cond.state_tx(uncond)
+                sig = bytes.fromhex(pl["sig"])
+                if sig[-1] != 0x21 or not ecc.verify(bytes.fromhex(st.params.payer_pub),
+                                                     cond.sighash(tx), sig[:-1]):
+                    return self._payment_required(url, price, "bad_sig", st)
+                st.cond_hash, st.cond_amount, st.cond_sig = offer["h"].hex(), offer["price"], pl["sig"]
+                price = offer["price"]
+            else:
+                paid = st.best_cum * 1000
+                need = st.spent_msat + (price * 1000 if self.billing == "prepay" else 0)
+                if paid < need:
+                    return self._payment_required(url, price, "insufficient_payment", st)
             if st.spent_msat + price * 1000 > st.params.max_amount * 1000:
                 return self._payment_required(url, price, "channel_exhausted", st)
             st.spent_msat += price * 1000        # reserve the max; refunded below if metered lower
             self.ledger.save()
         status, hdrs, out = self.handler(method, path, body)
+        if path_key in getattr(self, "_cond", {}) and pl.get("hashlock"):
+            offer = self._cond[path_key]
+            out = json.dumps({"cipher": offer["cipher"].hex(), "preimage": offer["k"].hex(),
+                              "hash": offer["h"].hex()}).encode()
+            hdrs = {"Content-Type": "application/json"}
+            status = 200
         charged = price
         if self.charge:
             charged = max(0, min(price, int(self.charge(method, path, status, out))))
@@ -309,16 +400,23 @@ class ClientChannel:
 
 class XbtChannelClient:
     """Payer SDK. `fund(address, sats) -> (txid, vout)` is the only wallet hook: in production it is
-    the B2 agent-wallet MCP (policy-checked, 0x21-signed), so the SDK never holds funding keys. The
-    per-channel payer key is created here; `on_refund(hex, expiry)` hands the refund to the wallet."""
+    the B2 agent-wallet MCP (policy-checked, 0x21-signed), so the SDK never holds funding keys.
+
+    When `signer` is set (ChannelSigner / B2 socket), per-channel payer keys live there and this
+    object never sees them. `refunds` is optional RefundCustody (broadcast after expiry).
+    Budgets: per-call (`max_price`), per-channel (`capacity`), per-day (`daily_budget`).
+    """
 
     def __init__(self, network: str, fund: Callable[[str, int], tuple], height: Callable[[], int],
                  capacity=200_000, expiry_blocks=1_008, max_price=1_000, max_close_fee=2_000,
-                 budget_sats=1_000_000, on_open: Callable = None, on_refund: Callable = None):
+                 budget_sats=1_000_000, on_open: Callable = None, on_refund: Callable = None,
+                 signer=None, refunds: RefundCustody = None, daily_budget=0):
         self.network, self.fund, self.height = network, fund, height
         self.capacity, self.expiry_blocks, self.max_price = capacity, expiry_blocks, max_price
         self.max_close_fee, self.budget_sats = max_close_fee, budget_sats
         self.on_open, self.on_refund = on_open, on_refund
+        self.signer, self.refunds = signer, refunds
+        self.daily_budget, self.day_spent, self.day_start = daily_budget, 0, time.time()
         self.channels: Dict[str, ClientChannel] = {}
         self.opened_sats = 0
 
@@ -353,14 +451,29 @@ class XbtChannelClient:
         cap = max(self.capacity, int(ex["minCapacity"]))
         if cap > int(ex.get("maxCapacity", cap)) or self.opened_sats + cap > self.budget_sats:
             raise ChannelError("budget", "channel capacity outside provider range or our budget")
-        secret = secrets.randbelow(ecc.N - 1) + 1
+        if self.signer:
+            pub = self.signer.new_key(origin)
+            secret = None
+        else:
+            secret = secrets.randbelow(ecc.N - 1) + 1
+            pub = ecc.pubkey(secret).hex()
         blocks = min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
         expiry = self.height() + blocks
-        p = ChannelParams.derive(acc["payTo"], ecc.pubkey(secret).hex(), expiry, int(ex["closeFeeSat"]))
-        txid, vout = self.fund(segwit_address(self.hrp_for(), p.spk), cap)
+        p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]))
+        fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
+        txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
         self.opened_sats += cap
-        ch = ClientChannel(Payer(p, secret), origin, acc, refund_hex=p.refund_tx(secret).hex())
+        if self.signer:
+            self.signer.attach(origin, p)
+            refund_hex = self.signer.sign_refund(p.channel_id)
+            payer = Payer(p, backend=self.signer)
+        else:
+            refund_hex = p.refund_tx(secret).hex()
+            payer = Payer(p, secret)
+        ch = ClientChannel(payer, origin, acc, refund_hex=refund_hex)
+        if self.refunds:
+            self.refunds.add(ch.refund_hex, expiry, p.channel_id)
         if self.on_refund:
             self.on_refund(ch.refund_hex, expiry)
         if self.on_open:
@@ -379,12 +492,22 @@ class XbtChannelClient:
         cum = max(-(-need_msat // 1000), ch.payer.signed)
         if 0 < cum < DUST:
             cum = DUST
+        if self.daily_budget and time.time() - self.day_start > 86400:
+            self.day_spent, self.day_start = 0, time.time()
+        if self.daily_budget and self.day_spent + cum - ch.payer.signed > self.daily_budget:
+            raise ChannelError("budget", "daily budget exhausted")
+        remaining = ch.payer.params.max_amount - max(ch.payer.signed, ch.spent_msat // 1000)
+        if remaining < price and ch.payer.signed:
+            self._rollover(ch)
+            remaining = ch.payer.params.max_amount - ch.payer.signed
         ch.seq += 1
         pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(cum)}
         if cum > ch.payer.signed:
             if cum > ch.payer.params.max_amount:
                 raise ChannelError("exhausted", "channel capacity used up: close and reopen")
+            delta = cum - ch.payer.signed
             pl["sig"] = ch.payer.sign_state(cum).hex()
+            self.day_spent += max(0, delta)
         return pl
 
     def request(self, method: str, url: str, body: bytes = b""):
@@ -420,9 +543,13 @@ class XbtChannelClient:
             raise ChannelError("bad_receipt", "receipt is for another request")
         if not ecc.verify(bytes.fromhex(ch.payer.params.payee_pub), receipt_message(r), bytes.fromhex(r["sig"])):
             raise ChannelError("bad_receipt", "receipt not signed by the channel payee key")
-        if int(r["cum"]) > ch.payer.signed or int(r["charged"]) > int(ch.accepted["amount"]):
+        quote = int(ch.accepted["amount"])
+        cond = (ch.accepted.get("extra") or {}).get("conditional") or {}
+        if cond.get("amount"):
+            quote = max(quote, int(cond["amount"]))
+        if int(r["cum"]) > ch.payer.signed or int(r["charged"]) > quote:
             raise ChannelError("bad_receipt", "provider claims more than we signed or were quoted")
-        if int(r["spentMsat"]) - ch.spent_msat > int(ch.accepted["amount"]) * 1000:
+        if int(r["spentMsat"]) - ch.spent_msat > quote * 1000:
             raise ChannelError("bad_receipt", "provider charged more than one call")
         ch.spent_msat = int(r["spentMsat"])
         ch.receipts.append(r)
@@ -431,6 +558,76 @@ class XbtChannelClient:
         """Cooperative close; in postpay the final state pays exactly what is owed."""
         ch = self.channels[origin]
         pl = self._payload(ch, 0)
-        sig = ecc.sign(ch.payer.secret, close_message(ch.payer.params.channel_id)).hex()
+        if self.signer:
+            sig = self.signer.sign_close(ch.payer.params.channel_id)
+        else:
+            sig = ecc.sign(ch.payer.secret, close_message(ch.payer.params.channel_id)).hex()
         return self._post(origin + ch.accepted["extra"]["closeUrl"],
                           {"chan": ch.payer.params.channel_id, "sig": sig, "payload": pl})
+
+    def _rollover(self, ch: ClientChannel):
+        """Close whose payer output is the next channel's funding. Needs a live signer or secret."""
+        origin, acc, ex = ch.origin, ch.accepted, ch.accepted["extra"]
+        owed = max(ch.spent_msat // 1000, ch.payer.signed)
+        if owed < DUST:
+            owed = DUST
+        if self.signer:
+            pub = self.signer.new_key(origin + "/next")
+        else:
+            secret2 = secrets.randbelow(ecc.N - 1) + 1
+            pub = ecc.pubkey(secret2).hex()
+        expiry = self.height() + min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
+                                     int(ex["maxExpiryBlocks"]) - 1)
+        nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]))
+        next_cap = min(self.capacity, ch.payer.params.capacity - owed - ch.payer.params.close_fee)
+        if next_cap < int(ex["minCapacity"]):
+            raise ChannelError("exhausted", "not enough leftover to roll into a new channel")
+        tx = ch.payer.params.rollover_tx(owed, nxt.spk, next_cap)
+        # Treat rollover as a cooperative close of the old channel, then register the new one
+        # after the close confirms. The demo exercises this offline; live path uses close().
+        raise ChannelError("exhausted", "channel low: close and reopen (rollover tx built)")
+
+    def request_conditional(self, method: str, url: str, body: bytes = b""):
+        """Pay-on-preimage: sign a hash-locked increment, receive cipher+k, upgrade if k checks."""
+        from .conditional import ConditionalParams, decrypt, sha256
+        origin = "/".join(url.split("/")[:3])
+        path = "/" + "/".join(url.split("/")[3:])
+        ch = self.channels.get(origin)
+        status, rh, out = self.http(method, url, body)
+        if status != 402:
+            raise ChannelError("bad_offer", "expected a 402 with a hashlock")
+        pr = unb64json(rh["PAYMENT-REQUIRED"])
+        acc = self._pick(pr)
+        ch.accepted = acc
+        extra = acc["extra"].get("conditional") or {}
+        if not extra.get("hash"):
+            raise ChannelError("bad_offer", "no conditional hashlock in the 402")
+        if not ch:
+            ch = self._open(origin, acc)
+            self.channels[origin] = ch
+        h = bytes.fromhex(extra["hash"])
+        cond_amt = int(extra["amount"])
+        cond = ConditionalParams(ch.payer.params, h, cond_amt, int(extra.get("csvDelta", 10)))
+        uncond = ch.payer.signed
+        tx = cond.state_tx(uncond)
+        if self.signer:
+            sig = self.signer.sign_conditional(ch.payer.params.channel_id, uncond, cond)
+        else:
+            sig = (ecc.sign(ch.payer.secret, cond.sighash(tx)) + bytes([0x21])).hex()
+        ch.seq += 1
+        pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(uncond),
+              "hashlock": extra["hash"], "sig": sig}
+        hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": pl})}
+        status, rh, out = self.http(method, url, body, hdrs)
+        data = json.loads(out)
+        k = bytes.fromhex(data["preimage"])
+        if sha256(k) != h:
+            raise ChannelError("bad_preimage", "provider preimage does not match H")
+        plain = decrypt(bytes.fromhex(data["cipher"]), k)
+        # upgrade: fold the increment into an unconditional state
+        new_cum = max(uncond + cond_amt, DUST)
+        if new_cum > ch.payer.signed:
+            ch.payer.sign_state(new_cum)
+        if "PAYMENT-RESPONSE" in rh:
+            self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body)
+        return status, rh, out, plain
