@@ -20,7 +20,7 @@ unidirectional channels (P2WSH: payee+payer pay path / CLTV refund). Every chann
 | `demo.sh` | all of the above, then 1,000 paid calls + close + refund-after-expiry (`scripts/demo_run.py`) |
 
 Nodes live under `~/lazarus-regtest/b1-xbt402/` (binaries `knots-29.4.2/`, `core-29.0/`; datadirs wiped
-on exit), on ports 19553-19584 and http 19402-19403, never the shared `:18443` rig. No miners are started:
+on exit), on ports 29553-29584 and http 29402-29403, never the shared `:18443` rig. No miners are started:
 blocks come from `generatetoaddress`.
 
 verify: `cd ~/xbt-rnd/b1 && ./demo.sh && python3 ~/lazarus-regtest/killminer.py | grep -q 'killed nothing'`

@@ -26,9 +26,9 @@ PRESPLIT_SK = 0x9E5B11  # block 1's coinbase pays P2WPKH(this key): scripts/rule
 
 SAT = 100_000_000
 ROOT = os.environ.get("RULES_ROOT", "$HOME/lazarus-regtest/b1-xbt402")
-A = RPC(19563, f"{ROOT}/rules-a/regtest/.cookie")
-B = RPC(19573, f"{ROOT}/rules-b/regtest/.cookie")
-CORE = RPC(19583, f"{ROOT}/rules-core/regtest/.cookie")
+A = RPC(29563, f"{ROOT}/rules-a/regtest/.cookie")
+B = RPC(29573, f"{ROOT}/rules-b/regtest/.cookie")
+CORE = RPC(29583, f"{ROOT}/rules-core/regtest/.cookie")
 W = A.wallet("w")
 failures = []
 

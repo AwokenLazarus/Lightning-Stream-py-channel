@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 R=$HOME/lazarus-regtest/b1-xbt402
-export XBT_BIN=$R/knots-29.4.2 XBT402_DATADIR=$R/demo XBT402_RPCPORT=19553 XBT402_P2PPORT=19554 XBT402_HTTP_PORT=19402
+export XBT_BIN=$R/knots-29.4.2 XBT402_DATADIR=$R/demo XBT402_RPCPORT=29553 XBT402_P2PPORT=29554 XBT402_HTTP_PORT=29402
 cleanup() { scripts/node.sh wipe >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
