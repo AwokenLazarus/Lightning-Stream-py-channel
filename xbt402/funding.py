@@ -15,6 +15,11 @@ class FundingPolicy:
     close_margin: int = 36            # payee closes this many blocks before expiry
     min_conf: int = 1
     zero_conf_max: int = 0            # accept unconfirmed funding up to this capacity (0 = never)
+    large_capacity: int = 1_000_000   # above this a funding reorg is worth more to an attacker,
+    large_min_conf: int = 3           # so wait for more confirmations
+
+    def conf_for(self, capacity: int) -> int:
+        return max(self.min_conf, self.large_min_conf) if capacity > self.large_capacity else self.min_conf
 
 
 def check_funding(rpc, p: ChannelParams, pol: FundingPolicy) -> int:
@@ -44,6 +49,7 @@ def check_funding(rpc, p: ChannelParams, pol: FundingPolicy) -> int:
         raise ChannelError("bad_expiry", f"{left} blocks to expiry, need "
                                          f"[{pol.min_expiry_blocks}, {pol.max_expiry_blocks}]")
     confs = raw.get("confirmations", 0)
-    if confs < pol.min_conf and p.capacity > pol.zero_conf_max:
-        raise ChannelError("unconfirmed", f"{confs} confirmations, need {pol.min_conf}")
+    need = pol.conf_for(p.capacity)
+    if confs < need and p.capacity > pol.zero_conf_max:
+        raise ChannelError("unconfirmed", f"{confs} confirmations, need {need}")
     return confs

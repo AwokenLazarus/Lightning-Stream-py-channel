@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -207,18 +208,50 @@ class XbtChannelProvider:
 
     def _close_locked(self, st: ChannelState) -> str:
         if not st.closed_txid:
-            st.closed_txid = self.rpc.sendrawtransaction(self._payee(st).close_tx().hex())
+            try:
+                st.closed_txid = self.rpc.sendrawtransaction(self._payee(st).close_tx().hex())
+            except ChannelError:
+                raise
+            except Exception as e:  # noqa: BLE001 - node errors become protocol errors
+                raise ChannelError("close_failed", str(e))
             self.ledger.save()
         return st.closed_txid
 
+    def _watch_one(self, st: ChannelState, h: int, out: list):
+        p = st.params
+        if st.closed_txid:
+            # funding still unspent even counting the mempool: the close was evicted, send it again
+            if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+                self.rpc.sendrawtransaction(self._payee(st).close_tx().hex())
+            return
+        utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
+        st.suspended = utxo is None or utxo.get("confirmations", 0) < self.policy.conf_for(p.capacity)
+        if st.best_sig and h >= p.expiry - self.close_margin:
+            out.append(self._close_locked(st))
+
     def close_due(self) -> list:
-        """Watcher tick (every block): close channels that reached expiry - closeMarginBlocks."""
+        """Watcher tick (every block), channel by channel so that one failing channel never stops
+        the rest: suspend channels whose funding left the chain, close channels that reached
+        expiry - closeMarginBlocks, rebroadcast closes that fell out of the mempool."""
         h, out = self.rpc.getblockcount(), []
         with self.ledger.lock:
-            for st in self.ledger.channels.values():
-                if not st.closed_txid and st.best_sig and h >= st.params.expiry - self.close_margin:
-                    out.append(self._close_locked(st))
+            for st in list(self.ledger.channels.values()):
+                try:
+                    self._watch_one(st, h, out)
+                    st.close_error = ""
+                except Exception as e:  # noqa: BLE001 - isolate every channel
+                    st.close_error = str(e) if isinstance(e, ChannelError) else f"{type(e).__name__}: {e}"
+                    sys.stderr.write(f"xbt402 watcher: {st.params.channel_id}: {st.close_error}\n")
+            self.ledger.save()
         return out
+
+    def watch(self, interval: float = 30.0, cpfp_fee: int = 0):
+        """Start a watcher.Watcher on this provider (a daemon thread that never dies on an error):
+        without one every payer's refund beats the provider's close."""
+        from .watcher import Watcher
+        w = Watcher(self, interval=interval, cpfp_fee=cpfp_fee)
+        w.start()
+        return w
 
     def cpfp(self, close_txid: str, fee: int) -> str:
         from .watcher import cpfp_from_close
@@ -312,6 +345,8 @@ class XbtChannelProvider:
                 return self._payment_required(url, price, "unknown_channel")
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
                 return self._payment_required(url, price, "channel_closing", st)
+            if st.suspended:
+                return self._payment_required(url, price, "unconfirmed", st)
             try:
                 if not pl.get("hashlock"):
                     self._apply(st, pl)

@@ -20,6 +20,12 @@ class ChannelState:
     cond_amount: int = 0
     cond_sig: str = ""
     extra: dict = field(default_factory=dict)
+    suspended: bool = False     # the watcher saw the funding leave the chain (reorg): serve nothing
+    close_error: str = ""       # last watcher error for this channel, retried every tick
+
+
+COLUMNS = ("chan", "params_json", "best_cum", "best_sig", "seq", "spent_msat", "closed_txid", "best_sig_a3",
+           "cond_hash", "cond_amount", "cond_sig", "extra_json", "suspended", "close_error")
 
 
 class Ledger:
@@ -46,19 +52,25 @@ class Ledger:
                 cond_hash TEXT NOT NULL DEFAULT '',
                 cond_amount INTEGER NOT NULL DEFAULT 0,
                 cond_sig TEXT NOT NULL DEFAULT '',
-                extra_json TEXT NOT NULL DEFAULT '{}'
+                extra_json TEXT NOT NULL DEFAULT '{}',
+                suspended INTEGER NOT NULL DEFAULT 0,
+                close_error TEXT NOT NULL DEFAULT ''
             )"""
         )
+        have = {r[1] for r in self._db.execute("PRAGMA table_info(channels)")}
+        for col, decl in (("suspended", "INTEGER NOT NULL DEFAULT 0"), ("close_error", "TEXT NOT NULL DEFAULT ''")):
+            if col not in have:   # a wave-2 ledger from before XBT-061
+                self._db.execute(f"ALTER TABLE channels ADD COLUMN {col} {decl}")
         self._load()
 
     def _load(self):
-        for row in self._db.execute("SELECT * FROM channels"):
+        for row in self._db.execute(f"SELECT {', '.join(COLUMNS)} FROM channels"):
             (chan, params_json, best_cum, best_sig, seq, spent_msat, closed_txid,
-             best_sig_a3, cond_hash, cond_amount, cond_sig, extra_json) = row
+             best_sig_a3, cond_hash, cond_amount, cond_sig, extra_json, suspended, close_error) = row
             st = ChannelState(
                 ChannelParams(**json.loads(params_json)), best_cum, best_sig, seq, spent_msat,
                 closed_txid, best_sig_a3, cond_hash, cond_amount, cond_sig,
-                json.loads(extra_json or "{}"),
+                json.loads(extra_json or "{}"), bool(suspended), close_error,
             )
             self.channels[chan] = st
 
@@ -70,17 +82,19 @@ class Ledger:
             for chan, st in self.channels.items():
                 cur.execute(
                     """INSERT INTO channels(chan, params_json, best_cum, best_sig, seq, spent_msat,
-                       closed_txid, best_sig_a3, cond_hash, cond_amount, cond_sig, extra_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       closed_txid, best_sig_a3, cond_hash, cond_amount, cond_sig, extra_json,
+                       suspended, close_error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(chan) DO UPDATE SET
                          params_json=excluded.params_json, best_cum=excluded.best_cum,
                          best_sig=excluded.best_sig, seq=excluded.seq, spent_msat=excluded.spent_msat,
                          closed_txid=excluded.closed_txid, best_sig_a3=excluded.best_sig_a3,
                          cond_hash=excluded.cond_hash, cond_amount=excluded.cond_amount,
-                         cond_sig=excluded.cond_sig, extra_json=excluded.extra_json""",
+                         cond_sig=excluded.cond_sig, extra_json=excluded.extra_json,
+                         suspended=excluded.suspended, close_error=excluded.close_error""",
                     (chan, json.dumps(st.params.to_dict()), st.best_cum, st.best_sig, st.seq,
                      st.spent_msat, st.closed_txid, st.best_sig_a3, st.cond_hash, st.cond_amount,
-                     st.cond_sig, json.dumps(st.extra or {})),
+                     st.cond_sig, json.dumps(st.extra or {}), int(st.suspended), st.close_error),
                 )
             cur.execute("COMMIT")
         except Exception:

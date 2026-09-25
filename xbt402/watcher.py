@@ -1,4 +1,5 @@
 """close_due() loop plus CPFP from the payee close output."""
+import sys
 import threading
 import time
 
@@ -39,8 +40,8 @@ class Watcher:
         while not self._stop.wait(self.interval):
             try:
                 self.tick()
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - a dead watcher lets every refund beat the close
+                sys.stderr.write(f"xbt402 watcher: {type(e).__name__}: {e}\n")
 
     def stop(self):
         self._stop.set()
