@@ -208,6 +208,14 @@ def v11(name):
     return base(name, V11, "xbt402v11")
 
 
+V11R1 = "075a8a7"    # v1.1 after its first review's fixes, before the L13 fix
+
+
+def v11r1(name):
+    """Import xbt402v11r1.<name>: v1.1 with the first review's fixes (075a8a7), before L13's."""
+    return base(name, V11R1, "xbt402v11r1")
+
+
 def load(name):
     """Import xbt402.<name> from the tree under test (wave2-hardened)."""
     import importlib

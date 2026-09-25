@@ -104,8 +104,10 @@ def channel_payee_pub(network: str, pay_to: bytes, payer_pub: bytes, expiry: int
     return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
 
 
-def channel_payee_secret(network: str, pay_to_secret: int, payer_pub: bytes, expiry: int) -> int:
-    return (pay_to_secret + _payee_tweak(network, ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
+def channel_payee_secret(network: str, pay_to_secret: int, payer_pub: bytes, expiry: int,
+                         pay_to: bytes = None) -> int:
+    """`pay_to` (= pubkey(pay_to_secret)), when the caller has it, saves an EC multiplication."""
+    return (pay_to_secret + _payee_tweak(network, pay_to or ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
 
 
 def channel_auth_key(secret: int, other_pub: bytes) -> bytes:

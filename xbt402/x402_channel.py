@@ -31,6 +31,7 @@ v2 facilitator shapes.
           only under /x402/, so a paid API keeps its own /verify, /settle and /supported routes
 """
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -193,6 +194,8 @@ class XbtChannelProvider:
             raise ValueError("billing is postpay or prepay")
         self.rpc, self.secret, self.network = rpc, pay_to_secret, network
         self.pay_to = ecc.pubkey(pay_to_secret).hex()
+        self._pay_to_bytes = bytes.fromhex(self.pay_to)
+        self._payees: Dict[str, Payee] = {}     # per channel: its secret and params, derived once (L13)
         self.ledger, self.price, self.handler, self.charge = Ledger(ledger_path), price, handler, charge
         self.billing, self.close_fee, self.close_margin, self.hrp = billing, close_fee, close_margin, hrp
         self.claim_fee = claim_fee      # sats the hash-lock claim pays out of condAmount (M6)
@@ -250,12 +253,30 @@ class XbtChannelProvider:
     def _chan_secret(self, p: ChannelParams) -> int:
         """The channel payee secret p = payTo_secret + t, t committing to this provider's network (M2).
         It never leaves the provider: one leaked p gives payTo_secret."""
-        return channel_payee_secret(self.network, self.secret, bytes.fromhex(p.payer_pub), p.expiry)
+        return self._channel_payee(p).secret
+
+    def _channel_payee(self, p: ChannelParams) -> Payee:
+        """The channel's Payee with no state, derived once per channel and then only read (its
+        verify_state is pure), so a signature check needs neither the ledger lock nor the two EC
+        multiplications the derivation costs (L13)."""
+        payee = self._payees.get(p.channel_id)
+        if payee is None:
+            payee = Payee(p, channel_payee_secret(self.network, self.secret, bytes.fromhex(p.payer_pub),
+                                                  p.expiry, pay_to=self._pay_to_bytes))
+            self._payees[p.channel_id] = payee
+        return payee
 
     def _payee(self, st: ChannelState) -> Payee:
-        payee = Payee(st.params, self._chan_secret(st.params))
+        payee = copy.copy(self._channel_payee(st.params))
         payee.best_amount, payee.best_sig = st.best_cum, bytes.fromhex(st.best_sig) if st.best_sig else b""
         return payee
+
+    def _channel(self, chan) -> ChannelState:
+        with self.ledger.lock:
+            st = self.ledger.channels.get(canonical_chan(chan))
+        if not st:
+            raise ChannelError("unknown_channel")
+        return st
 
     def _authentic(self, st: ChannelState, pl: dict, method: str, path: str, body: bytes) -> bool:
         """payload.auth is the channel's HMAC over this request and a seq above every earlier one."""
@@ -291,13 +312,12 @@ class XbtChannelProvider:
             raise ChannelError("bad_sig", "signature differs from the stored state for this cum")
 
     def close(self, req: dict) -> dict:
+        st = self._channel(req["chan"])
+        # unauthenticated until this check passes: it runs outside the ledger lock (L13)
+        if not ecc.verify(bytes.fromhex(st.params.payer_pub), close_message(st.params.channel_id),
+                          bytes.fromhex(req["sig"])):
+            raise ChannelError("bad_sig", "close request not signed by the payer")
         with self.ledger.lock:
-            st = self.ledger.channels.get(canonical_chan(req["chan"]))
-            if not st:
-                raise ChannelError("unknown_channel")
-            if not ecc.verify(bytes.fromhex(st.params.payer_pub), close_message(st.params.channel_id),
-                              bytes.fromhex(req["sig"])):
-                raise ChannelError("bad_sig", "close request not signed by the payer")
             if req.get("payload") and not st.closed_txid:   # after the close a state changes nothing (L10)
                 self._apply(st, req["payload"])
             txid = self._close_locked(st)
@@ -499,14 +519,15 @@ class XbtChannelProvider:
         a huge seq."""
         try:
             pl = self._facilitator_payload(req)
+            st = self._channel(pl.get("chan"))
+            cum = int(pl["cum"])
+            if not pl.get("sig"):
+                raise ChannelError("bad_sig", "verify needs a signed state")
+            # anyone can call this: the signature check, all a stranger can make us compute, runs
+            # outside the ledger lock against the channel's cached payee, so a flood of junk states
+            # never queues paid calls behind it (L13)
+            self._channel_payee(st.params).verify_state(cum, bytes.fromhex(pl["sig"]))
             with self.ledger.lock:
-                st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
-                if not st:
-                    raise ChannelError("unknown_channel")
-                cum = int(pl["cum"])
-                if not pl.get("sig"):
-                    raise ChannelError("bad_sig", "verify needs a signed state")
-                self._payee(st).verify_state(cum, bytes.fromhex(pl["sig"]))
                 if cum > st.best_cum and not st.closed_txid:
                     st.best_cum, st.best_sig = cum, pl["sig"]
                     self.ledger.save(st)
