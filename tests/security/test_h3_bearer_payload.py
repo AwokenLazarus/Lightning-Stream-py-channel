@@ -91,10 +91,10 @@ class BearerPayload(Repro, unittest.TestCase):
         self.assertEqual(pay(xp, prov, authed(xp, cp, payer, p.payee_pub,
                                               {"chan": p.channel_id, "seq": 1, "cum": "3000", "sig": sig3}))[0], 200)
         for req in ({"chan": p.channel_id, "cum": "0"}, {"chan": p.channel_id, "cum": "3000", "seq": 10**9}):
-            st, _, out = prov.serve("POST", "/verify", {}, json.dumps(req).encode())
+            st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(req).encode())
             self.assertEqual((st, json.loads(out)["error"]), (400, "bad_sig"))
             self.assertNotIn("3000", json.loads(out)["detail"])
-        st, _, out = prov.serve("POST", "/verify", {}, json.dumps(
+        st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(
             {"chan": p.channel_id, "cum": "3000", "sig": sig3, "seq": 10**9}).encode())
         self.assertEqual(st, 200)
         self.assertEqual(prov.ledger.channels[p.channel_id].seq, 1)          # /verify never moves seq

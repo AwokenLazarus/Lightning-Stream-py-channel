@@ -19,7 +19,7 @@ pure-Python test oracle.
 | `xbt402/client_httpx.py` | httpx transport |
 | `xbt402/signer.py` | ChannelSigner (secrets never leave) + B2 socket adapter |
 | `xbt402/mcp_server.py` | `xbt402_pay`, `xbt_channels`, `xbt_close`, `xbt_refunds_due` |
-| `xbt402/x402_channel.py` | provider + SDK (facilitator `/verify` `/settle` `/supported`) |
+| `xbt402/x402_channel.py` | provider + SDK (facilitator `/x402/verify` `/x402/settle` `/x402/supported`) |
 | `demo.sh` | units + chain rules + 1,000 calls + conditional + MCP + close + refund |
 
 Ports **30100–30199**, datadirs under `~/xbt-rnd/xbt-060/run/`. Isolated Knots 29.4.2 with RDTS

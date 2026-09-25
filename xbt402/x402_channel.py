@@ -19,6 +19,8 @@ Spec: ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment cha
           owedMsat, creditMsat, expiry, req, sig})  sig = receipt by the channel payee key
   close:  POST extra.closeUrl {chan, sig, payload?}  sig = payer over tagged_hash("xbt402/close", chan);
           payload = a final state paying what is owed (postpay)
+  facilitator: GET /x402/supported, POST /x402/verify {payload}, POST /x402/settle (= close); only
+          under /x402/, so a paid API keeps its own /verify, /settle and /supported routes
 """
 import base64
 import hashlib
@@ -45,6 +47,7 @@ from .tx import segwit_address, tagged_hash
 SCHEME = "xbt-channel"
 MAX_BODY = 1 << 20                                          # bytes per request body
 XBT_MAINNET = "bip122:0000000000000050c1e5f69672f45929"   # block 961640, the first BLAKE2b block
+FACILITATOR_VERIFY, FACILITATOR_SETTLE, FACILITATOR_SUPPORTED = "/x402/verify", "/x402/settle", "/x402/supported"
 
 
 def b64json(obj) -> str:
@@ -334,16 +337,17 @@ class XbtChannelProvider:
 
     # paid requests ----------------------------------------------------------------------
     def serve(self, method: str, path: str, headers: dict, body: bytes, url: str = ""):
-        if path in ("/x402/supported", "/verify", "/settle", "/supported"):
+        # facilitator endpoints live under /x402/ only: bare /verify, /settle and /supported shadowed
+        # a paid API's own routes of those names (XBT-061 L6)
+        control = {("GET", FACILITATOR_SUPPORTED): lambda: self.supported(),
+                   ("POST", FACILITATOR_VERIFY): lambda: self.facilitator_verify(json.loads(body)),
+                   ("POST", FACILITATOR_SETTLE): lambda: self.facilitator_settle(json.loads(body))}
+        if path.split("?", 1)[0] in (FACILITATOR_SUPPORTED, FACILITATOR_VERIFY, FACILITATOR_SETTLE):
+            action = control.get((method, path.split("?", 1)[0]))
+            if not action:
+                return 405, {}, b"method not allowed"
             try:
-                if path.endswith("supported") and method == "GET":
-                    return 200, {"Content-Type": "application/json"}, json.dumps(self.supported()).encode()
-                if path.endswith("verify") and method == "POST":
-                    return 200, {"Content-Type": "application/json"}, json.dumps(
-                        self.facilitator_verify(json.loads(body))).encode()
-                if path.endswith("settle") and method == "POST":
-                    return 200, {"Content-Type": "application/json"}, json.dumps(
-                        self.facilitator_settle(json.loads(body))).encode()
+                return 200, {"Content-Type": "application/json"}, json.dumps(action()).encode()
             except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
