@@ -219,7 +219,7 @@ OP_ENDIF
 and the rest, minus `closeFeeSat`, to the client. Signed `0x21`. Once the client has the preimage `k`
 (`SHA256(k) = H`), it SHOULD fold the increment into an ordinary state paying `uncond + condAmount`.
 
-**Ciphertext first** (AGP-005 M7). The 402 carries the encrypted deliverable, `extra.conditional.cipher`,
+**Ciphertext first** (M7). The 402 carries the encrypted deliverable, `extra.conditional.cipher`,
 and a client MUST refuse a conditional offer without one, before it signs. The provider's claim (below)
 publishes `k` in its witness, so whatever happens to the paid response, a client that holds the
 ciphertext gets the deliverable: from `k` in the response, or from the claim transaction. A client MUST
@@ -636,12 +636,12 @@ Breaking (a v1.1 party refuses a v1.0 one at the 402 or the open, before any fun
   also answered the bare `/verify`, `/settle`, `/supported`, which shadowed any API route of those
   names (L6).
 
-Breaking, from the pre-publication review of v1.1 (AGP-005; only conditional calls):
+Breaking, from the pre-publication review of v1.1 (conditional calls only):
 - **`extra.conditional.cipher`** (§6.5, §7.1, M7): the 402 carries the ciphertext, and a v1.1 client
   refuses a conditional offer without it before signing. Plain calls are unchanged.
 
 Not breaking:
-- **Review of v1.1 (AGP-005)**: clients cap `condAmount` (H6); providers record a close before sending it
+- **Pre-publication review of v1.1**: clients cap `condAmount` (H6); providers record a close before sending it
   (M8), bump the claim fee (L8) and re-key a conditional path after each sale (M7); the facilitator never
   reports a state that cannot settle (L10, L11); agent tools label every provider string (L12).
 - **Hash-locked conditional calls are enforceable** (§6.5, M6): the provider closes with the conditional

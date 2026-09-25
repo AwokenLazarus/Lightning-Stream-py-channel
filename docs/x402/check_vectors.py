@@ -263,7 +263,7 @@ def generate():
     return {
         "title": "x402 xbt-channel test vectors",
         "version": "1.1-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes)" % DERIVATION,
-        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.1 (AGP-004)",
+        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.1",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",
                   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
                   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
