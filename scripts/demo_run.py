@@ -129,11 +129,12 @@ def main():
 
     print("[4] MCP xbt402_pay (no keys in the result)")
     mcp = xbt402_pay(client, f"{base}/v1/infer?mcp=1", "GET", b"", max_sats=500)
-    check(mcp["status"] == 200 and mcp.get("charged") == str(PRICE),
+    check(mcp["status"] == 200 and mcp["paid"] and mcp.get("charged") == PRICE,
           f"xbt402_pay status={mcp['status']} charged={mcp.get('charged')}")
-    blob = json.dumps(mcp)
-    check("secret" not in blob.lower() and "priv" not in blob.lower(),
-          "MCP result has no key material")
+    blob = json.dumps({k: v for k, v in mcp.items() if k != "untrusted_provider_response"})
+    check("secret" not in blob.lower() and "priv" not in blob.lower()
+          and mcp["untrusted_provider_response"]["trust"] == "untrusted",
+          "MCP result has no key material; the provider body comes back labelled untrusted")
 
     print("[5] refusals")
     def pay(payload, accepted=None, auth=True):
