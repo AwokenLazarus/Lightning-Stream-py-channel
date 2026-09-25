@@ -1,0 +1,443 @@
+{
+ "title": "x402 xbt-channel test vectors",
+ "version": "1.1-draft (wire-compatible with v1.0)",
+ "generator": "docs/x402/check_vectors.py --write, reference library xbt402 (commit 702b262)",
+ "notes": [
+  "All keys are test keys derived from sha256 of fixed strings. Never fund them.",
+  "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
+  "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
+  "Fields starting with '_' are cross-checks, not wire values."
+ ],
+ "constants": {
+  "network": "bip122:0000000000000050c1e5f69672f45929",
+  "dust": 546,
+  "closeFeeSat": 600,
+  "capacity": 200000,
+  "sighashAllUnified": 33,
+  "tags": [
+   "xbt-channel/payee",
+   "xbt402/auth-key",
+   "xbt402/receipt",
+   "xbt402/close",
+   "UnifiedSighash"
+  ]
+ },
+ "derivation": [
+  {
+   "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+   "payerPub": "0219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cb",
+   "expiry": 2014,
+   "expiryLE32": "de070000",
+   "tweakPreimage": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b7700219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbde070000",
+   "t": "5435717a2bb1876d3f085b521c39e52fa2c4be622afd5c52b00d2260404f1773",
+   "payeePub": "022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5a",
+   "redeemScript": "6321022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5aad6702de07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbac",
+   "fundingSpk": "0020f7c36fcc2939c6d8bb0e65bec46901524596bde4155728d6a51a807ba555de1f",
+   "fundingAddressMainnet": "bc1q7lpklnpf88rd3wcwvklvg6gp2fzed00yz4tj3449r2q8hf24mc0speqgur",
+   "payeeSpk": "0014999b7bdda50977eddd8aa0bc5062628194ac4fb4",
+   "payerSpk": "0014df3c663091b8e278e5800a406646bf8f4ba99443"
+  },
+  {
+   "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+   "payerPub": "0219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cb",
+   "expiry": 2015,
+   "expiryLE32": "df070000",
+   "tweakPreimage": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b7700219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbdf070000",
+   "t": "23a614bdad18e125d16c07c79395e0f8f67a705f2370c02a0875fed5da2a8709",
+   "payeePub": "02fedc380192126a91f8700afc5de4895c81f9525281c686288d47cc902704e1d6",
+   "redeemScript": "632102fedc380192126a91f8700afc5de4895c81f9525281c686288d47cc902704e1d6ad6702df07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbac",
+   "fundingSpk": "002039fa0d3db148b3802c6a44f7974331d1cae3ee0463c838efe6f723fbc9cf55b8",
+   "fundingAddressMainnet": "bc1q88aq60d3fzecqtr2gnmewse3689w8msyv0yr3mlx7u3lhjw02kuq34v3wp",
+   "payeeSpk": "0014b307b99665b772679f2f4d5bdc151eb42e4e46e0",
+   "payerSpk": "0014df3c663091b8e278e5800a406646bf8f4ba99443"
+  },
+  {
+   "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+   "payerPub": "0364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362",
+   "expiry": 969640,
+   "expiryLE32": "a8cb0e00",
+   "tweakPreimage": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b7700364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362a8cb0e00",
+   "t": "7a70efc7072411af724a31fd341395fc5c10dd0c5c7cb4a6e45afa13fffcf11b",
+   "payeePub": "02f600ff7052a2c0e0f604c6c6c99096e7cf2793066c3fcea299244bc3e2a1f8a8",
+   "redeemScript": "632102f600ff7052a2c0e0f604c6c6c99096e7cf2793066c3fcea299244bc3e2a1f8a8ad6703a8cb0eb17568210364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362ac",
+   "fundingSpk": "0020653797384609f5fc8397c4ef73d3210730bcd7d6f487c24f78c958c99ea8b3c9",
+   "fundingAddressMainnet": "bc1qv5mewwzxp86lequhcnhh85epqucte47k7jruynmce9vvn84gk0ysquqm92",
+   "payeeSpk": "001497d7d555844f74d4eb940869ca3dcf1c81e900d5",
+   "payerSpk": "00149476e4d990109bbc1ae5a065ef2de2396d2d4083"
+  }
+ ],
+ "auth": {
+  "payerSecret": "cc14bc8dd932ccaa4451abbc8496c0c4e985952fb0d47409e213fb0c9be9da13",
+  "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+  "payerPub": "0219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cb",
+  "expiry": 2014,
+  "payeePub": "022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5a",
+  "ecdhX": "c16c9aaa955334aa2a96fda95aa3799453902bfdd7e083233b536ab46e7ef30d",
+  "K": "1b956f09e6e7845c1c679feae1369090ae7c2cc852f736b94725faf1a8589231",
+  "_K_payee_side": "1b956f09e6e7845c1c679feae1369090ae7c2cc852f736b94725faf1a8589231",
+  "cases": [
+   {
+    "method": "GET",
+    "path": "/v1/quote?pair=XBT-USD",
+    "bodyHex": "",
+    "req": "a3cbfbf2f9ad5e1b23622fb1cedccc06fbbb1e39615ab9aeb29eb343fe673494",
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "seq": 1,
+    "cum": "0",
+    "sig": "",
+    "message": "xbt402/auth|1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0|1|0||a3cbfbf2f9ad5e1b23622fb1cedccc06fbbb1e39615ab9aeb29eb343fe673494",
+    "auth": "f9d668a118c8f6d468eaf9f29523adf99544bfc5d085960bf3a37a914adab041"
+   },
+   {
+    "method": "POST",
+    "path": "/v1/infer",
+    "bodyHex": "7b2270726f6d7074223a2268656c6c6f227d",
+    "req": "ad921c8c12c9fbccc118d3d45d853f97e01e4e075a2dc4548512e7ccc321cc3f",
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "seq": 2,
+    "cum": "546",
+    "sig": "3045022100a222c263100667e64dcd9894061ec20b583bbfd75f702f8a151d467d439a1a2a0220200e1e51c4ac264c063ed35e9836825a349f37567c387c0244c6242f79ce9c1f21",
+    "message": "xbt402/auth|1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0|2|546|3045022100a222c263100667e64dcd9894061ec20b583bbfd75f702f8a151d467d439a1a2a0220200e1e51c4ac264c063ed35e9836825a349f37567c387c0244c6242f79ce9c1f21|ad921c8c12c9fbccc118d3d45d853f97e01e4e075a2dc4548512e7ccc321cc3f",
+    "auth": "c8e41fda9705e6c02651ebffc999eb3baf9095b0610924c01ebda19fa7279151"
+   },
+   {
+    "method": "POST",
+    "path": "/v1/a%20b?x=1",
+    "bodyHex": "000162696e617279",
+    "req": "96fa7825c8fed166fec4f6e931df60f7bc7dab0c7a64550080ba94419d78e903",
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "seq": 7,
+    "cum": "1200",
+    "sig": "",
+    "message": "xbt402/auth|1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0|7|1200||96fa7825c8fed166fec4f6e931df60f7bc7dab0c7a64550080ba94419d78e903",
+    "auth": "b7dd7b3c0d2fc32b9edf855d00ffba7b0cfbf408601ded506970fff8e6b5c512"
+   }
+  ]
+ },
+ "state": {
+  "payerSecret": "cc14bc8dd932ccaa4451abbc8496c0c4e985952fb0d47409e213fb0c9be9da13",
+  "payToSecret": "8bebc426f46a6c026c0dc085453fba5a8d54a39cd9b094a42a0e849b3f91828e",
+  "payeeSecret": "e02135a1201bf36fab161bd761799f8a301961ff04adf0f6da1ba6fb7fe09a01",
+  "params": {
+   "payer_pub": "0219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cb",
+   "payee_pub": "022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5a",
+   "expiry": 2014,
+   "payer_spk": "0014df3c663091b8e278e5800a406646bf8f4ba99443",
+   "payee_spk": "0014999b7bdda50977eddd8aa0bc5062628194ac4fb4",
+   "close_fee": 600,
+   "funding_txid": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969",
+   "funding_vout": 0,
+   "capacity": 200000
+  },
+  "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+  "maxCum": 199400,
+  "states": [
+   {
+    "cum": 546,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff022202000000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb4c608030000000000160014df3c663091b8e278e5800a406646bf8f4ba9944300000000",
+    "outputs": 2,
+    "sighash": "cbe0b890cf84069df283216139e7f69fea0fc9e168d5ece4cdf70d3059206ce1",
+    "payerSig": "3045022100a222c263100667e64dcd9894061ec20b583bbfd75f702f8a151d467d439a1a2a0220200e1e51c4ac264c063ed35e9836825a349f37567c387c0244c6242f79ce9c1f21"
+   },
+   {
+    "cum": 150000,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02f049020000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb4f8c0000000000000160014df3c663091b8e278e5800a406646bf8f4ba9944300000000",
+    "outputs": 2,
+    "sighash": "ef4a7edefae36c106b9c8644bfbac8d36ec74b07a661847f853a87fe3a65bcd7",
+    "payerSig": "304402200d738715b5d08d5e626c568bbd9d55c909a03f143e48999c2d7204be5e2eacfb0220162d58ad4422a48b35aa91080b3eedaee7133682e171111f52ae08eb7c15f2dd21"
+   },
+   {
+    "cum": 198855,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff01c708030000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb400000000",
+    "outputs": 1,
+    "sighash": "43c7e737dbf2877c5ca93d59413c68d98d50e16c230383b506b0ee754fd63cb6",
+    "payerSig": "304402205a7d760dc2bfcdbd47e3ba5285be15e4be1a0bf6593068687c89548d5ab4ae23022050da301d72c5b3d7a3a9140a8c6adaf6e2f2581a345a7d52332ea10b0e004d2921"
+   },
+   {
+    "cum": 199400,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff01e80a030000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb400000000",
+    "outputs": 1,
+    "sighash": "1087969c7babb671924acaa5660a828c31ccb941a073ecbacaf90475c237206e",
+    "payerSig": "3044022026ffdc359e15c9276a7e0e90bec255bb75063d9acc1c15b80fe5e78a339a46a5022046440bd84a5867386d580fece1a827ceb4ff71e9b74607f9d5d61af4321a13fa21"
+   }
+  ],
+  "closeTx": {
+   "cum": 150000,
+   "hex": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02f049020000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb4f8c0000000000000160014df3c663091b8e278e5800a406646bf8f4ba994430447304402200d738715b5d08d5e626c568bbd9d55c909a03f143e48999c2d7204be5e2eacfb0220162d58ad4422a48b35aa91080b3eedaee7133682e171111f52ae08eb7c15f2dd21483045022100902de5db24ea059e8670dbe09116b9aa1c486a77d843ddb017a3728e7f0dd96002201666220b266396748e69494aa73390ac5cd5a8208ebb50d3ab4168c9f29c27452101014e6321022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5aad6702de07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbac00000000",
+   "txid": "0691140667ef3f6653558592eeb3495c7eccbf08cf3f2e68be0d81f7b2da81ba",
+   "vsize": 171
+  },
+  "refundTx": {
+   "hex": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000feffffff01e80a030000000000160014df3c663091b8e278e5800a406646bf8f4ba9944303483045022100832b258b8facb832ea015809c563970fb07985f35657fc74d134ee4c06f97a6602207bc6a4e6579784aed05dfc9c2c499189093fd5440584e0f1e92a3b3584cc86e621004e6321022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5aad6702de07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbacde070000",
+   "txid": "926a73b7618a387c90e9d27f70c1cc0d5c48ec3ef3ed5fd0fc46d3f117a94263",
+   "nLockTime": 2014
+  },
+  "invalid": [
+   {
+    "why": "non-strict DER (0x00 before r): consensus-invalid in segwit v0",
+    "cum": 150000,
+    "payerSig": "30430221000d738715b5d08d5e626c568bbd9d55c909a03f143e48999c2d7204be5e2eacfb162d58ad4422a48b35aa91080b3eedaee7133682e171111f52ae08eb7c15f2dd21",
+    "error": "bad_sig"
+   },
+   {
+    "why": "SIGHASH_ALL (0x01) instead of ALL|UNIFIED (0x21)",
+    "cum": 150000,
+    "payerSig": "304402200d738715b5d08d5e626c568bbd9d55c909a03f143e48999c2d7204be5e2eacfb0220162d58ad4422a48b35aa91080b3eedaee7133682e171111f52ae08eb7c15f2dd01",
+    "error": "bad_sighash"
+   },
+   {
+    "why": "valid signature relabelled with a higher cum",
+    "cum": 150001,
+    "payerSig": "304402200d738715b5d08d5e626c568bbd9d55c909a03f143e48999c2d7204be5e2eacfb0220162d58ad4422a48b35aa91080b3eedaee7133682e171111f52ae08eb7c15f2dd21",
+    "error": "bad_sig"
+   }
+  ]
+ },
+ "roundtrip": {
+  "network": "bip122:0000000000000050c1e5f69672f45929",
+  "tip": 1000,
+  "payToSecret": "8bebc426f46a6c026c0dc085453fba5a8d54a39cd9b094a42a0e849b3f91828e",
+  "payerSecret": "cc14bc8dd932ccaa4451abbc8496c0c4e985952fb0d47409e213fb0c9be9da13",
+  "url": "https://api.example.com/v1/infer?model=small",
+  "price": 150,
+  "billing": "postpay",
+  "handlerBodyHex": "7b22726573756c74223a226f6b227d",
+  "steps": [
+   {
+    "step": "unpaid request",
+    "request": {
+     "method": "POST",
+     "path": "/v1/infer?model=small",
+     "bodyHex": "7b2270726f6d7074223a2268656c6c6f227d"
+    },
+    "status": 402,
+    "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJwYXltZW50X3JlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS5jb20vdjEvaW5mZXI/bW9kZWw9c21hbGwifSwiYWNjZXB0cyI6W3sic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX1dfQ==",
+    "decoded": {
+     "x402Version": 2,
+     "error": "payment_required",
+     "resource": {
+      "url": "https://api.example.com/v1/infer?model=small"
+     },
+     "accepts": [
+      {
+       "scheme": "xbt-channel",
+       "network": "bip122:0000000000000050c1e5f69672f45929",
+       "amount": "150",
+       "asset": "XBT:sat",
+       "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+       "maxTimeoutSeconds": 30,
+       "extra": {
+        "minCapacity": "20000",
+        "maxCapacity": "10000000",
+        "minExpiryBlocks": 1008,
+        "maxExpiryBlocks": 8640,
+        "closeMarginBlocks": 144,
+        "minConf": 1,
+        "closeFeeSat": "600",
+        "openUrl": "/x402/xbt-channel/open",
+        "closeUrl": "/x402/xbt-channel/close",
+        "billing": "postpay"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "step": "open",
+    "path": "/x402/xbt-channel/open",
+    "request": {
+     "x402Version": 2,
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "channel": {
+      "txid": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969",
+      "vout": 0,
+      "capacity": 200000,
+      "expiry": 2014,
+      "payerPub": "0219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cb",
+      "payerSpk": "0014df3c663091b8e278e5800a406646bf8f4ba99443",
+      "redeemScript": "6321022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5aad6702de07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbac"
+     }
+    },
+    "status": 200,
+    "response": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "expiry": 2014,
+     "maxCum": "199400",
+     "confirmations": 1
+    }
+   },
+   {
+    "step": "paid call 1",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6MSwiY3VtIjoiMCIsImF1dGgiOiI0ZTVhODRlNmMzYzQ1MDYxMzBlYzNlMGE0ZmExY2I5M2RmZjExOWVhNTFhZmFhMzMyZjZjMzE2NjllZjkwMWIxIn19",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 1,
+     "cum": "0",
+     "auth": "4e5a84e6c3c4506130ec3e0a4fa1cb93dff119ea51afaa332f6c31669ef901b1"
+    },
+    "status": 200,
+    "bodyHex": "7b22726573756c74223a226f6b227d",
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjoxLCJjdW0iOiIwIiwiY2hhcmdlZCI6IjE1MCIsInNwZW50TXNhdCI6IjE1MDAwMCIsIm93ZWRNc2F0IjoiMTUwMDAwIiwiY3JlZGl0TXNhdCI6IjAiLCJleHBpcnkiOjIwMTQsInJlcSI6IjQwOTk2NzY1OWMyNDZiMDhmZmViZTI2Mzk0YjM3ZWNmZmJiYjA5NTI1NjBmYjFiZDA2Zjg4YTAzMzNhNmZlNjYiLCJzaWciOiIzMDQ1MDIyMTAwZWRmNWRlMzIyMjZiNWZjODlmZWQ3MTljYTZkZjEyYWQ4ZGFjZTQ2ZWE5NWZkZThiYmM3NjZiNzRiOWQ2NDA0NTAyMjAzMjMwODI1YTFhOWM1ZWEwMjcwNjU2ZGJiNmE1MzY3MzhkY2U5MTdkYjUwNmRjNjkyMmRiMTdiM2M3NDZmZTJhIn0=",
+    "receipt": {
+     "success": true,
+     "scheme": "xbt-channel",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 1,
+     "cum": "0",
+     "charged": "150",
+     "spentMsat": "150000",
+     "owedMsat": "150000",
+     "creditMsat": "0",
+     "expiry": 2014,
+     "req": "409967659c246b08ffebe26394b37ecffbbb0952560fb1bd06f88a0333a6fe66",
+     "sig": "3045022100edf5de32226b5fc89fed719ca6df12ad8dace46ea95fde8bbc766b74b9d6404502203230825a1a9c5ea0270656dbb6a536738dce917db506dc6922db17b3c746fe2a"
+    }
+   },
+   {
+    "step": "paid call 2",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6MiwiY3VtIjoiNTQ2Iiwic2lnIjoiMzA0NTAyMjEwMGEyMjJjMjYzMTAwNjY3ZTY0ZGNkOTg5NDA2MWVjMjBiNTgzYmJmZDc1ZjcwMmY4YTE1MWQ0NjdkNDM5YTFhMmEwMjIwMjAwZTFlNTFjNGFjMjY0YzA2M2VkMzVlOTgzNjgyNWEzNDlmMzc1NjdjMzg3YzAyNDRjNjI0MmY3OWNlOWMxZjIxIiwiYXV0aCI6IjhmNGE3MTcwYjU3MjM1NDM4OTY1MjYxODE1NGI0YmEyZGRjZGFjNGUxY2QyNTkxZTYyNTEzYTZmMDA2Mzk5OGYifX0=",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 2,
+     "cum": "546",
+     "sig": "3045022100a222c263100667e64dcd9894061ec20b583bbfd75f702f8a151d467d439a1a2a0220200e1e51c4ac264c063ed35e9836825a349f37567c387c0244c6242f79ce9c1f21",
+     "auth": "8f4a7170b572354389652618154b4ba2ddcdac4e1cd2591e62513a6f0063998f"
+    },
+    "status": 200,
+    "bodyHex": "7b22726573756c74223a226f6b227d",
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjoyLCJjdW0iOiI1NDYiLCJjaGFyZ2VkIjoiMTUwIiwic3BlbnRNc2F0IjoiMzAwMDAwIiwib3dlZE1zYXQiOiIwIiwiY3JlZGl0TXNhdCI6IjI0NjAwMCIsImV4cGlyeSI6MjAxNCwicmVxIjoiNDA5OTY3NjU5YzI0NmIwOGZmZWJlMjYzOTRiMzdlY2ZmYmJiMDk1MjU2MGZiMWJkMDZmODhhMDMzM2E2ZmU2NiIsInNpZyI6IjMwNDQwMjIwMGIzMDc1NTQ5ZjZmMzU4ODQ0NDYzNWE0N2I2ODg4YjQwZDk4OGVjMDQyZjk0Y2VhM2E2YTgxYzBjZTJiM2E1NzAyMjAzNzFlYzAxYWM3ZTllODkyOTU4OWQ3NTljNGVjNGY5NGJkODVlNzIyYjFlOWIwYTY3ZjNjNDQ3MjUxYjYyYzI2In0=",
+    "receipt": {
+     "success": true,
+     "scheme": "xbt-channel",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 2,
+     "cum": "546",
+     "charged": "150",
+     "spentMsat": "300000",
+     "owedMsat": "0",
+     "creditMsat": "246000",
+     "expiry": 2014,
+     "req": "409967659c246b08ffebe26394b37ecffbbb0952560fb1bd06f88a0333a6fe66",
+     "sig": "304402200b3075549f6f3588444635a47b6888b40d988ec042f94cea3a6a81c0ce2b3a570220371ec01ac7e9e8929589d759c4ec4f94bd85e722b1e9b0a67f3c447251b62c26"
+    }
+   },
+   {
+    "step": "paid call 3",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6MywiY3VtIjoiNTQ2IiwiYXV0aCI6ImMwODdkZTA4ZGJmMGU5YjBjODVlODYzMDM1YzQ1MDE0Zjk0NDJmNDM5Nzc1NmQ1ZGI3MmFhOTE3ZWE1YWE4MjIifX0=",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 3,
+     "cum": "546",
+     "auth": "c087de08dbf0e9b0c85e863035c45014f9442f4397756d5db72aa917ea5aa822"
+    },
+    "status": 200,
+    "bodyHex": "7b22726573756c74223a226f6b227d",
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjozLCJjdW0iOiI1NDYiLCJjaGFyZ2VkIjoiMTUwIiwic3BlbnRNc2F0IjoiNDUwMDAwIiwib3dlZE1zYXQiOiIwIiwiY3JlZGl0TXNhdCI6Ijk2MDAwIiwiZXhwaXJ5IjoyMDE0LCJyZXEiOiI0MDk5Njc2NTljMjQ2YjA4ZmZlYmUyNjM5NGIzN2VjZmZiYmIwOTUyNTYwZmIxYmQwNmY4OGEwMzMzYTZmZTY2Iiwic2lnIjoiMzA0NDAyMjAyYTNjMjhjOWExYmZjZTE1ODkyZjAxZWNmZDY5NWFkZTdlNzRiYmE2YzE1NTM4MjEzZTVkZDg2ZDczNzYwNjA0MDIyMDM3NGI5MTE5MjU0YTg5ZDc4MzgyZWFlMDdiNGZkYzgwMWRlNjA2MDFhZWUxYmNlMmE4MmYyZGIxZTZjZWExZDgifQ==",
+    "receipt": {
+     "success": true,
+     "scheme": "xbt-channel",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 3,
+     "cum": "546",
+     "charged": "150",
+     "spentMsat": "450000",
+     "owedMsat": "0",
+     "creditMsat": "96000",
+     "expiry": 2014,
+     "req": "409967659c246b08ffebe26394b37ecffbbb0952560fb1bd06f88a0333a6fe66",
+     "sig": "304402202a3c28c9a1bfce15892f01ecfd695ade7e74bba6c15538213e5dd86d737606040220374b9119254a89d78382eae07b4fdc801de60601aee1bce2a82f2db1e6cea1d8"
+    }
+   },
+   {
+    "step": "paid call 4",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6NCwiY3VtIjoiNTQ2IiwiYXV0aCI6IjdlNDZhODMwNjZlYTQwM2Q4NDBmZjhmZjZlMDQzMTk5YzgyNWQzNThjMWNlZWI1NDg1YjlkMjRiMWI1ZWY3MWMifX0=",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 4,
+     "cum": "546",
+     "auth": "7e46a83066ea403d840ff8ff6e043199c825d358c1ceeb5485b9d24b1b5ef71c"
+    },
+    "status": 200,
+    "bodyHex": "7b22726573756c74223a226f6b227d",
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjo0LCJjdW0iOiI1NDYiLCJjaGFyZ2VkIjoiMTUwIiwic3BlbnRNc2F0IjoiNjAwMDAwIiwib3dlZE1zYXQiOiI1NDAwMCIsImNyZWRpdE1zYXQiOiIwIiwiZXhwaXJ5IjoyMDE0LCJyZXEiOiI0MDk5Njc2NTljMjQ2YjA4ZmZlYmUyNjM5NGIzN2VjZmZiYmIwOTUyNTYwZmIxYmQwNmY4OGEwMzMzYTZmZTY2Iiwic2lnIjoiMzA0NDAyMjA1MGQ2MzBmZmVlNjgxYjgxMjcyMjY2MzNmMThjYmI4MDMyNjQ5ZjIzYTMwOTExMDM4MzdlMzNmYTgxZGVmMGIyMDIyMDNlOWZhYzc2MjljYjM3YjQwNzkyNWZlODllODEzNTA4NTcxMmQxMDY4ZjNmZTJkNWE1N2VhYWEzMjA0NDkwNTgifQ==",
+    "receipt": {
+     "success": true,
+     "scheme": "xbt-channel",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 4,
+     "cum": "546",
+     "charged": "150",
+     "spentMsat": "600000",
+     "owedMsat": "54000",
+     "creditMsat": "0",
+     "expiry": 2014,
+     "req": "409967659c246b08ffebe26394b37ecffbbb0952560fb1bd06f88a0333a6fe66",
+     "sig": "3044022050d630ffee681b8127226633f18cbb8032649f23a3091103837e33fa81def0b202203e9fac7629cb37b407925fe89e8135085712d1068f3fe2d5a57eaaa320449058"
+    }
+   },
+   {
+    "step": "paid call 5",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6NSwiY3VtIjoiNjAwIiwic2lnIjoiMzA0NTAyMjEwMGEyMjUwNWVmYmU1ZWFjNzA2N2MxYTMzNWIzNzM1YzQwYjhiYTRmYjE2ZDRiMGVlNWVjMzc3M2Y0NjA4ZDNjYzcwMjIwMjc1ZDUyZTI4NzAxNjlmODU1MDVkYjBjZTM5MGIyYWUzY2Q0YmE4YmM4ZjJlZTBhZjNmNWJjYTk4NWEzYzAzYTIxIiwiYXV0aCI6IjI2YmIwMDE5MWE2ZDVlYmM4MjE0NjA5OTAzMDcyODFhM2E0NWI0ODBjM2I2OTBlMDQxODYzNjA3OWNjYjE2NmUifX0=",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 5,
+     "cum": "600",
+     "sig": "3045022100a22505efbe5eac7067c1a335b3735c40b8ba4fb16d4b0ee5ec3773f4608d3cc70220275d52e2870169f85505db0ce390b2ae3cd4ba8bc8f2ee0af3f5bca985a3c03a21",
+     "auth": "26bb00191a6d5ebc821460990307281a3a45b480c3b690e0418636079ccb166e"
+    },
+    "status": 200,
+    "bodyHex": "7b22726573756c74223a226f6b227d",
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjo1LCJjdW0iOiI2MDAiLCJjaGFyZ2VkIjoiMTUwIiwic3BlbnRNc2F0IjoiNzUwMDAwIiwib3dlZE1zYXQiOiIxNTAwMDAiLCJjcmVkaXRNc2F0IjoiMCIsImV4cGlyeSI6MjAxNCwicmVxIjoiNDA5OTY3NjU5YzI0NmIwOGZmZWJlMjYzOTRiMzdlY2ZmYmJiMDk1MjU2MGZiMWJkMDZmODhhMDMzM2E2ZmU2NiIsInNpZyI6IjMwNDUwMjIxMDBhZDc3YTgzZDkxNTNlM2MxYmQzY2ZjMzBhOGRkYTQ1MTE3YTYzZDA1MGQ0OWQ4NTdkNDVhN2Q0ZWVmMzczZjVlMDIyMDZiNWYyNGE2N2IwNmEzMDMxOWQ0MjkyM2FhMzUwZDQ5OWMxMTU2MWJhMzBjNDhkZTdhNzk5MmJhMzI1M2RjZjIifQ==",
+    "receipt": {
+     "success": true,
+     "scheme": "xbt-channel",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 5,
+     "cum": "600",
+     "charged": "150",
+     "spentMsat": "750000",
+     "owedMsat": "150000",
+     "creditMsat": "0",
+     "expiry": 2014,
+     "req": "409967659c246b08ffebe26394b37ecffbbb0952560fb1bd06f88a0333a6fe66",
+     "sig": "3045022100ad77a83d9153e3c1bd3cfc30a8dda45117a63d050d49d857d45a7d4eef373f5e02206b5f24a67b06a30319d42923aa350d499c11561ba30c48de7a7992ba3253dcf2"
+    }
+   },
+   {
+    "step": "replay of paid call 5",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkifX0sInBheWxvYWQiOnsiY2hhbiI6IjFhM2JiYmE2MjhhMjllZGMzZWMwYmVmYjMwY2MyYTQyMmRiMDVkNjEwMjI5ODg3YThhYTI0ODU0ZGZlNWI5Njk6MCIsInNlcSI6NSwiY3VtIjoiNjAwIiwic2lnIjoiMzA0NTAyMjEwMGEyMjUwNWVmYmU1ZWFjNzA2N2MxYTMzNWIzNzM1YzQwYjhiYTRmYjE2ZDRiMGVlNWVjMzc3M2Y0NjA4ZDNjYzcwMjIwMjc1ZDUyZTI4NzAxNjlmODU1MDVkYjBjZTM5MGIyYWUzY2Q0YmE4YmM4ZjJlZTBhZjNmNWJjYTk4NWEzYzAzYTIxIiwiYXV0aCI6IjI2YmIwMDE5MWE2ZDVlYmM4MjE0NjA5OTAzMDcyODFhM2E0NWI0ODBjM2I2OTBlMDQxODYzNjA3OWNjYjE2NmUifX0=",
+    "status": 402,
+    "error": "bad_auth",
+    "hasChannelDetails": false
+   },
+   {
+    "step": "cooperative close",
+    "path": "/x402/xbt-channel/close",
+    "request": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "sig": "3044022063d7fd3d361b8efca05a9b09202d9cb14de45bc1e0298cc9b65a6811bff4d4cc02200c0d320682333acbdd3d3314b9e2cb44f5818b40bf9dc06fdb07193145e602d3",
+     "payload": {
+      "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+      "seq": 6,
+      "cum": "750",
+      "sig": "30440220154fb618c38599bdb18d05e75fe679485931950d56d1bc67cf1b040b4fe84df90220245e674cb59bad6955e317394bfd39448d15c2f37b72f6e60bb569d2be40c3c621",
+      "auth": "0e9ce6509d4189adb53a8200b65368db228bb5bf731c59f5333d9ac4a7afc060"
+     }
+    },
+    "status": 200,
+    "response": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "txid": "4216334f0df1f7fc41f5d2325b9a85866fd7616cdb85abb7f21caf514e08e6f6",
+     "cum": "750",
+     "unpaidMsat": "0"
+    },
+    "closeTx": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02ee02000000000000160014999b7bdda50977eddd8aa0bc5062628194ac4fb4fa07030000000000160014df3c663091b8e278e5800a406646bf8f4ba99443044730440220154fb618c38599bdb18d05e75fe679485931950d56d1bc67cf1b040b4fe84df90220245e674cb59bad6955e317394bfd39448d15c2f37b72f6e60bb569d2be40c3c6214730440220096067805b8a2db2fa3b9a90f014130042ddbe631ed5c1a5600df8a7ffc794840220545d57420efd712eeeca3e42996f734b9a2de47c0cb53f5cb5eee2cc01f755ee2101014e6321022aa91cf36f7ca8c1f327bbb10c744333d0d7ef76f3600bc96b0c10f383c01f5aad6702de07b17568210219b0eadf13835e76df3ecadf4a2062c755fc5111b0f9a2ac2652487a105283cbac00000000"
+   }
+  ]
+ }
+}
