@@ -307,7 +307,10 @@ unauthenticated, so it:
 - MUST require `sig` for exactly the `cum` given;
 - MUST NOT move `seq`, and MUST NOT check `auth` (a stranger could otherwise lock a client out with a
   huge `seq`);
-- MUST report only what the caller sent.
+- MUST report only what the caller sent;
+- MUST answer `isValid: false` for a channel that is closed, closing or suspended
+  (`invalid_xbt_channel_closing` / `invalid_xbt_channel_unconfirmed`), whatever the signature: a resource
+  server serves on `isValid`.
 ```json
 {"isValid":true,"payer":"<A hex>","extra":{"chan":"…:0","cum":"600"}}
 ```
@@ -321,7 +324,8 @@ request). It closes the channel; settling a channel that is already closed retur
 {"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"750",
  "extra":{"chan":"…:0","unpaidMsat":"0"}}
 ```
-`amount` is the sat paid to the server by the close. A refusal is
+`amount` is the sat paid to the server by the recorded close; repeats report that same close, and a
+`payload` sent after the close changes nothing. A refusal is
 `{"success":false,"errorReason":"invalid_xbt_channel_signature","transaction":"","network":"bip122:…"}`.
 
 ### GET /x402/supported
@@ -477,14 +481,19 @@ so channels opened under either name are the same channels.
 
 ### Hash-locked conditional requests (experimental)
 A server MAY offer a deliverable that is paid atomically with a secret: `extra.conditional =
-{"hash","amount","csvDelta"}`, and the client signs a state paying `amount` to
+{"hash","amount","csvDelta","cipher"}`, where `cipher` is the deliverable encrypted under `k`
+(`SHA256(k) = hash`). The client MUST have the ciphertext before it signs, MUST hold `amount` to its
+per-request cap, and signs a state paying `amount` to
 `OP_IF OP_SHA256 <H> OP_EQUALVERIFY <P> OP_CHECKSIG OP_ELSE <csvDelta> OP_CSV OP_DROP <A> OP_CHECKSIG OP_ENDIF`
-(P2WSH). The response body carries the ciphertext and the preimage `k`. Once `k` checks, the client signs
-a plain state for the folded total and hands it over (`/x402/verify` or its next request). A server that
-offers conditional requests MUST close with the conditional state whenever it pays more than the best
-plain state and then claim the hash-lock output with `k` before `csvDelta` blocks pass, and MUST refuse
-a new conditional request while one increment is unfolded (`invalid_xbt_channel_conditional_outstanding`).
-The reference server does both.
+(P2WSH). The response body carries `k`. Once `k` checks, the client decrypts the ciphertext it was
+offered, signs a plain state for the folded total and hands it over (`/x402/verify` or its next request).
+A server that offers conditional requests MUST close with the conditional state whenever it pays more
+than the best plain state, MUST record that close before broadcasting it, and then MUST claim the
+hash-lock output with `k` before `csvDelta` blocks pass, raising the claim's fee as needed. The claim
+publishes `k`, so a client whose response was lost still gets the deliverable from the ciphertext it
+holds; for the same reason the server MUST use a fresh `k` for every sale. It MUST refuse a new
+conditional request while one increment is unfolded (`invalid_xbt_channel_conditional_outstanding`).
+The reference server does all of this.
 
 ### Open questions
 - `asset: "XBT:sat"` is not a CAIP-19 identifier. Is a slip44-style `bip122:…/slip44:0` preferred, or a

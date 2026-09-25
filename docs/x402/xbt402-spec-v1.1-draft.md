@@ -109,8 +109,8 @@ being served). Under **prepay** the client risks one call. Neither can take more
 | `network`, regtest | `bip122:` + first 32 hex of block 101 | wire | Same rule, on the block where regtest switches to BLAKE2b. |
 | `asset` | `XBT:sat` | wire | Not a CAIP-19 identifier; see [open questions](scheme_xbt-channel.md#open-questions). |
 | `derivation` | `v2` | `extra` | The payee-key derivation of §5.1. v1.0 had no such field (its derivation omitted the network). A client MUST refuse any other value **before funding**. |
-| `DUST` | 546 sat | protocol | Smallest output either side creates, and smallest signed `cum`. |
-| `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the client's side. A close is 170–171 vB, so about 3.5 sat/vB. Clients SHOULD refuse offers above a cap (reference: 2,000). |
+| `DUST` | 546 sat | protocol | Smallest output either side creates, and smallest signed `cum`. Above the node's own floors (Knots 29.4.2, default `dustrelayfee`): 294 sat for P2WPKH, 330 for P2WSH and P2TR. |
+| `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the client's side. A close is 170–171 vB with P2WPKH client change, so about 3.5 sat/vB (183 vB, 3.3 sat/vB, with P2WSH or P2TR change; 139–140 vB without change; a conditional close, §6.5, is 214 vB, 2.8 sat/vB). Clients SHOULD refuse offers above a cap (reference: 2,000). |
 | `minCapacity`, `maxCapacity` | 20,000 / 10,000,000 sat (reference) | `extra` | Provider policy. |
 | `minExpiryBlocks`, `maxExpiryBlocks` | 1,008 / 8,640 (reference) | `extra` | Blocks from the tip at open (about 7 and 60 days). |
 | `closeMarginBlocks` | 144 (reference) | `extra` | The provider stops serving and MUST close at `expiry − closeMarginBlocks`. |
@@ -156,7 +156,8 @@ signs a receipt on every paid call, which gives any client a signing oracle (fin
 ## 6. Scripts and transactions
 
 ### 6.1 Funding output
-P2WSH (a 34-byte output) of this 79-byte witness script:
+P2WSH (a 34-byte output) of this witness script, 79 bytes for any `expiry` from 32,768 to 8,388,607
+(every mainnet height; 78 bytes below 32,768, as on a fresh regtest chain):
 ```
 OP_IF    <P> OP_CHECKSIGVERIFY
 OP_ELSE  <expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP
@@ -218,14 +219,35 @@ OP_ENDIF
 and the rest, minus `closeFeeSat`, to the client. Signed `0x21`. Once the client has the preimage `k`
 (`SHA256(k) = H`), it SHOULD fold the increment into an ordinary state paying `uncond + condAmount`.
 
+**Ciphertext first** (AGP-005 M7). The 402 carries the encrypted deliverable, `extra.conditional.cipher`,
+and a client MUST refuse a conditional offer without one, before it signs. The provider's claim (below)
+publishes `k` in its witness, so whatever happens to the paid response, a client that holds the
+ciphertext gets the deliverable: from `k` in the response, or from the claim transaction. A client MUST
+decrypt the ciphertext it was offered, not one a later response substitutes. Because the ciphertext is
+public and every sale reveals `k`, a provider MUST offer each sale under a fresh `k` (the reference
+re-keys a path after every conditional call).
+
+**Client caps** (H6). `condAmount` is the price of a call: a client MUST hold it to its per-call cap and
+its budgets before signing. Since the provider can close with a conditional state and claim it, an
+unchecked `condAmount` lets one conditional call take the whole channel.
+
 **Enforceable since v1.1** (finding M6; in v1.0 the provider stored the conditional signature but had
 no close path that used it). A provider that offers conditional calls MUST do both:
 1. **Close with the conditional state when it pays more.** When the provider closes (cooperatively, or
    at `expiry − closeMarginBlocks`) and `uncond + condAmount − claimFee` exceeds the best plain `cum`
    (the client took the deliverable and never signed the fold), it completes the conditional state
    with its own signature, broadcasts it, and then spends the hash-lock output with `k` to its own
-   key. The claim MUST confirm within `csvDelta` blocks of the close, when the client's branch opens;
-   the watcher rebroadcasts it every tick until it does. The claim fee comes out of `condAmount`.
+   key. The claim MUST confirm within `csvDelta` blocks of the close, when the client's branch opens
+   (checked on Knots 29.4.2: the client's branch is non-final at `csvDelta − 1` confirmations of the close
+   and final at `csvDelta`, and from then on the two race; a claim paying more replaces the client's spend
+   in the mempool). The watcher rebroadcasts the claim every tick until it confirms, and raises its fee
+   while it waits (the reference doubles it for each block of the close's depth, keeping the output
+   above dust: L8). The claim fee comes out of `condAmount`; the claim is 138 vB, so the reference's
+   starting 300 sat is about 2.2 sat/vB.
+   The provider MUST record the close before broadcasting it (M8): a close the node accepted but the
+   provider never recorded (a lost RPC answer, a crash) is never claimed, and once it confirms no re-send
+   is accepted. The reference saves the close transaction and its txid first, treats a failed broadcast
+   of a transaction the node already has as sent, and adopts a recorded close it finds on-chain.
 2. **Hold at most one outstanding conditional increment.** While the stored conditional state pays more
    than the best plain state, a new conditional call is refused with `conditional_outstanding`.
 
@@ -263,8 +285,10 @@ input; implementations emit lowercase.
 - `derivation` names the payee-key derivation, `"v2"` (§5.1). A client MUST refuse an offer with any
   other value, or none, before it funds anything: a script built with another derivation fails the open
   (`bad_funding`) and strands the funding until `expiry`.
-- `extra.conditional = {"hash","amount","csvDelta"}` appears only on a path offering a hash-locked
-  deliverable (§6.5).
+- `extra.conditional = {"hash","amount","csvDelta","cipher"}` appears only on a path offering a
+  hash-locked deliverable (§6.5). `cipher` is the encrypted deliverable (hex); the header can get large,
+  so a provider SHOULD offer conditional calls only for small deliverables (the last chunk of a stream,
+  a key).
 - On a refusal, `error` carries the code (Appendix B). The body adds
   `"channel":{"chan","cum","seq","spentMsat"}` **only when the request was authenticated for that
   channel** (H3). An unauthenticated caller learns nothing about any channel.
@@ -337,7 +361,8 @@ Header `PAYMENT-SIGNATURE: base64(PaymentPayload)`:
 
 Conditional calls replace steps 6–7: `hashlock` equals the offered `H` → else `bad_hashlock`; `sig` is a
 valid `0x21` signature over the conditional state with `uncond` = stored `cum` → else `bad_sig`; the
-charge is `condAmount`. The response body is `{"cipher","preimage","hash"}` (hex).
+charge is `condAmount`. The response body is `{"cipher","preimage","hash"}` (hex); `cipher` repeats the
+offered ciphertext. After the call the provider offers the path under a new `k` (§6.5).
 
 ### 7.4 Payment response
 On every served call, header `PAYMENT-RESPONSE: base64(SettlementResponse)`, the x402 v2 settlement
@@ -361,7 +386,9 @@ A handler response with status ≥ 500 is not billed (`charged` = "0"). A handle
 LF or NUL MUST be replaced by an unbilled 500 (M4).
 
 **Client checks:** `network` and `payer` are its channel's; the receipt verifies under `P`; `req` is
-its own request's digest; `cum` is not more than it signed; `charged ≤ amount` (or the conditional amount); `spentMsat` grew by at most one call.
+its own request's digest; `cum` is not more than it signed; `charged` is at most the price pinned at
+open (for a conditional call, that call's `condAmount`, already held to the client's caps; never a
+quote from a later 402: H6); `spentMsat` grew by at most one call.
 When a 402 arrives on an open channel, the client MUST NOT accept a higher `amount` than it opened the
 channel at, and MUST NOT adopt more than **one call's worth of unreceipted charges over the channel's
 life** (M3).
@@ -370,7 +397,9 @@ life** (M3).
 `POST extra.closeUrl` with `{"chan","sig","payload"?}`. `sig` is `A`'s signature over
 `tagged_hash("xbt402/close", chan)`. `payload` is an optional final state (as in §7.3) paying what is
 owed. The provider completes the best state with its own signature and broadcasts it. Reply:
-`{"chan","txid","cum","unpaidMsat"}`. Replaying a close request only closes the same channel with the
+`{"chan","txid","cum","unpaidMsat"}`, where `cum` is what the recorded close pays the provider (for a
+conditional close, `uncond + condAmount`) and every repeat of the close reports that same close: once a
+channel is closed, a `payload` changes nothing (L10). Replaying a close request only closes the same channel with the
 best state, which the provider may do at any time anyway.
 
 ### 7.6 Facilitator endpoints (optional)
@@ -390,14 +419,18 @@ upstream-style names of Appendix B.
 - `POST /x402/verify`, `payload = {"chan","cum","sig"}`: checks a signed state and records it if higher.
   It is unauthenticated, so it MUST require `sig` for exactly the `cum` given, MUST report nothing the
   caller did not send, MUST NOT check `auth` and MUST NOT move `seq` (otherwise a stranger learns `cum`,
-  or locks the client out with a huge `seq`). Answer: a `VerifyResponse`,
+  or locks the client out with a huge `seq`). A state for a channel that is closed, closing (tip at or
+  above `expiry − closeMarginBlocks`) or suspended is answered `isValid: false`
+  (`invalid_xbt_channel_closing` / `invalid_xbt_channel_unconfirmed`) even when its signature is good:
+  a resource server serves on `isValid` (L11). A higher state is still recorded while the channel is
+  open or closing. Answer: a `VerifyResponse`,
   `{"isValid":true,"payer":"<A hex>","extra":{"chan","cum"}}` or
   `{"isValid":false,"invalidReason":"invalid_xbt_channel_signature"}`. This is also how a client hands
   over a folded conditional state (§6.5).
 - `POST /x402/settle`, `payload` = the close request of §7.5 (`{"chan","sig","payload"?}`): closes the
   channel under the same rules. Answer: a `SettlementResponse`,
   `{"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"<sat paid
-  to the provider>","extra":{"chan","unpaidMsat"}}`, or
+  to the provider by the recorded close>","extra":{"chan","unpaidMsat"}}`, or
   `{"success":false,"errorReason":"<code>","transaction":"","network":"bip122:…"}`. Settling a channel
   that is already closed returns the same close.
 
@@ -417,7 +450,7 @@ Provider view:
 | `open` | the open checks pass | yes | `suspended`, `closing`, `closed` |
 | `suspended` | a watcher tick finds the funding not confirmed to the required depth (reorg) | no (`unconfirmed`) | `open` when it confirms again |
 | `closing` | tip ≥ `expiry − closeMarginBlocks`, or a cooperative close request | no (`channel_closing`) | `closed` |
-| `closed` | the node accepted the close (its txid recorded) | no | rebroadcast while the funding is unspent |
+| `closed` | the node has the close (recorded before the broadcast, M8) | no | rebroadcast while the funding is unspent; claim a conditional close |
 | `lost` | tip ≥ `expiry` and the client's refund confirmed first | no | none |
 
 Watcher rules (run at least every block):
@@ -425,6 +458,9 @@ Watcher rules (run at least every block):
   others (H1). Record the error and retry on the next tick.
 - Re-check every open channel's funding and suspend a channel whose funding is not confirmed to depth (H2).
 - Rebroadcast a recorded close whose funding is unspent again (mempool eviction).
+- Record every close before broadcasting it, and adopt a recorded close that is found on-chain or in the
+  mempool (M8).
+- For a conditional close, rebroadcast the claim until it confirms and raise its fee as `csvDelta` nears (L8).
 - SHOULD bump a close by CPFP from the provider output when the feerate is above what `closeFeeSat` pays.
 - MUST run supervised, so that it cannot silently die: after `expiry` a missing close means the refund wins.
 
@@ -453,7 +489,16 @@ An implementation of this spec MUST meet all of these. Each names the finding in
 16. An agent-facing client (an MCP tool) returns the provider's body and receipt verbatim, labelled as
     untrusted data (the reference: an `untrusted_provider_response` object with `trust: "untrusted"`), and
     filters only its own fields for key material (L7). Filtering the body made a paid call whose answer
-    merely mentioned "seed" look failed after it had been charged.
+    merely mentioned "seed" look failed after it had been charged. **Every** provider-controlled string
+    goes under that label: offer fields and error replies quoted in the tool's errors, and close replies
+    too. The tool's own fields are values it can check (its channel id, a txid-shaped txid, integers,
+    error codes from a fixed alphabet) (L12).
+17. Client: a conditional `condAmount` is held to the per-call cap and budgets before signing (H6).
+18. Conditional calls: ciphertext in the 402 before the client signs, a fresh `k` per sale (M7).
+19. Provider: record a close before broadcasting it; adopt a recorded close found on-chain (M8). Raise
+    the claim's fee as `csvDelta` nears (L8).
+20. Facilitator: `/x402/settle` and close repeats report the recorded close (L10); `/x402/verify` is never
+    `isValid` for a closed, closing or suspended channel (L11).
 
 ## 10. Known weaknesses
 This section is deliberately blunt. None of these is a way to steal funds from a correct
@@ -591,7 +636,14 @@ Breaking (a v1.1 party refuses a v1.0 one at the 402 or the open, before any fun
   also answered the bare `/verify`, `/settle`, `/supported`, which shadowed any API route of those
   names (L6).
 
+Breaking, from the pre-publication review of v1.1 (AGP-005; only conditional calls):
+- **`extra.conditional.cipher`** (§6.5, §7.1, M7): the 402 carries the ciphertext, and a v1.1 client
+  refuses a conditional offer without it before signing. Plain calls are unchanged.
+
 Not breaking:
+- **Review of v1.1 (AGP-005)**: clients cap `condAmount` (H6); providers record a close before sending it
+  (M8), bump the claim fee (L8) and re-key a conditional path after each sale (M7); the facilitator never
+  reports a state that cannot settle (L10, L11); agent tools label every provider string (L12).
 - **Hash-locked conditional calls are enforceable** (§6.5, M6): the provider closes with the conditional
   state when it pays more and claims with `k`, refuses a second outstanding increment
   (`conditional_outstanding`), and the client hands over the fold through `/x402/verify`.
@@ -603,7 +655,8 @@ Not breaking:
   references to internal documents and deployments are removed.
 
 ## Appendix A: security findings referenced in this document
-Identifiers come from the security review of the reference implementation that preceded v1.0.
+Identifiers come from the security review of the reference implementation that preceded v1.0
+(C1–L7), and from the review of the v1.1 changes before publication (H6–L12).
 All Critical and High findings are fixed in the reference and have tests.
 
 | ID | Finding | Rule |
@@ -623,6 +676,14 @@ All Critical and High findings are fixed in the reference and have tests.
 | M6 | The hash-locked conditional state had no provider close path (fixed in v1.1) | §6.5 |
 | L6 | Facilitator paths shadowed API routes of the same name | §7.6 |
 | L7 | The agent-facing client filtered the provider body for key material, so a charged call could look failed | §9 |
+| H6 | The client signed a conditional increment of any size the provider named (one call could take the channel) | §6.5, §7.4 |
+| M7 | The ciphertext came after the client signed, so the hash lock paid a provider that never answered | §6.5 |
+| M8 | A close the node accepted but the provider never recorded was never claimed | §6.5, §8 |
+| L8 | The hash-lock claim's fee was never raised before `csvDelta` | §6.5 |
+| L9 | A lost fold blocked later conditional calls (reference client) | §6.5 |
+| L10 | Repeated settles reported states the close does not pay | §7.5, §7.6 |
+| L11 | `/x402/verify` answered `isValid` for channels that can no longer settle | §7.6 |
+| L12 | Provider text reached the model outside the untrusted label (errors, close replies) | §9 |
 
 ## Appendix B: error codes
 Codes in the 402 `error` field and in `400 {"error"}` answers of the control endpoints:
