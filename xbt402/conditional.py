@@ -55,6 +55,18 @@ def sha256(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
 
 
+def preimage_from_tx(tx, h: bytes) -> bytes:
+    """k from a hash-lock claim (any witness item whose SHA-256 is H), or b"" if `tx` reveals none.
+    The claim that pays the provider publishes k, so a payer holding the ciphertext always gets the
+    deliverable, even when the paid response never arrived (AGP-005 M7)."""
+    from .tx import Tx
+    if isinstance(tx, str):
+        tx = bytes.fromhex(tx)
+    if isinstance(tx, bytes):
+        tx = Tx.parse(tx)
+    return next((w for i in tx.inputs for w in (i.witness or []) if sha256(w) == h), b"")
+
+
 class ConditionalParams:
     def __init__(self, channel: ChannelParams, h: bytes, cond_amount: int, csv_delta: int = CSV_DELTA):
         if cond_amount < DUST:

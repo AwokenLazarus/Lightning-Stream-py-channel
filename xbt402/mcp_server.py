@@ -44,6 +44,8 @@ def xbt402_pay(client, url: str, method: str = "GET", body: bytes = b"", max_sat
     client.max_price = min(client.max_price, max_sats)
     try:
         status, hdrs, out = client.request(method, url, body)
+    except (ChannelError, ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+        return refused(e)
     finally:
         client.max_price = old
     receipt = None
@@ -90,12 +92,44 @@ def xbt_channels(signer) -> dict:
     return sanitize(result)
 
 
+def refused(e: Exception) -> dict:
+    """A refused or failed call as the tool's own fields (a fixed-alphabet code) plus the message,
+    which can quote the provider (an offer field, its error reply), under the untrusted label (L12)."""
+    code = getattr(e, "code", "")
+    if not _code_ok(code):
+        code = "network_error" if isinstance(e, OSError) else "bad_provider_response"
+    return {"status": None, "paid": False, "error": code, UNTRUSTED: untrusted(str(e).encode())}
+
+
+def _code_ok(code) -> bool:
+    from .x402_channel import safe_code
+    return safe_code(code)
+
+
 def xbt_close(client, origin: str) -> dict:
-    res = client.close(origin)
-    out = {"chan": res.get("chan"), "txid": res.get("txid"), "cum": res.get("cum"),
-           "unpaidMsat": res.get("unpaidMsat")}
+    """Cooperative close. Only values the tool can check are its own fields: the channel id it holds,
+    a 64-hex txid, integer amounts. The provider's reply comes back under the untrusted label (L12)."""
+    try:
+        res = client.close(origin)
+    except (ChannelError, ValueError, KeyError, TypeError, AttributeError, OSError) as e:
+        return refused(e)
+    ch = client.channels.get(origin)
+    txid = res.get("txid") if isinstance(res, dict) else None
+    out = {"chan": ch.payer.params.channel_id if ch else None,
+           "txid": txid if isinstance(txid, str) and len(txid) == 64 and _hex(txid) else None,
+           "cum": _int(res, "cum"), "unpaidMsat": _int(res, "unpaidMsat")}
     assert_no_key_material(out)
-    return sanitize(out)
+    out = sanitize(out)
+    out[UNTRUSTED] = untrusted(json.dumps(res).encode())
+    return out
+
+
+def _hex(s: str) -> bool:
+    try:
+        bytes.fromhex(s)
+        return True
+    except ValueError:
+        return False
 
 
 def xbt_refunds_due(client, height: int = None) -> dict:

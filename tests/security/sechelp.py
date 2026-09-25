@@ -159,45 +159,53 @@ def authed(xc, ch, payer, prov_payee_pub, payload, method="GET", path="/v1/x", b
 
 
 class Repro:
-    """Mixin: a finding reproduces on unpatched wave 2 (a failure means BASE changed, not the fix)."""
+    """Mixin: a finding reproduces on its unpatched base (a failure means the base changed, not the fix)."""
+    REPRO_BASE = BASE
 
     def reproduces(self, cond, what):
-        self.assertTrue(cond, f"did not reproduce on {BASE}: {what}")
-        sys.stderr.write(f"\n    REPRODUCED on {BASE}: {what} ")
+        self.assertTrue(cond, f"did not reproduce on {self.REPRO_BASE}: {what}")
+        sys.stderr.write(f"\n    REPRODUCED on {self.REPRO_BASE}: {what} ")
 
 
 _base = {}
+V11 = "c770880"      # xbt402 v1.1 as AGP-004 shipped it, which AGP-005 reviews and patches
 
 
-def base_tree():
-    """The unpatched wave-2 tree (BASE) as an importable package `xbt402w2`, so the repro tests show
-    each finding on the code XBT-060 shipped while the fixed tests run the tree they sit in."""
-    if "dir" in _base:
-        return _base["dir"]
+def base_tree(rev=BASE, pkg="xbt402w2"):
+    """An unpatched tree (`rev`) as an importable package `pkg`, so the repro tests show each finding
+    on the code that shipped while the fixed tests run the tree they sit in."""
+    if rev in _base:
+        return _base[rev]
     out = None
-    tmp = tempfile.mkdtemp(prefix="xbt061-base-")
+    tmp = tempfile.mkdtemp(prefix=f"xbt402-{rev}-")
     try:
-        arc = subprocess.run(["git", "-C", ROOT, "archive", BASE, "xbt402"], check=True, capture_output=True).stdout
+        arc = subprocess.run(["git", "-C", ROOT, "archive", rev, "xbt402"], check=True, capture_output=True).stdout
         subprocess.run(["tar", "-x", "-C", tmp], input=arc, check=True)
-        shutil.move(os.path.join(tmp, "xbt402"), os.path.join(tmp, "xbt402w2"))
+        shutil.move(os.path.join(tmp, "xbt402"), os.path.join(tmp, pkg))
         atexit.register(shutil.rmtree, tmp, True)
         out = tmp
     except (subprocess.CalledProcessError, OSError) as e:
         sys.stderr.write(f"base_tree: {e}\n")
-    _base["dir"] = out
+    _base[rev] = out
     return out
 
 
-def base(name):
-    """Import xbt402w2.<name>: unpatched wave 2 (raises SkipTest if git or BASE is unavailable)."""
+def base(name, rev=BASE, pkg="xbt402w2"):
+    """Import <pkg>.<name> from unpatched `rev` (wave 2 by default; raises SkipTest if git or the
+    revision is unavailable)."""
     import importlib
     import unittest
-    d = base_tree()
+    d = base_tree(rev, pkg)
     if not d:
-        raise unittest.SkipTest(f"unpatched base {BASE} unavailable")
+        raise unittest.SkipTest(f"unpatched base {rev} unavailable")
     if d not in sys.path:
         sys.path.insert(0, d)
-    return importlib.import_module(f"xbt402w2.{name}")
+    return importlib.import_module(f"{pkg}.{name}")
+
+
+def v11(name):
+    """Import xbt402v11.<name>: v1.1 as AGP-004 shipped it (c770880), before the AGP-005 fixes."""
+    return base(name, V11, "xbt402v11")
 
 
 def load(name):
