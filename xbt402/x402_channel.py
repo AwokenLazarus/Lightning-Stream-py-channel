@@ -32,7 +32,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
 from . import ecc
-from .channel import DUST, ChannelError, ChannelParams, Payee, Payer, channel_payee_secret
+from .channel import (DUST, ChannelError, ChannelParams, Payee, Payer, canonical_chan, channel_payee_secret,
+                      check_payout_spk)
 from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
@@ -154,11 +155,14 @@ class XbtChannelProvider:
         if req.get("network") != self.network:
             raise ChannelError("wrong_network", f"this provider is on {self.network}")
         c = req["channel"]
-        ecc._decode_pub(bytes.fromhex(c["payerPub"]))
-        p = ChannelParams.derive(self.pay_to, c["payerPub"], int(c["expiry"]), self.close_fee, c.get("payerSpk", ""))
-        if c["redeemScript"] != p.script.hex():
+        payer_pub = bytes.fromhex(c["payerPub"])
+        ecc._decode_pub(payer_pub)
+        payer_spk = check_payout_spk(c["payerSpk"]) if c.get("payerSpk") else ""
+        p = ChannelParams.derive(self.pay_to, payer_pub.hex(), int(c["expiry"]), self.close_fee, payer_spk)
+        if c["redeemScript"].lower() != p.script.hex():
             raise ChannelError("bad_funding", "redeemScript does not match payTo/payerPub/expiry")
-        p.funding_txid, p.funding_vout, p.capacity = c["txid"], int(c["vout"]), int(c["capacity"])
+        chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
+        p.funding_txid, p.funding_vout, p.capacity = chan.split(":")[0], int(c["vout"]), int(c["capacity"])
         with self.ledger.lock:
             if p.channel_id in self.ledger.channels:
                 raise ChannelError("duplicate_channel")
@@ -189,7 +193,7 @@ class XbtChannelProvider:
 
     def close(self, req: dict) -> dict:
         with self.ledger.lock:
-            st = self.ledger.channels.get(req["chan"])
+            st = self.ledger.channels.get(canonical_chan(req["chan"]))
             if not st:
                 raise ChannelError("unknown_channel")
             if not ecc.verify(bytes.fromhex(st.params.payer_pub), close_message(st.params.channel_id),
@@ -231,7 +235,7 @@ class XbtChannelProvider:
     def facilitator_verify(self, req: dict) -> dict:
         pl = req.get("payload") or req
         with self.ledger.lock:
-            st = self.ledger.channels.get(pl.get("chan", ""))
+            st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
             if not st:
                 raise ChannelError("unknown_channel")
             self._apply(st, pl)
@@ -300,7 +304,10 @@ class XbtChannelProvider:
         except (ValueError, KeyError, TypeError):
             return self._payment_required(url, price, "bad_payload")
         with self.ledger.lock:
-            st = self.ledger.channels.get(pl.get("chan", ""))
+            try:
+                st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
+            except ChannelError:
+                st = None
             if not st:
                 return self._payment_required(url, price, "unknown_channel")
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:

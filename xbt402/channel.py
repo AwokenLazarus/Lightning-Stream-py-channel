@@ -38,6 +38,35 @@ class ChannelError(ValueError):
         self.code = code
 
 
+def canonical_chan(chan) -> str:
+    """The one spelling of a channel id: 64 lowercase hex txid, ':', decimal vout. bitcoind parses
+    txids case-insensitively, so without this one outpoint could be opened (and credited) under
+    many ids."""
+    if not isinstance(chan, str):
+        raise ChannelError("unknown_channel", "chan must be txid:vout")
+    txid, sep, vout = chan.partition(":")
+    if not sep or len(txid) != 64 or not vout.isdigit() or len(vout) > 10:
+        raise ChannelError("unknown_channel", "chan must be txid:vout")
+    try:
+        txid = bytes.fromhex(txid).hex()
+    except ValueError:
+        raise ChannelError("unknown_channel", "txid is not hex")
+    return f"{txid}:{int(vout)}"
+
+
+def check_payout_spk(spk: str) -> str:
+    """A payout scriptPubKey both sides can put in every state: P2WPKH, P2WSH or P2TR, which are
+    standard and fit the RDTS 34-byte output cap. Anything else could make every close
+    non-standard or consensus-invalid while the provider keeps serving. Returns canonical hex."""
+    try:
+        b = bytes.fromhex(spk)
+    except (TypeError, ValueError):
+        raise ChannelError("bad_payer_spk", "payerSpk is not hex")
+    if not (len(b) == 22 and b[:2] == b"\x00\x14" or len(b) == 34 and b[:2] in (b"\x00\x20", b"\x51\x20")):
+        raise ChannelError("bad_payer_spk", "payerSpk must be P2WPKH, P2WSH or P2TR")
+    return b.hex()
+
+
 def funding_script(payer_pub: bytes, payee_pub: bytes, expiry: int) -> bytes:
     if not 0 < expiry < EXPIRY_MAX:
         raise ChannelError("bad_expiry", "expiry must be a block height")
@@ -60,6 +89,12 @@ def channel_payee_pub(pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:
 
 def channel_payee_secret(pay_to_secret: int, payer_pub: bytes, expiry: int) -> int:
     return (pay_to_secret + _payee_tweak(ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
+
+
+def channel_auth_key(secret: int, other_pub: bytes) -> bytes:
+    """Per-channel request-authentication key, ECDH(A, P): the payer computes it with a and P, the
+    payee with p and A. Nobody else can, so a known channel id alone buys nothing."""
+    return tagged_hash("xbt402/auth-key", ecc.ecdh(secret, other_pub))
 
 
 @dataclass
