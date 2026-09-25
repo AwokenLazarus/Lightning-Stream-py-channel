@@ -1,18 +1,18 @@
 #!/bin/bash
-# Fresh isolated nodes for tests/regtest_rules.py. Ports 30130-30135 (XBT-060 range 30100-30199).
-# Datadirs under ~/xbt-rnd/xbt-060/run/. Knots 29.4.2 A+B (RDTS + #419) and Core 29.0 stuck at
+# Fresh isolated nodes for tests/regtest_rules.py. Ports 30232-30237 (XBT-061 range 30200-30299).
+# Datadirs under ~/xbt-rnd/xbt-061/run/. Knots 29.4.2 A+B (RDTS + #419) and Core 29.0 stuck at
 # block 100. No miners; everything is stopped and wiped on exit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # demo.sh exports a pad for the HTTP node; rules nodes must mine the presplit as block 1 first
 unset XBT402_MATURITY_PAD
-R=${RULES_ROOT:-$HOME/xbt-rnd/xbt-060/run}
+R=${RULES_ROOT:-$HOME/xbt-rnd/xbt-061/run}
 K=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
 C=${XBT_CORE_BIN:-$HOME/lazarus-regtest/b1-xbt402/core-29.0}
 export RULES_ROOT=$R
-nodeA()    { XBT_BIN=$K XBT402_DATADIR=$R/rules-a    XBT402_RPCPORT=30130 XBT402_P2PPORT=30131 scripts/node.sh "$@"; }
-nodeB()    { XBT_BIN=$K XBT402_DATADIR=$R/rules-b    XBT402_RPCPORT=30132 XBT402_P2PPORT=30133 XBT402_CONNECT=30131 XBT402_BLOCKS=0 scripts/node.sh "$@"; }
-nodeCore() { XBT_BIN=$C XBT402_DATADIR=$R/rules-core XBT402_RPCPORT=30134 XBT402_P2PPORT=30135 XBT402_CONNECT=30131 XBT402_BLOCKS=0 scripts/node.sh "$@"; }
+nodeA()    { XBT_BIN=$K XBT402_DATADIR=$R/rules-a    XBT402_RPCPORT=30232 XBT402_P2PPORT=30233 scripts/node.sh "$@"; }
+nodeB()    { XBT_BIN=$K XBT402_DATADIR=$R/rules-b    XBT402_RPCPORT=30234 XBT402_P2PPORT=30235 XBT402_CONNECT=30233 XBT402_BLOCKS=0 scripts/node.sh "$@"; }
+nodeCore() { XBT_BIN=$C XBT402_DATADIR=$R/rules-core XBT402_RPCPORT=30236 XBT402_P2PPORT=30237 XBT402_CONNECT=30233 XBT402_BLOCKS=0 scripts/node.sh "$@"; }
 cleanup() { [ -n "${KEEP_ON_FAIL:-}" ] && [ "${rc:-0}" != 0 ] && { tail -20 $R/rules-a/regtest/debug.log; }; nodeA wipe; nodeB wipe; nodeCore wipe; } 2>/dev/null
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP

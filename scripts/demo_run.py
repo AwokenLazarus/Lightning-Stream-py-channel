@@ -8,7 +8,7 @@
 6. Cooperative close; payee on-chain total equals signed calls. Optional CPFP child.
 7. Prepay provider vanishes; refund custody broadcasts after expiry.
 
-Ports: HTTP 30120 / 30121 (env XBT402_HTTP_PORT). Exit 0 only if every check holds.
+Ports: HTTP 30240 / 30241 (env XBT402_HTTP_PORT). Exit 0 only if every check holds.
 """
 import json
 import os
@@ -33,7 +33,7 @@ from xbt402.x402_channel import (RefundCustody, XbtChannelClient,               
 SAT = 100_000_000
 PRICE = 150
 CALLS = int(os.environ.get("XBT402_CALLS", "1000"))
-PORT = int(os.environ.get("XBT402_HTTP_PORT", "30120"))
+PORT = int(os.environ.get("XBT402_HTTP_PORT", "30240"))
 SECRET = b"wave2-conditional-result"
 
 
