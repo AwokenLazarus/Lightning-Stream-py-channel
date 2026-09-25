@@ -10,7 +10,7 @@ The xbt402 headers themselves are safe (PAYMENT-* values are base64). But v1's h
 Wave 2 adds an ASGI transport (Starlette): it reads the whole body with no bound, and whether a
 CR/LF header is refused depends on which ASGI server runs it. Fixed in serve() itself (an unbilled
 500 for a CR/LF/NUL header, whatever the transport) and in both transports' framing.
-Servers bind 127.0.0.1 on ports 30210-30219 (XBT-061's range).
+Servers bind 127.0.0.1 on ports XBT402_TEST_PORT_BASE + 20..23 (see sechelp.PORT_OFFSETS).
 """
 import asyncio
 import socket
@@ -19,13 +19,14 @@ import time
 import unittest
 import urllib.parse
 
-from sechelp import FakeNode, Repro, authed, base, load, make_channel, make_provider
+from sechelp import FakeNode, Repro, authed, base, load, make_channel, make_provider, port_for
 ch, xc = base("channel"), base("x402_channel")   # unpatched wave 2: the repro tests
 
 INNER = b"GET /v1/smuggled HTTP/1.1\r\nHost: x\r\n\r\n"
 SIZE = f"{len(INNER):x}\r\n".encode()
 SMUGGLE = (b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: " + str(len(SIZE)).encode()
            + b"\r\nTransfer-Encoding: chunked\r\n\r\n" + SIZE + INNER + b"\r\n0\r\n\r\n")
+P0, P1, P2, P3 = (port_for("m4", i) for i in range(4))
 EVIL_PATH = "/v1/x%0d%0aSet-Cookie:%20pwn=1"
 
 
@@ -77,36 +78,36 @@ class HttpLayer(Repro, unittest.TestCase):
         return prov, node
 
     def test_repro_crlf_header_injection(self):
-        prov, node = self.serve(xc, 30210, echo)
-        data = exchange(30210, paid_get(xc, ch, prov, node, EVIL_PATH, auth=False))
+        prov, node = self.serve(xc, P0, echo)
+        data = exchange(P0, paid_get(xc, ch, prov, node, EVIL_PATH, auth=False))
         self.reproduces(b"\r\nSet-Cookie: pwn=1\r\n" in data.split(b"\r\n\r\n")[0] + b"\r\n",
                         "handler-reflected CR/LF became a Set-Cookie response header")
 
     def test_repro_cl_te_smuggling(self):
-        self.serve(xc, 30211)
-        data = exchange(30211, SMUGGLE)
+        self.serve(xc, P1)
+        data = exchange(P1, SMUGGLE)
         self.reproduces(data.count(b"HTTP/1.1 402") >= 2 and b"smuggled" in data,
                         "one chunked POST (to a TE-honoring proxy) was served as two requests")
 
     def test_repro_negative_content_length_pins_thread(self):
-        self.serve(xc, 30212)
-        data = exchange(30212, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n", wait=1.0)
+        self.serve(xc, P2)
+        data = exchange(P2, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n", wait=1.0)
         self.reproduces(data == b"", "Content-Length: -1 got no answer: the thread reads until the client hangs up")
 
     def test_fixed(self):
         xp, cp = load("x402_channel"), load("channel")
-        prov, node = self.serve(xp, 30213, echo)
-        data = exchange(30213, paid_get(xp, cp, prov, node, EVIL_PATH, auth=True))
+        prov, node = self.serve(xp, P3, echo)
+        data = exchange(P3, paid_get(xp, cp, prov, node, EVIL_PATH, auth=True))
         self.assertTrue(data.startswith(b"HTTP/1.0 500") or data.startswith(b"HTTP/1.1 500"), data[:60])
         self.assertNotIn(b"Set-Cookie", data)
-        data = exchange(30213, SMUGGLE)
+        data = exchange(P3, SMUGGLE)
         self.assertIn(b" 501 ", data.split(b"\r\n")[0])
         self.assertNotIn(b"smuggled", data)
-        data = exchange(30213, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+        data = exchange(P3, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
         self.assertIn(b" 400 ", data.split(b"\r\n")[0])
-        data = exchange(30213, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n")
+        data = exchange(P3, b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n")
         self.assertIn(b" 413 ", data.split(b"\r\n")[0])
-        data = exchange(30213, b"GET /v1/x HTTP/1.1\r\nHost: x\r\nPAYMENT-SIGNATURE: a\r\nPAYMENT-SIGNATURE: b\r\n\r\n")
+        data = exchange(P3, b"GET /v1/x HTTP/1.1\r\nHost: x\r\nPAYMENT-SIGNATURE: a\r\nPAYMENT-SIGNATURE: b\r\n\r\n")
         self.assertIn(b" 400 ", data.split(b"\r\n")[0])
 
 

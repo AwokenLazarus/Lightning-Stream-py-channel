@@ -6,18 +6,18 @@ higher `amount`, up to max_price). A provider that answers every request with 40
 call" gets a fresh, higher state signed twice per request and never serves or signs a receipt.
 The v1 note's "at most one call" holds per request, not per channel: N requests, N calls lost.
 Unchanged in wave 2. Fixed: the price is pinned at open and the one call of slack is per channel.
-Ports 30214-30215.
+Ports XBT402_TEST_PORT_BASE + 30..31 (see sechelp.PORT_OFFSETS).
 """
 import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sechelp import FakeNode, Repro, base, load, make_provider
+from sechelp import FakeNode, Repro, base, load, make_provider, port_for
 ch, ecc, xc = base("channel"), base("ecc"), base("x402_channel")   # unpatched wave 2: the repro tests
 wire = load("x402_channel")   # the fake server's base64-JSON helpers (the same in every tree)
 
-PORT = 30214
+PORT = port_for("m3")
 
 
 class Greedy(BaseHTTPRequestHandler):

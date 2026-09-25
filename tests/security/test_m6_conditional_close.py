@@ -13,16 +13,14 @@ plain 0x21 state, since only one conditional state can be closed with. k and the
 kept in the ledger, so a restart can still close and claim.
 
 The regtest class runs the whole thing on a throwaway Knots 29.4.2 node (RDTS + #419) on ports
-33001/33002 (AGP-001's range), datadir ~/xbt-rnd/b1/run/m6 (wiped after). It is skipped only when
-the node binary is missing.
+XBT402_TEST_PORT_BASE + 0/1 (see sechelp.PORT_OFFSETS), datadir run/m6-<pid> (stopped and wiped
+after, also when the class fails). It is skipped only when the node binary is missing (env XBT_BIN).
 """
 import json
 import os
-import shutil
-import subprocess
 import unittest
 
-from sechelp import ROOT, FakeNode, Repro, base, load, make_provider
+from sechelp import ROOT, FakeNode, RegtestNode, Repro, base, load, make_provider, port_for
 
 PLAIN = b"the deliverable"
 COND_PRICE = 1000
@@ -192,10 +190,8 @@ class ConditionalClose(Repro, unittest.TestCase):
         self.assertTrue(prov._cond_outstanding(chan))
 
 
-BIN = "$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2"
-DD = os.path.expanduser("~/xbt-rnd/b1/run/m6")
-ENV = {"XBT_BIN": BIN, "XBT402_DATADIR": DD, "XBT402_RPCPORT": "33001", "XBT402_P2PPORT": "33002",
-       "XBT402_BLOCKS": "300", "XBT402_MATURITY_PAD": "6800"}
+BIN = os.environ.get("XBT_BIN", "$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2")
+DD = os.path.join(ROOT, "run", f"m6-{os.getpid()}")
 
 
 @unittest.skipUnless(os.path.exists(os.path.join(BIN, "bitcoind")), "Knots 29.4.2 binary not installed")
@@ -204,14 +200,9 @@ class ConditionalCloseRegtest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.env = {**os.environ, **ENV}
-        node_sh = os.path.join(ROOT, "scripts", "node.sh")
-        subprocess.run([node_sh, "wipe"], env=cls.env, capture_output=True)
-        cls.addClassCleanup(lambda: (subprocess.run([node_sh, "wipe"], env=cls.env, capture_output=True),
-                                     shutil.rmtree(DD, ignore_errors=True)))
-        subprocess.run(["nice", "-n", "10", node_sh, "up"], env=cls.env, check=True, capture_output=True)
-        from xbt402.rpc import RPC
-        cls.node = RPC(33001, os.path.join(DD, "regtest", ".cookie"))
+        cls.regtest = RegtestNode(BIN, DD, port_for("m6_rpc"), port_for("m6_p2p"),
+                                  XBT402_BLOCKS="300", XBT402_MATURITY_PAD="6800")
+        cls.node = cls.regtest.start(cls)
         cls.w = cls.node.wallet("w")
 
     def mine(self, n=1):

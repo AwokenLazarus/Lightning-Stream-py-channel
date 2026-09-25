@@ -214,6 +214,116 @@ def load(name):
     return importlib.import_module(f"xbt402.{name}")
 
 
+# Every port a test binds is XBT402_TEST_PORT_BASE + one of these offsets (a block of 100), so
+# parallel runs on one machine use disjoint ranges. Without the variable, a free block is picked
+# at runtime (logged to stderr).
+PORT_OFFSETS = {"m6_rpc": 0, "m6_p2p": 1, "l6": 10, "m4": 20, "m3": 30, "l13": 40}
+PORT_BLOCK = 100
+_port_base = []
+
+
+def _block_free(base):
+    import socket
+    for p in range(base, base + PORT_BLOCK):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                return False
+    return True
+
+
+def port_base():
+    if not _port_base:
+        env = os.environ.get("XBT402_TEST_PORT_BASE")
+        if env:
+            base = int(env)
+            if not 1024 <= base <= 65535 - PORT_BLOCK:
+                raise ValueError(f"XBT402_TEST_PORT_BASE={env}: not in 1024..{65535 - PORT_BLOCK}")
+        else:
+            import random
+            rng = random.Random()
+            for _ in range(50):
+                base = rng.randrange(20000, 60000, PORT_BLOCK)
+                if _block_free(base):
+                    break
+            else:
+                raise RuntimeError("no free block of test ports; set XBT402_TEST_PORT_BASE")
+            sys.stderr.write(f"\n[test ports: XBT402_TEST_PORT_BASE unset, using {base}-{base + PORT_BLOCK - 1}]\n")
+        _port_base.append(base)
+    return _port_base[0]
+
+
+def port_for(name, i=0):
+    """The port for `name` (see PORT_OFFSETS), plus `i` for tests that bind several."""
+    return port_base() + PORT_OFFSETS[name] + i
+
+
+class RegtestNode:
+    """A throwaway regtest node started with scripts/node.sh, which a test class owns: `start()`
+    registers the teardown before it launches bitcoind, so a node that fails to start, or a class
+    whose setUpClass or tests fail, is still stopped (SIGKILL after a grace period) and wiped."""
+
+    def __init__(self, bin_dir, datadir, rpcport, p2pport, **env):
+        self.datadir, self.rpcport = datadir, rpcport
+        self.env = {**os.environ, "XBT_BIN": bin_dir, "XBT402_DATADIR": datadir,
+                    "XBT402_RPCPORT": str(rpcport), "XBT402_P2PPORT": str(p2pport), **env}
+        self.node_sh = os.path.join(ROOT, "scripts", "node.sh")
+        self._stopped = False
+
+    def start(self, test_class):
+        test_class.addClassCleanup(self.stop)
+        atexit.register(self.stop)
+        self.stop(final=False)                      # a leftover datadir from a killed run
+        self._stopped = False
+        r = subprocess.run(["nice", "-n", "10", self.node_sh, "up"], env=self.env, capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"regtest node on {self.rpcport} did not start: {r.stderr.strip()[-600:]}")
+        from xbt402.rpc import RPC
+        return RPC(self.rpcport, os.path.join(self.datadir, "regtest", ".cookie"))
+
+    def _pid(self):
+        try:
+            with open(os.path.join(self.datadir, "regtest", "bitcoind.pid")) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _ours(self, pid):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+        except OSError:
+            return False
+        return b"bitcoind" in cmd and self.datadir.encode() in cmd
+
+    def stop(self, final=True):
+        import signal
+        import time
+        if self._stopped:
+            return
+        self._stopped = final
+        subprocess.run([self.node_sh, "down"], env=self.env, capture_output=True, timeout=90)
+        pid = self._pid()
+        if pid and self._ours(pid):                 # `stop` did not answer: the node never came up
+            for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 5)):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    break
+                end = time.time() + wait
+                while time.time() < end:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.2)
+                else:
+                    continue
+                break
+        shutil.rmtree(self.datadir, ignore_errors=True)
+
+
 def backends(ecc_mod):
     """The ECDSA backends this python can run: always the pure-Python fallback, plus coincurve."""
     return ["oracle"] + (["coincurve"] if ecc_mod.BACKEND == "coincurve" else [])

@@ -5,14 +5,14 @@ looked at the paid route, so an API with its own /verify (a very ordinary name) 
 request: a payer who signed and sent a state for it got a facilitator error instead. Fixed: the
 facilitator lives under /x402/ only (/x402/verify, /x402/settle, /x402/supported), in serve()
 and so in both transports (http.server and ASGI).
-Servers bind 127.0.0.1 on ports 33010-33019 (AGP-001's range).
+Servers bind 127.0.0.1 on port XBT402_TEST_PORT_BASE + 10 (see sechelp.PORT_OFFSETS).
 """
 import json
 import threading
 import unittest
 import urllib.request
 
-from sechelp import PRICE, FakeNode, Repro, authed, base, load, make_channel, make_provider
+from sechelp import PRICE, FakeNode, Repro, authed, base, load, make_channel, make_provider, port_for
 ch, xc = base("channel"), base("x402_channel")   # unpatched wave 2: the repro tests
 
 BODY = b'{"doc": "an API document to verify"}'
@@ -96,12 +96,12 @@ class RouteShadowing(Repro, unittest.TestCase):
 
         def send(prov, method, path, body, headers):
             if "port" not in servers:
-                httpd = prov.http_server(33010)
+                httpd = prov.http_server(port_for("l6"))
                 threading.Thread(target=httpd.serve_forever, daemon=True).start()
                 self.addCleanup(httpd.server_close)
                 self.addCleanup(httpd.shutdown)
-                servers["port"] = 33010
-            req = urllib.request.Request(f"http://127.0.0.1:33010{path}", body or None, headers, method=method)
+                servers["port"] = port_for("l6")
+            req = urllib.request.Request(f"http://127.0.0.1:{servers['port']}{path}", body or None, headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=10) as r:
                     return r.status, r.read()

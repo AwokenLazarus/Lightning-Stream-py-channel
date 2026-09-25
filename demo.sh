@@ -1,5 +1,6 @@
 #!/bin/bash
-# xbt-channel wave 2 (hardened) demo. Isolated Knots 29.4.2 (RDTS + #419) on ports 30230-30241 (XBT-061 range 30200-30299).
+# xbt-channel wave 2 (hardened) demo. Isolated Knots 29.4.2 (RDTS + #419) on ports XBT402_TEST_PORT_BASE + 30..41
+# (default base 30200, XBT-061's range 30200-30299).
 # Datadirs under ~/xbt-rnd/xbt-061/run/. Starts NO miners. Nodes wiped on exit.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -8,9 +9,10 @@ R=${XBT402_RUN:-$HOME/xbt-rnd/xbt-061/run}
 mkdir -p "$R"
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
 export XBT402_DATADIR=$R/demo
-export XBT402_RPCPORT=30230
-export XBT402_P2PPORT=30231
-export XBT402_HTTP_PORT=30240
+PB=${XBT402_TEST_PORT_BASE:-30200}
+export XBT402_RPCPORT=$((PB + 30))
+export XBT402_P2PPORT=$((PB + 31))
+export XBT402_HTTP_PORT=$((PB + 40))
 export XBT402_MATURITY_PAD=6800
 export RULES_ROOT=$R
 cleanup() { scripts/node.sh wipe >/dev/null 2>&1 || true; }
