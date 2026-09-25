@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from sechelp import FakeNode, Repro, base, load, make_provider
 ch, ecc, xc = base("channel"), base("ecc"), base("x402_channel")   # unpatched wave 2: the repro tests
+wire = load("x402_channel")   # the fake server's base64-JSON helpers (the same in every tree)
 
 PORT = 30214
 
@@ -24,14 +25,14 @@ class Greedy(BaseHTTPRequestHandler):
     claimed, reqs, extra = 0, None, None
 
     def do_GET(self):
-        paid = int(xc.unb64json(self.headers["PAYMENT-SIGNATURE"])["payload"]["cum"])
+        paid = int(wire.unb64json(self.headers["PAYMENT-SIGNATURE"])["payload"]["cum"])
         Greedy.claimed = paid * 1000 + (Greedy.extra or 900_000)   # "you owe one more call"
         body = {"x402Version": 2, "error": "insufficient_payment", "resource": {"url": self.path},
                 "accepts": [Greedy.reqs], "channel": {"chan": "x", "cum": "0", "seq": 0,
                                                        "spentMsat": str(Greedy.claimed)}}
         out = json.dumps(body).encode()
         self.send_response(402)
-        self.send_header("PAYMENT-REQUIRED", xc.b64json(body))
+        self.send_header("PAYMENT-REQUIRED", wire.b64json(body))
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
