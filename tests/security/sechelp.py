@@ -95,6 +95,10 @@ class FakeNode:
         for i in tx.inputs:
             self.spent.add((i.txid[::-1].hex(), i.vout))
         self.sent.append(hx)
+        self.txs.setdefault(tx.txid(), {   # in the mempool: its outputs are spendable (a claim of a close)
+            "vin": [{"txid": i.txid[::-1].hex(), "vout": i.vout} for i in tx.inputs],
+            "vout": [{"n": n, "value": o.value / 1e8, "scriptPubKey": {"hex": o.script_pubkey.hex()}}
+                     for n, o in enumerate(tx.outputs)], "confirmations": 0})
         return tx.txid()
 
 
