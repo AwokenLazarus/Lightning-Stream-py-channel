@@ -74,12 +74,15 @@ class Ledger:
             )
             self.channels[chan] = st
 
-    def save(self):
-        """Upsert every in-memory row and fsync the WAL."""
+    def save(self, *states: ChannelState):
+        """Upsert the given rows (every row if none are given) and fsync the WAL. A paid call saves
+        only its own channel: rewriting all of them made each call O(channels), and channels cost an
+        attacker only fees (XBT-061 M5)."""
+        rows = [(st.params.channel_id, st) for st in states] if states else list(self.channels.items())
         cur = self._db.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
-            for chan, st in self.channels.items():
+            for chan, st in rows:
                 cur.execute(
                     """INSERT INTO channels(chan, params_json, best_cum, best_sig, seq, spent_msat,
                        closed_txid, best_sig_a3, cond_hash, cond_amount, cond_sig, extra_json,

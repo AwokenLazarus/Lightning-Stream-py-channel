@@ -186,8 +186,8 @@ class XbtChannelProvider:
             if p.channel_id in self.ledger.channels:
                 raise ChannelError("duplicate_channel")
             confs = check_funding(self.rpc, p, self.policy)
-            self.ledger.channels[p.channel_id] = ChannelState(p)
-            self.ledger.save()
+            st = self.ledger.channels[p.channel_id] = ChannelState(p)
+            self.ledger.save(st)
         return {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
 
     def _payee(self, st: ChannelState) -> Payee:
@@ -220,11 +220,12 @@ class XbtChannelProvider:
             if "sig" not in pl:
                 raise ChannelError("bad_sig", "a higher cum needs a signature")
             payee = self._payee(st)
-            payee.accept(cum, bytes.fromhex(pl["sig"]))
-            st.best_cum, st.best_sig = cum, pl["sig"]
+            sig = bytes.fromhex(pl["sig"])
+            payee.accept(cum, sig)
+            st.best_cum, st.best_sig = cum, sig.hex()
         elif cum < st.best_cum:
             raise ChannelError("stale_amount", f"have {st.best_cum}, got {cum}")
-        elif pl.get("sig") and pl["sig"] != st.best_sig:
+        elif pl.get("sig") and bytes.fromhex(pl["sig"]) != bytes.fromhex(st.best_sig or ""):
             raise ChannelError("bad_sig", "signature differs from the stored state for this cum")
 
     def close(self, req: dict) -> dict:
@@ -249,7 +250,7 @@ class XbtChannelProvider:
                 raise
             except Exception as e:  # noqa: BLE001 - node errors become protocol errors
                 raise ChannelError("close_failed", str(e))
-            self.ledger.save()
+            self.ledger.save(st)
         return st.closed_txid
 
     def _watch_one(self, st: ChannelState, h: int, out: list):
@@ -315,7 +316,7 @@ class XbtChannelProvider:
             self._payee(st).verify_state(cum, bytes.fromhex(pl["sig"]))
             if cum > st.best_cum:
                 st.best_cum, st.best_sig = cum, pl["sig"]
-                self.ledger.save()
+                self.ledger.save(st)
             return {"valid": True, "chan": st.params.channel_id, "cum": str(cum)}
 
     def facilitator_settle(self, req: dict) -> dict:
@@ -343,7 +344,7 @@ class XbtChannelProvider:
                 if path.endswith("settle") and method == "POST":
                     return 200, {"Content-Type": "application/json"}, json.dumps(
                         self.facilitator_settle(json.loads(body))).encode()
-            except (ChannelError, KeyError, ValueError) as e:
+            except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
         if path.startswith("/x402/xbt-channel/"):
@@ -352,7 +353,7 @@ class XbtChannelProvider:
                 return 404, {}, b"not found"
             try:
                 return 200, {"Content-Type": "application/json"}, json.dumps(action(json.loads(body))).encode()
-            except (ChannelError, KeyError, ValueError) as e:
+            except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
         url = url or path
@@ -375,6 +376,8 @@ class XbtChannelProvider:
         try:
             pp = unb64json(hdr)
             acc, pl = pp["accepted"], pp["payload"]
+            if not isinstance(acc, dict) or not isinstance(pl, dict):
+                raise TypeError("accepted and payload are objects")
             if pp.get("x402Version") != 2 or acc.get("scheme") != SCHEME or acc.get("network") != self.network \
                     or acc.get("payTo") != self.pay_to:
                 return self._payment_required(url, price, "unsupported_scheme_or_network")
@@ -394,34 +397,42 @@ class XbtChannelProvider:
                 return self._payment_required(url, price, "channel_closing", st)
             if st.suspended:
                 return self._payment_required(url, price, "unconfirmed", st)
+            best = st.best_cum
             try:
                 if not pl.get("hashlock"):
                     self._apply(st, pl)
-            except (ChannelError, ValueError) as e:
+            except (ChannelError, ValueError, TypeError, KeyError) as e:
                 return self._payment_required(url, price, getattr(e, "code", "bad_payload"), st)
+
+            def refuse(error):
+                if st.best_cum != best:   # a higher state that still does not cover this call: keep it
+                    self.ledger.save(st)
+                return self._payment_required(url, price, error, st)
             if pl.get("hashlock") and path_key in cond_offers:
                 from .conditional import ConditionalParams
                 offer = cond_offers[path_key]
-                if bytes.fromhex(pl["hashlock"]) != offer["h"]:
-                    return self._payment_required(url, price, "bad_hashlock", st)
-                cond = ConditionalParams(st.params, offer["h"], offer["price"])
-                uncond = st.best_cum
-                tx = cond.state_tx(uncond)
-                sig = bytes.fromhex(pl["sig"])
-                if sig[-1] != 0x21 or not ecc.verify(bytes.fromhex(st.params.payer_pub),
-                                                     cond.sighash(tx), sig[:-1]):
-                    return self._payment_required(url, price, "bad_sig", st)
+                try:
+                    if bytes.fromhex(pl["hashlock"]) != offer["h"]:
+                        return refuse("bad_hashlock")
+                    cond = ConditionalParams(st.params, offer["h"], offer["price"])
+                    tx = cond.state_tx(st.best_cum)
+                    sig = bytes.fromhex(pl["sig"])
+                except (ChannelError, ValueError, TypeError, KeyError) as e:
+                    return refuse(getattr(e, "code", "bad_payload"))
+                if not sig or sig[-1] != 0x21 or not ecc.verify(bytes.fromhex(st.params.payer_pub),
+                                                                cond.sighash(tx), sig[:-1]):
+                    return refuse("bad_sig")
                 st.cond_hash, st.cond_amount, st.cond_sig = offer["h"].hex(), offer["price"], pl["sig"]
                 price = offer["price"]
             else:
                 paid = st.best_cum * 1000
                 need = st.spent_msat + (price * 1000 if self.billing == "prepay" else 0)
                 if paid < need:
-                    return self._payment_required(url, price, "insufficient_payment", st)
+                    return refuse("insufficient_payment")
             if st.spent_msat + price * 1000 > st.params.max_amount * 1000:
-                return self._payment_required(url, price, "channel_exhausted", st)
+                return refuse("channel_exhausted")
             st.spent_msat += price * 1000        # reserve the max; refunded below if metered lower
-            self.ledger.save()
+            self.ledger.save(st)
         status, hdrs, out = self.handler(method, path, body)
         if unsafe_headers(hdrs):                 # no header injection, whatever the transport
             status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
@@ -440,7 +451,7 @@ class XbtChannelProvider:
                 st.spent_msat -= charged * 1000
                 charged = 0
             if charged != price:
-                self.ledger.save()
+                self.ledger.save(st)
             r = {"success": status < 400, "scheme": SCHEME, "network": self.network, "chan": st.params.channel_id,
                  "seq": st.seq, "cum": str(st.best_cum), "charged": str(charged), "spentMsat": str(st.spent_msat),
                  "owedMsat": str(max(0, st.spent_msat - st.best_cum * 1000)),
