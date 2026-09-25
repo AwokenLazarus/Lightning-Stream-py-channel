@@ -10,8 +10,11 @@ generator: each tweak is the tagged hash of a preimage laid out as the spec says
 network ‖ payTo ‖ A ‖ LE32(expiry)), p·G = P, one payTo derives different keys on different networks
 and differs from the v1.0 derivation, each signature verifies under the key the spec says signed it,
 both ECDH sides agree on K, a non-strict-DER or 0x01 re-encoding of a state signature is refused, every
-PAYMENT-RESPONSE is a SettlementResponse whose receipt verifies under P, and a replayed
-PAYMENT-SIGNATURE is refused with `bad_auth`. Exits 0 when everything matches, 1 on any mismatch.
+PAYMENT-RESPONSE is a SettlementResponse whose receipt verifies under P, a replayed PAYMENT-SIGNATURE is
+refused with `bad_auth`, and for the hash-locked conditional call: H = sha256(k), the ciphertext is
+the plaintext XOR the sha256(k || BE32(i)) keystream and is in the 402 before the payer signs, the
+hash-lock script and P2WSH output are laid out as the spec says, the conditional state's payer
+signature verifies, the provider's close carries that state, and its claim reveals k in the witness. Exits 0 when everything matches, 1 on any mismatch.
 Run it under both crypto backends: the project venv (libsecp256k1 via coincurve) and a Python without
 coincurve (the pure-Python fallback); the output names the backend.
 
@@ -32,6 +35,7 @@ from xbt402 import ecc  # noqa: E402
 from xbt402.channel import (DERIVATION, PAYEE_TAG, ChannelError, ChannelParams, Payee, Payer,  # noqa: E402
                             _payee_tweak, channel_auth_key, channel_payee_pub, channel_payee_secret,
                             payee_tweak_preimage)
+from xbt402.conditional import ConditionalParams, decrypt, preimage_from_tx  # noqa: E402
 from xbt402.tx import SIGHASH_ALL, SIGHASH_ALL_UNIFIED, Tx, segwit_address, sha256, tagged_hash  # noqa: E402
 from xbt402.x402_channel import (FACILITATOR_SETTLE, FACILITATOR_SUPPORTED, FACILITATOR_VERIFY,  # noqa: E402
                                  XBT_MAINNET, XbtChannelProvider, b64json, close_message, facilitator_request,
@@ -160,10 +164,10 @@ class StubNode:
     """The four RPCs the reference provider uses on a paid path, returning fixed answers."""
 
     def __init__(self, p: ChannelParams):
-        self.p, self.sent = p, []
+        self.p, self.sent, self.tip = p, [], TIP
 
     def getblockcount(self):
-        return TIP
+        return self.tip
 
     def getrawtransaction(self, txid, verbose=True):
         return {"vin": [{"txid": "cd" * 32, "vout": 0}], "confirmations": 1,
@@ -259,6 +263,77 @@ def gen_roundtrip():
             "url": url, "price": PRICE, "billing": "postpay", "handlerBodyHex": handler_body.hex(), "steps": steps}
 
 
+# --- 5. hash-locked conditional call: offer, state, paid call, close, claim, recovery ----------------
+COND_K = sha256(b"xbt402 test vector: conditional k")      # a revealed test key: never reuse a k
+COND_PLAIN = b"the deliverable: a report sold under a hash lock\n"
+COND_PRICE = 1_000
+COND_PATH = "/v1/report"
+
+
+def gen_conditional():
+    """A payer buys a hash-locked deliverable, takes it, and never folds the increment into a plain
+    state; at expiry - closeMarginBlocks the provider closes with the conditional state and claims
+    the hash lock with k, which anyone can read from the claim's witness (preimage_from_tx)."""
+    a = PAYER_SECRETS[1]
+    p = _params(a)
+    node = StubNode(p)
+    with tempfile.TemporaryDirectory() as d:
+        prov = XbtChannelProvider(node, PAYTO_SECRET, NETWORK, os.path.join(d, "ledger.sqlite"),
+                                  lambda m, path: PRICE, lambda m, path, b: (200, {}, b'{"result":"ok"}'),
+                                  billing="postpay", close_fee=CLOSE_FEE)
+        h, cipher, _ = prov.offer_conditional(COND_PATH, COND_PRICE, COND_PLAIN, k=COND_K)
+        url = "https://api.example.com" + COND_PATH
+        steps = []
+        status, hdrs, _ = prov.serve("GET", COND_PATH, {}, b"", url)
+        offer = unb64json(hdrs["PAYMENT-REQUIRED"])
+        steps.append({"step": "conditional offer", "status": status, "PAYMENT-REQUIRED": hdrs["PAYMENT-REQUIRED"],
+                      "decoded": offer})
+        accepted = offer["accepts"][0]
+        cond_extra = accepted["extra"]["conditional"]
+        open_req = {"x402Version": 2, "network": NETWORK, "channel": {
+            "txid": p.funding_txid, "vout": p.funding_vout, "capacity": p.capacity, "expiry": p.expiry,
+            "payerPub": p.payer_pub, "payerSpk": p.payer_spk, "redeemScript": p.script.hex()}}
+        prov.serve("POST", accepted["extra"]["openUrl"], {}, json.dumps(open_req).encode())
+        payer, kauth = Payer(p, a), channel_auth_key(a, bytes.fromhex(p.payee_pub))
+
+        def paid(path, pl, seq):
+            pl = {"chan": p.channel_id, "seq": seq, **pl}
+            pl["auth"] = request_auth(kauth, pl["chan"], seq, pl["cum"], pl.get("sig"),
+                                      request_digest("GET", path, b""))
+            hdr = b64json({"x402Version": 2, "accepted": accepted, "payload": pl})
+            st_, h_, out_ = prov.serve("GET", path, {"PAYMENT-SIGNATURE": hdr}, b"", "https://api.example.com" + path)
+            return pl, hdr, st_, h_, out_
+        uncond = 546                           # one plain call paid first: the payee's unconditional part
+        pl, hdr, status, h1, _ = paid("/v1/x", {"cum": str(uncond), "sig": payer.sign_state(uncond).hex()}, 1)
+        steps.append({"step": "plain paid call", "payload": pl, "status": status})
+        cp = ConditionalParams(p, h, COND_PRICE, int(cond_extra["csvDelta"]))
+        tx = cp.state_tx(uncond)
+        csig = ecc.sign(a, cp.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
+        pl, hdr, status, h2, out = paid(COND_PATH, {"cum": str(uncond), "hashlock": h.hex(), "sig": csig.hex()}, 2)
+        resp = unb64json(h2["PAYMENT-RESPONSE"])
+        steps.append({"step": "conditional paid call", "PAYMENT-SIGNATURE": hdr, "payload": pl, "status": status,
+                      "body": json.loads(out), "PAYMENT-RESPONSE": h2["PAYMENT-RESPONSE"],
+                      "settlementResponse": resp, "receipt": receipt_of(resp)})
+        node.tip = p.expiry - prov.close_margin         # the payer never folded: the watcher closes
+        prov.close_due()
+        close, claim = node.sent[:2]            # (the stub never reports the claim spent: it is re-sent)
+        ctx, cltx = Tx.parse(bytes.fromhex(close)), Tx.parse(bytes.fromhex(claim))
+        claim_vout = cltx.inputs[0].vout
+        steps.append({"step": "conditional close", "closeTx": close, "txid": ctx.txid(), "vsize": ctx.vsize(),
+                      "hashlockVout": next(i for i, o in enumerate(ctx.outputs) if o.script_pubkey == cp.spk)})
+        steps.append({"step": "claim", "claimTx": claim, "txid": cltx.txid(), "vsize": cltx.vsize(),
+                      "spends": f"{ctx.txid()}:{claim_vout}", "fee": COND_PRICE - cltx.outputs[0].value,
+                      "preimageFromTx": preimage_from_tx(claim, h).hex(),
+                      "recoveredPlaintextHex": decrypt(cipher, preimage_from_tx(claim, h)).hex()})
+    return {"network": NETWORK, "payerSecret": "%064x" % a, "payToSecret": "%064x" % PAYTO_SECRET,
+            "params": p.to_dict(), "chan": p.channel_id, "k": COND_K.hex(), "H": h.hex(),
+            "plaintextHex": COND_PLAIN.hex(), "cipher": cipher.hex(), "condAmount": COND_PRICE,
+            "csvDelta": cp.csv_delta, "hashlockScript": cp.script.hex(), "hashlockSpk": cp.spk.hex(),
+            "state": {"uncond": uncond, "unsignedTx": tx.hex(), "outputs": len(tx.outputs),
+                      "sighash": cp.sighash(tx).hex(), "payerSig": csig.hex()},
+            "steps": steps}
+
+
 def generate():
     return {
         "title": "x402 xbt-channel test vectors",
@@ -277,6 +352,7 @@ def generate():
         "auth": gen_auth(),
         "state": gen_states(),
         "roundtrip": gen_roundtrip(),
+        "conditional": gen_conditional(),
     }
 
 
@@ -348,6 +424,73 @@ def independent_checks(v) -> list:
             need(ecc.verify(bytes.fromhex(v["derivation"][0]["payerPub"]),
                             close_message(s["request"]["chan"]), bytes.fromhex(s["request"]["sig"])),
                  "close: request signature does not verify")
+    errs += conditional_checks(v)
+    return errs
+
+
+def conditional_checks(v) -> list:
+    """The conditional section, recomputed from its own fields without the library's conditional
+    module: H, the keystream, the hash-lock script, the payer's signature, the close and the claim."""
+    errs = []
+
+    def need(ok, what):
+        if not ok:
+            errs.append("conditional: " + what)
+    c = v.get("conditional")
+    if not c:
+        return ["conditional: section missing"]
+    k, h, plain, cipher = (bytes.fromhex(c[x]) for x in ("k", "H", "plaintextHex", "cipher"))
+    need(sha256(k) == h, "H != sha256(k)")
+    stream = b"".join(sha256(k + i.to_bytes(4, "big")) for i in range(-(-len(plain) // 32)))
+    need(cipher == bytes(x ^ y for x, y in zip(plain, stream)),
+         "cipher != plaintext XOR sha256(k || BE32(i)) keystream")
+    p = ChannelParams(**c["params"])
+    csv = c["csvDelta"]
+    want = (bytes([0x63, 0xa8, 0x20]) + h + bytes([0x88, 0x21]) + bytes.fromhex(p.payee_pub) + bytes([0xac, 0x67])
+            + (bytes([0x50 + csv]) if 1 <= csv <= 16 else bytes([1, csv])) + bytes([0xb2, 0x75, 0x21])
+            + bytes.fromhex(p.payer_pub) + bytes([0xac, 0x68]))
+    need(bytes.fromhex(c["hashlockScript"]) == want,
+         "script != IF SHA256 <H> EQUALVERIFY <P> CHECKSIG ELSE <csvDelta> CSV DROP <A> CHECKSIG ENDIF")
+    need(c["hashlockSpk"] == "0020" + sha256(want).hex(), "hashlockSpk != P2WSH(script)")
+    s = c["state"]
+    sig = bytes.fromhex(s["payerSig"])
+    need(sig[-1] == SIGHASH_ALL_UNIFIED and ecc.is_strict_der(sig[:-1])
+         and ecc.verify(bytes.fromhex(p.payer_pub), bytes.fromhex(s["sighash"]), sig[:-1]),
+         "state: payer signature is not strict DER || 0x21 under A")
+    outs = [(o.value, o.script_pubkey.hex()) for o in Tx.parse(bytes.fromhex(s["unsignedTx"])).outputs]
+    need(outs[:2] == [(s["uncond"], p.payee_spk), (c["condAmount"], c["hashlockSpk"])]
+         and outs[2] == (p.capacity - s["uncond"] - c["condAmount"] - p.close_fee, p.payer_spk),
+         "state: outputs are not uncond to P, condAmount to the hash lock, change to the payer")
+    steps = {st["step"]: st for st in c["steps"]}
+    ce = steps["conditional offer"]["decoded"]["accepts"][0]["extra"]["conditional"]
+    need(steps["conditional offer"]["status"] == 402 and ce == {"hash": c["H"], "amount": str(c["condAmount"]),
+                                                                 "csvDelta": csv, "cipher": c["cipher"]},
+         "offer: the 402 must carry {hash, amount, csvDelta, cipher} before the payer signs")
+    paid = steps["conditional paid call"]
+    need(paid["payload"]["hashlock"] == c["H"] and paid["payload"]["sig"] == s["payerSig"]
+         and paid["payload"]["cum"] == str(s["uncond"]), "paid call: payload is not {cum: uncond, hashlock, sig}")
+    need(paid["status"] == 200 and paid["body"] == {"cipher": c["cipher"], "preimage": c["k"], "hash": c["H"]},
+         "paid call: the response must reveal k for the offered ciphertext")
+    need(ecc.verify(bytes.fromhex(p.payee_pub), receipt_message(paid["receipt"]), bytes.fromhex(paid["receipt"]["sig"]))
+         and paid["receipt"]["charged"] == str(c["condAmount"]), "paid call: receipt not signed by P for condAmount")
+    close = Tx.parse(bytes.fromhex(steps["conditional close"]["closeTx"]))
+    wit = close.inputs[0].witness
+    need([(o.value, o.script_pubkey.hex()) for o in close.outputs] == outs and close.txid() == steps["conditional close"]["txid"]
+         and wit[0] == sig and wit[2] == b"\x01" and wit[3] == p.script,
+         "close: not the signed conditional state (payer sig, payee sig, IF branch, funding script)")
+    claim = Tx.parse(bytes.fromhex(steps["claim"]["claimTx"]))
+    cw = claim.inputs[0].witness
+    hv = steps["conditional close"]["hashlockVout"]
+    need(claim.inputs[0].txid[::-1].hex() == close.txid() and claim.inputs[0].vout == hv
+         and close.outputs[hv].script_pubkey.hex() == c["hashlockSpk"], "claim: does not spend the hash-lock output")
+    need(len(cw) == 4 and cw[1] == k and cw[2] == b"\x01" and cw[3] == want and cw[0][-1] == SIGHASH_ALL_UNIFIED,
+         "claim: witness is not [payee sig || 0x21, k, 0x01, script]")
+    need([(o.value, o.script_pubkey.hex()) for o in claim.outputs] == [(c["condAmount"] - steps["claim"]["fee"], p.payee_spk)],
+         "claim: pays condAmount - fee to the payee key")
+    got_k = next((w for w in cw if sha256(w) == h), b"")
+    need(got_k == k and steps["claim"]["preimageFromTx"] == k.hex()
+         and bytes.fromhex(steps["claim"]["recoveredPlaintextHex"]) == plain,
+         "recovery: k from the claim's witness must decrypt the offered ciphertext")
     return errs
 
 
@@ -379,7 +522,8 @@ def main() -> int:
         want = json.load(f)
     errs = diff(want, got) + independent_checks(want)
     n = (len(want["derivation"]) + len(want["auth"]["cases"]) + len(want["state"]["states"])
-         + len(want["state"]["invalid"]) + 2 + len(want["roundtrip"]["steps"]))
+         + len(want["state"]["invalid"]) + 2 + len(want["roundtrip"]["steps"])
+         + 1 + len(want.get("conditional", {}).get("steps", [])))
     for e in errs:
         print("MISMATCH", e)
     print(f"{'FAIL' if errs else 'OK'}: {n} vectors, backend {ecc.BACKEND}, {len(errs)} mismatches")

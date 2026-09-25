@@ -803,5 +803,163 @@
     }
    }
   ]
+ },
+ "conditional": {
+  "network": "bip122:0000000000000050c1e5f69672f45929",
+  "payerSecret": "1454474591e9a20e74a342ea305941aa27b9d5d63209cd81879c0f33b7abc602",
+  "payToSecret": "8bebc426f46a6c026c0dc085453fba5a8d54a39cd9b094a42a0e849b3f91828e",
+  "params": {
+   "payer_pub": "0364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362",
+   "payee_pub": "02528ca329dfef5793a66f8c260defbda29e70e08d73e1c879b757c77f571e54d5",
+   "expiry": 2014,
+   "payer_spk": "00149476e4d990109bbc1ae5a065ef2de2396d2d4083",
+   "payee_spk": "0014925326cef069f9db1000ad3c3dfb55f308d5ca7d",
+   "close_fee": 600,
+   "funding_txid": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969",
+   "funding_vout": 0,
+   "capacity": 200000
+  },
+  "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+  "k": "9dfdaf552e217f9b3abd3a05b7dd6d2ea40776646d96e6f7d67d920fa05c4d8e",
+  "H": "6f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b",
+  "plaintextHex": "7468652064656c6976657261626c653a2061207265706f727420736f6c6420756e64657220612068617368206c6f636b0a",
+  "cipher": "5c19c6a797207fbb08d8366f4025aff1c9c8135da0910a212fe3184c5db167b20b62bdfca12f11f8c3f0c46150f3220b8d",
+  "condAmount": 1000,
+  "csvDelta": 10,
+  "hashlockScript": "63a8206f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b882102528ca329dfef5793a66f8c260defbda29e70e08d73e1c879b757c77f571e54d5ac675ab275210364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362ac68",
+  "hashlockSpk": "0020e2bfffc199909c57f00f260c4dec92c44d7c4e9127c6f453c81275ff769eef1c",
+  "state": {
+   "uncond": 546,
+   "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff032202000000000000160014925326cef069f9db1000ad3c3dfb55f308d5ca7de803000000000000220020e2bfffc199909c57f00f260c4dec92c44d7c4e9127c6f453c81275ff769eef1cde040300000000001600149476e4d990109bbc1ae5a065ef2de2396d2d408300000000",
+   "outputs": 3,
+   "sighash": "e2ac65084f0ba102d45d3e520204d6a7c0da44a587ddf21d321dbe31df501410",
+   "payerSig": "3045022100865362edff0c44d5c3422e38764c5cacc366a0646e1bad73b9fff9505b16ae8c02203ed214c8439da584fbc5ce0ecad36bed28b6b24cd83b21bcf199cd4a97b5902b21"
+  },
+  "steps": [
+   {
+    "step": "conditional offer",
+    "status": 402,
+    "PAYMENT-REQUIRED": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJwYXltZW50X3JlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS5jb20vdjEvcmVwb3J0In0sImFjY2VwdHMiOlt7InNjaGVtZSI6InhidC1jaGFubmVsIiwibmV0d29yayI6ImJpcDEyMjowMDAwMDAwMDAwMDAwMDUwYzFlNWY2OTY3MmY0NTkyOSIsImFtb3VudCI6IjE1MCIsImFzc2V0IjoiWEJUOnNhdCIsInBheVRvIjoiMDJjYWY2ZjQ3MTJkODcxYWU4ZjgwN2NhNGVhNjY5NmIwODhkYzFjOGJjZjY3OTZhNmQ1MmY5MDJlMmZiYjFiNzcwIiwibWF4VGltZW91dFNlY29uZHMiOjMwLCJleHRyYSI6eyJtaW5DYXBhY2l0eSI6IjIwMDAwIiwibWF4Q2FwYWNpdHkiOiIxMDAwMDAwMCIsIm1pbkV4cGlyeUJsb2NrcyI6MTAwOCwibWF4RXhwaXJ5QmxvY2tzIjo4NjQwLCJjbG9zZU1hcmdpbkJsb2NrcyI6MTQ0LCJtaW5Db25mIjoxLCJjbG9zZUZlZVNhdCI6IjYwMCIsIm9wZW5VcmwiOiIveDQwMi94YnQtY2hhbm5lbC9vcGVuIiwiY2xvc2VVcmwiOiIveDQwMi94YnQtY2hhbm5lbC9jbG9zZSIsImJpbGxpbmciOiJwb3N0cGF5IiwiZGVyaXZhdGlvbiI6InYyIiwiY29uZGl0aW9uYWwiOnsiaGFzaCI6IjZmOTY2OGEzYmMyYWMwNzQzMzg4NTcwNzYzZjE3Y2QyYzk2ZWIyODliMjZlN2JjZDFiOWY2YWI5ZGQ3NmE3NWIiLCJhbW91bnQiOiIxMDAwIiwiY3N2RGVsdGEiOjEwLCJjaXBoZXIiOiI1YzE5YzZhNzk3MjA3ZmJiMDhkODM2NmY0MDI1YWZmMWM5YzgxMzVkYTA5MTBhMjEyZmUzMTg0YzVkYjE2N2IyMGI2MmJkZmNhMTJmMTFmOGMzZjBjNDYxNTBmMzIyMGI4ZCJ9fX1dfQ==",
+    "decoded": {
+     "x402Version": 2,
+     "error": "payment_required",
+     "resource": {
+      "url": "https://api.example.com/v1/report"
+     },
+     "accepts": [
+      {
+       "scheme": "xbt-channel",
+       "network": "bip122:0000000000000050c1e5f69672f45929",
+       "amount": "150",
+       "asset": "XBT:sat",
+       "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+       "maxTimeoutSeconds": 30,
+       "extra": {
+        "minCapacity": "20000",
+        "maxCapacity": "10000000",
+        "minExpiryBlocks": 1008,
+        "maxExpiryBlocks": 8640,
+        "closeMarginBlocks": 144,
+        "minConf": 1,
+        "closeFeeSat": "600",
+        "openUrl": "/x402/xbt-channel/open",
+        "closeUrl": "/x402/xbt-channel/close",
+        "billing": "postpay",
+        "derivation": "v2",
+        "conditional": {
+         "hash": "6f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b",
+         "amount": "1000",
+         "csvDelta": 10,
+         "cipher": "5c19c6a797207fbb08d8366f4025aff1c9c8135da0910a212fe3184c5db167b20b62bdfca12f11f8c3f0c46150f3220b8d"
+        }
+       }
+      }
+     ]
+    }
+   },
+   {
+    "step": "plain paid call",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 1,
+     "cum": "546",
+     "sig": "3045022100d4cc8e34250e936754bc149853110d2de464b297cd436e8a09b51659859eeb600220141f154a719a1f22a7bd33284457c26c3cfa83b9ade5d2ffe28a9f86c53a046f21",
+     "auth": "130ae5bb6e15b9595d40b53133f6679a906891e062759ffe674c4fdad83da87c"
+    },
+    "status": 200
+   },
+   {
+    "step": "conditional paid call",
+    "PAYMENT-SIGNATURE": "eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0ZWQiOnsic2NoZW1lIjoieGJ0LWNoYW5uZWwiLCJuZXR3b3JrIjoiYmlwMTIyOjAwMDAwMDAwMDAwMDAwNTBjMWU1ZjY5NjcyZjQ1OTI5IiwiYW1vdW50IjoiMTUwIiwiYXNzZXQiOiJYQlQ6c2F0IiwicGF5VG8iOiIwMmNhZjZmNDcxMmQ4NzFhZThmODA3Y2E0ZWE2Njk2YjA4OGRjMWM4YmNmNjc5NmE2ZDUyZjkwMmUyZmJiMWI3NzAiLCJtYXhUaW1lb3V0U2Vjb25kcyI6MzAsImV4dHJhIjp7Im1pbkNhcGFjaXR5IjoiMjAwMDAiLCJtYXhDYXBhY2l0eSI6IjEwMDAwMDAwIiwibWluRXhwaXJ5QmxvY2tzIjoxMDA4LCJtYXhFeHBpcnlCbG9ja3MiOjg2NDAsImNsb3NlTWFyZ2luQmxvY2tzIjoxNDQsIm1pbkNvbmYiOjEsImNsb3NlRmVlU2F0IjoiNjAwIiwib3BlblVybCI6Ii94NDAyL3hidC1jaGFubmVsL29wZW4iLCJjbG9zZVVybCI6Ii94NDAyL3hidC1jaGFubmVsL2Nsb3NlIiwiYmlsbGluZyI6InBvc3RwYXkiLCJkZXJpdmF0aW9uIjoidjIiLCJjb25kaXRpb25hbCI6eyJoYXNoIjoiNmY5NjY4YTNiYzJhYzA3NDMzODg1NzA3NjNmMTdjZDJjOTZlYjI4OWIyNmU3YmNkMWI5ZjZhYjlkZDc2YTc1YiIsImFtb3VudCI6IjEwMDAiLCJjc3ZEZWx0YSI6MTAsImNpcGhlciI6IjVjMTljNmE3OTcyMDdmYmIwOGQ4MzY2ZjQwMjVhZmYxYzljODEzNWRhMDkxMGEyMTJmZTMxODRjNWRiMTY3YjIwYjYyYmRmY2ExMmYxMWY4YzNmMGM0NjE1MGYzMjIwYjhkIn19fSwicGF5bG9hZCI6eyJjaGFuIjoiMWEzYmJiYTYyOGEyOWVkYzNlYzBiZWZiMzBjYzJhNDIyZGIwNWQ2MTAyMjk4ODdhOGFhMjQ4NTRkZmU1Yjk2OTowIiwic2VxIjoyLCJjdW0iOiI1NDYiLCJoYXNobG9jayI6IjZmOTY2OGEzYmMyYWMwNzQzMzg4NTcwNzYzZjE3Y2QyYzk2ZWIyODliMjZlN2JjZDFiOWY2YWI5ZGQ3NmE3NWIiLCJzaWciOiIzMDQ1MDIyMTAwODY1MzYyZWRmZjBjNDRkNWMzNDIyZTM4NzY0YzVjYWNjMzY2YTA2NDZlMWJhZDczYjlmZmY5NTA1YjE2YWU4YzAyMjAzZWQyMTRjODQzOWRhNTg0ZmJjNWNlMGVjYWQzNmJlZDI4YjZiMjRjZDgzYjIxYmNmMTk5Y2Q0YTk3YjU5MDJiMjEiLCJhdXRoIjoiYmEwMjU5ODM1MTY1ZGQyM2U0MGY0YjgwNGU1NzllODllZjAwNjFmNTVmOWVmNzQ0MzQ1ODQxOTk5ZjljNTJjZSJ9fQ==",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 2,
+     "cum": "546",
+     "hashlock": "6f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b",
+     "sig": "3045022100865362edff0c44d5c3422e38764c5cacc366a0646e1bad73b9fff9505b16ae8c02203ed214c8439da584fbc5ce0ecad36bed28b6b24cd83b21bcf199cd4a97b5902b21",
+     "auth": "ba0259835165dd23e40f4b804e579e89ef0061f55f9ef744345841999f9c52ce"
+    },
+    "status": 200,
+    "body": {
+     "cipher": "5c19c6a797207fbb08d8366f4025aff1c9c8135da0910a212fe3184c5db167b20b62bdfca12f11f8c3f0c46150f3220b8d",
+     "preimage": "9dfdaf552e217f9b3abd3a05b7dd6d2ea40776646d96e6f7d67d920fa05c4d8e",
+     "hash": "6f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b"
+    },
+    "PAYMENT-RESPONSE": "eyJzdWNjZXNzIjp0cnVlLCJ0cmFuc2FjdGlvbiI6IiIsIm5ldHdvcmsiOiJiaXAxMjI6MDAwMDAwMDAwMDAwMDA1MGMxZTVmNjk2NzJmNDU5MjkiLCJwYXllciI6IjAzNjQ0MDZjMmI5NjE4ZGY5YTg2NzUwNDM2MTUwOWFjYzliZThjYTdjY2FhMTRhMjYxNDY1MmUwZTA1YzM2MzM2MiIsImFtb3VudCI6IiIsImV4dHJhIjp7ImNoYXJnZWRBbW91bnQiOiIxMDAwIiwicmVjZWlwdCI6eyJzY2hlbWUiOiJ4YnQtY2hhbm5lbCIsImNoYW4iOiIxYTNiYmJhNjI4YTI5ZWRjM2VjMGJlZmIzMGNjMmE0MjJkYjA1ZDYxMDIyOTg4N2E4YWEyNDg1NGRmZTViOTY5OjAiLCJzZXEiOjIsImN1bSI6IjU0NiIsImNoYXJnZWQiOiIxMDAwIiwic3BlbnRNc2F0IjoiMTE1MDAwMCIsIm93ZWRNc2F0IjoiNjA0MDAwIiwiY3JlZGl0TXNhdCI6IjAiLCJleHBpcnkiOjIwMTQsInJlcSI6IjBhNTJlZTQyYzA5NGQ3ZWUzMzk4ZTIyYzg5M2JiZjc0ZWE3MTdhNjE2NjU3YzE0ZWQ5M2FiNjcwMjM0ODZjYTQiLCJzaWciOiIzMDQ1MDIyMTAwOWYyNGNkOGIxMmM1Y2I5NDQ4ZmQxYjRhNjk4Y2JlMjg1YTg3ZDM0MzRkYzJkYWJhYTFiNmZkYmExMDAzN2Q0MTAyMjAyNjdmNTQ2ZjM4NGNlODRhNzg0NDg3N2JkNDBjNGNkZDYwMjhmNmRlM2ZkODc2N2ZlYjZjMzZjODQ3ZDM4MWEyIn19fQ==",
+    "settlementResponse": {
+     "success": true,
+     "transaction": "",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "payer": "0364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362",
+     "amount": "",
+     "extra": {
+      "chargedAmount": "1000",
+      "receipt": {
+       "scheme": "xbt-channel",
+       "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+       "seq": 2,
+       "cum": "546",
+       "charged": "1000",
+       "spentMsat": "1150000",
+       "owedMsat": "604000",
+       "creditMsat": "0",
+       "expiry": 2014,
+       "req": "0a52ee42c094d7ee3398e22c893bbf74ea717a616657c14ed93ab67023486ca4",
+       "sig": "30450221009f24cd8b12c5cb9448fd1b4a698cbe285a87d3434dc2dabaa1b6fdba10037d410220267f546f384ce84a7844877bd40c4cdd6028f6de3fd8767feb6c36c847d381a2"
+      }
+     }
+    },
+    "receipt": {
+     "scheme": "xbt-channel",
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "seq": 2,
+     "cum": "546",
+     "charged": "1000",
+     "spentMsat": "1150000",
+     "owedMsat": "604000",
+     "creditMsat": "0",
+     "expiry": 2014,
+     "req": "0a52ee42c094d7ee3398e22c893bbf74ea717a616657c14ed93ab67023486ca4",
+     "sig": "30450221009f24cd8b12c5cb9448fd1b4a698cbe285a87d3434dc2dabaa1b6fdba10037d410220267f546f384ce84a7844877bd40c4cdd6028f6de3fd8767feb6c36c847d381a2"
+    }
+   },
+   {
+    "step": "conditional close",
+    "closeTx": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff032202000000000000160014925326cef069f9db1000ad3c3dfb55f308d5ca7de803000000000000220020e2bfffc199909c57f00f260c4dec92c44d7c4e9127c6f453c81275ff769eef1cde040300000000001600149476e4d990109bbc1ae5a065ef2de2396d2d408304483045022100865362edff0c44d5c3422e38764c5cacc366a0646e1bad73b9fff9505b16ae8c02203ed214c8439da584fbc5ce0ecad36bed28b6b24cd83b21bcf199cd4a97b5902b21483045022100da2e014b9a89461b6c0a595a768f65656511758543288532511c794a334d96630220125bbe9bc4b6fc442a44ba90eae393a86e2c5dab5c2a9663f8b7b802932269112101014e632102528ca329dfef5793a66f8c260defbda29e70e08d73e1c879b757c77f571e54d5ad6702de07b17568210364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362ac00000000",
+    "txid": "6632e4916205835f68d00fb2afea311c0cd074c140b7eb8dbfb1a3f6eae2ec5b",
+    "vsize": 214,
+    "hashlockVout": 1
+   },
+   {
+    "step": "claim",
+    "claimTx": "020000000001015bece2eaf6a3b1bf8debb740c174d00c1c31eaafb20fd0685f83056291e432660100000000fdffffff01bc02000000000000160014925326cef069f9db1000ad3c3dfb55f308d5ca7d0447304402203a917c5f30499c2c92fbe919f564be2aa843d0e5a021d0481615c7531719690c02206a2222b66c1342fc4d7b9197b1c90973097c00b04c169a10c367ea2714660e9c21209dfdaf552e217f9b3abd3a05b7dd6d2ea40776646d96e6f7d67d920fa05c4d8e01016f63a8206f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b882102528ca329dfef5793a66f8c260defbda29e70e08d73e1c879b757c77f571e54d5ac675ab275210364406c2b9618df9a867504361509acc9be8ca7ccaa14a2614652e0e05c363362ac6800000000",
+    "txid": "6b43a35bfdde07d629e6f2350eedb351616e2e089d809b53e556d8043be67667",
+    "vsize": 138,
+    "spends": "6632e4916205835f68d00fb2afea311c0cd074c140b7eb8dbfb1a3f6eae2ec5b:1",
+    "fee": 300,
+    "preimageFromTx": "9dfdaf552e217f9b3abd3a05b7dd6d2ea40776646d96e6f7d67d920fa05c4d8e",
+    "recoveredPlaintextHex": "7468652064656c6976657261626c653a2061207265706f727420736f6c6420756e64657220612068617368206c6f636b0a"
+   }
+  ]
  }
 }

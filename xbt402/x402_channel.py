@@ -561,11 +561,12 @@ class XbtChannelProvider:
         return {"success": True, "transaction": r["txid"], "network": self.network, "payer": payer,
                 "amount": str(paid), "extra": {"chan": r["chan"], "unpaidMsat": r["unpaidMsat"]}}
 
-    def offer_conditional(self, path: str, price: int, plaintext: bytes):
+    def offer_conditional(self, path: str, price: int, plaintext: bytes, k: bytes = None):
         """Prepare a hash-locked deliverable for `path`. Returns (H, ciphertext, k). The 402 carries
         H and the ciphertext; each sale reveals k (to the payer, and on-chain if claimed), so after a
-        sale the path is offered again under a fresh k."""
-        k = os.urandom(32)
+        sale the path is offered again under a fresh k. `k` fixes the first key (test vectors only:
+        a k already revealed decrypts this ciphertext for anyone)."""
+        k = k or os.urandom(32)
         from .conditional import encrypt, sha256
         h = sha256(k)
         self._cond = getattr(self, "_cond", {})

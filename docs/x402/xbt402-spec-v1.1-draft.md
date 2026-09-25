@@ -613,12 +613,18 @@ payments without custody.
 - a twelve-step exchange: the 402, the open, five paid calls (with the exact `PAYMENT-SIGNATURE` and
   `PAYMENT-RESPONSE` header values and the decoded `SettlementResponse`), a replayed header refused with
   `bad_auth`, `/x402/supported`, `/x402/verify` with a valid state and with a relabelled `cum`, a
-  cooperative close with its transaction, and `/x402/settle` returning the same close.
+  cooperative close with its transaction, and `/x402/settle` returning the same close;
+- a hash-locked conditional call (§6.5): `k`, `H`, the plaintext and its ciphertext, the hash-lock
+  script and output, the conditional state with the client's signature, the 402 carrying
+  `extra.conditional` with `cipher`, the paid call and its response, the provider's close with the
+  conditional state (the client never folded it), and the claim, whose witness reveals `k`, which
+  opens the offered ciphertext.
 
 `check_vectors.py` recomputes every value with the reference implementation and exits non-zero on any
 difference. It also checks what does not depend on the generator: the preimage layout, `t` against
 the tagged hash, `p·G = P`, one key per network and none equal to v1.0's, every signature under the key
-that should have made it, and every `PAYMENT-RESPONSE` against the receipt it wraps. The vectors are
+that should have made it, every `PAYMENT-RESPONSE` against the receipt it wraps, and, for the conditional
+call, `H = SHA256(k)`, the keystream, the hash-lock script byte by byte, and `k` in the claim. The vectors are
 identical under the libsecp256k1 backend and the pure-Python backend.
 
 ## Changes from v1.0
