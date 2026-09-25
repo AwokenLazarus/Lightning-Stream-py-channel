@@ -1,13 +1,18 @@
-"""x402 v2 scheme `xbt-channel`: HTTP 402 payments over XBT Spillman channels.
+"""x402 v2 scheme `xbt-channel`: HTTP 402 payments over XBT Spillman channels (xbt402 v1.1).
 
-Spec: ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment channels.md
+Spec: docs/x402/xbt402-spec-v1.1-draft.md (was ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402
+HTTP 402 payment channels.md). v1.1: the payee key commits to the network (extra.derivation "v2"),
+PAYMENT-RESPONSE is an x402 SettlementResponse, /x402/verify and /x402/settle take and answer the x402
+v2 facilitator shapes.
 
   402 + PAYMENT-REQUIRED: base64(PaymentRequired)      (same JSON in the body)
   PaymentRequired = {x402Version: 2, error?, resource: {url}, accepts: [PaymentRequirements]}
   PaymentRequirements = {scheme: "xbt-channel", network: "bip122:<first 32 hex of block 961640>",
       amount: "<sats per call, max>", asset: "XBT:sat", payTo: "<33-byte compressed pubkey hex>",
       maxTimeoutSeconds, extra: {minCapacity, maxCapacity, minExpiryBlocks, maxExpiryBlocks,
-      closeMarginBlocks, minConf, closeFeeSat, openUrl, closeUrl, billing: "postpay"|"prepay"}}
+      closeMarginBlocks, minConf, closeFeeSat, openUrl, closeUrl, billing: "postpay"|"prepay",
+      derivation: "v2"}}   payee key P = payTo + t*G, t = H("xbt-channel/payee/v2", len8(network) network
+      payTo A LE32(expiry))
 
   open:   POST extra.openUrl {x402Version, network, channel: {txid, vout, capacity, expiry, payerPub,
           payerSpk?, redeemScript}}  -> {chan, expiry, maxCum, confirmations}
@@ -15,12 +20,15 @@ Spec: ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment cha
           payload: {chan, seq, cum, sig?, auth}})  sig = payer DER || 0x21 over the state for cum
           auth = HMAC-SHA256(tagged_hash("xbt402/auth-key", ECDH(A, P)),
                  "xbt402/auth|chan|seq|cum|sig|sha256(method|path|body)"), seq above every earlier one
-  result: PAYMENT-RESPONSE: base64({success, scheme, network, chan, seq, cum, charged, spentMsat,
-          owedMsat, creditMsat, expiry, req, sig})  sig = receipt by the channel payee key
+  result: PAYMENT-RESPONSE: base64(SettlementResponse {success, transaction: "", network, payer: A,
+          amount: "", extra: {chargedAmount, receipt: {scheme, chan, seq, cum, charged, spentMsat,
+          owedMsat, creditMsat, expiry, req, sig}}})  sig = receipt by the channel payee key
   close:  POST extra.closeUrl {chan, sig, payload?}  sig = payer over tagged_hash("xbt402/close", chan);
           payload = a final state paying what is owed (postpay)
-  facilitator: GET /x402/supported, POST /x402/verify {payload}, POST /x402/settle (= close); only
-          under /x402/, so a paid API keeps its own /verify, /settle and /supported routes
+  facilitator: GET /x402/supported, POST /x402/verify and /x402/settle with {x402Version,
+          paymentPayload: {x402Version, accepted, payload}, paymentRequirements} -> VerifyResponse
+          {isValid, invalidReason?, payer, extra: {chan, cum}} / SettlementResponse (settle = close);
+          only under /x402/, so a paid API keeps its own /verify, /settle and /supported routes
 """
 import base64
 import hashlib
@@ -38,8 +46,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
 from . import ecc
-from .channel import (DUST, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer, canonical_chan,
-                      channel_auth_key, channel_payee_secret, check_payout_spk)
+from .channel import (DERIVATION, DUST, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
+                      canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk)
 from .conditional import CSV_DELTA
 from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
@@ -87,6 +95,42 @@ def close_message(chan: str) -> bytes:
 
 def network_id(first_blake2b_block_hash: str) -> str:
     return "bip122:" + first_blake2b_block_hash[:32]
+
+
+# x402 v2 facilitator reasons (VerifyResponse.invalidReason, SettlementResponse.errorReason) for the
+# protocol's own codes. The 402 `error` field keeps the short codes until the scheme name is settled
+# (`xbt-channel` or a `batch-settlement` binding would change the prefix; docs/x402/PUBLISHING.md).
+UPSTREAM_CODES = {"unsupported_scheme_or_network": "invalid_xbt_channel_scheme_or_network",
+                  "bad_payload": "invalid_xbt_channel_payload", "bad_auth": "invalid_xbt_channel_auth",
+                  "channel_closing": "invalid_xbt_channel_closing", "bad_sig": "invalid_xbt_channel_signature",
+                  "wrong_network": "invalid_network", "close_failed": "unexpected_settle_error"}
+
+
+def upstream_code(code: str) -> str:
+    return UPSTREAM_CODES.get(code) or "invalid_xbt_channel_" + (code or "payload")
+
+
+def settlement_response(receipt: dict, network: str, payer: str, success: bool) -> dict:
+    """PAYMENT-RESPONSE as an x402 v2 SettlementResponse. A paid call broadcasts nothing, so
+    `transaction` and `amount` are empty; the signed channel receipt rides in `extra`."""
+    return {"success": success, "transaction": "", "network": network, "payer": payer, "amount": "",
+            "extra": {"chargedAmount": receipt["charged"], "receipt": receipt}}
+
+
+def receipt_of(resp: dict) -> dict:
+    """The signed channel receipt inside a PAYMENT-RESPONSE SettlementResponse."""
+    r = ((resp or {}).get("extra") or {}).get("receipt") if isinstance(resp, dict) else None
+    if not isinstance(r, dict) or r.get("scheme") != SCHEME:
+        raise ChannelError("bad_receipt", "PAYMENT-RESPONSE carries no xbt-channel receipt in extra.receipt")
+    if str(resp["extra"].get("chargedAmount")) != str(r.get("charged")):
+        raise ChannelError("bad_receipt", "extra.chargedAmount differs from the signed receipt")
+    return r
+
+
+def facilitator_request(accepted: dict, payload: dict) -> dict:
+    """Body of POST /x402/verify and /x402/settle: {x402Version, paymentPayload, paymentRequirements}."""
+    return {"x402Version": 2, "paymentPayload": {"x402Version": 2, "accepted": accepted, "payload": payload},
+            "paymentRequirements": accepted}
 
 
 # --- provider ---------------------------------------------------------------------------------
@@ -165,7 +209,8 @@ class XbtChannelProvider:
                           "minExpiryBlocks": p.min_expiry_blocks, "maxExpiryBlocks": p.max_expiry_blocks,
                           "closeMarginBlocks": self.close_margin, "minConf": p.min_conf,
                           "closeFeeSat": str(self.close_fee), "openUrl": "/x402/xbt-channel/open",
-                          "closeUrl": "/x402/xbt-channel/close", "billing": self.billing}}
+                          "closeUrl": "/x402/xbt-channel/close", "billing": self.billing,
+                          "derivation": DERIVATION}}
 
     def _payment_required(self, url: str, price: int, error: str, st: ChannelState = None):
         body = {"x402Version": 2, "error": error, "resource": {"url": url}, "accepts": [self.requirements(price)]}
@@ -182,7 +227,9 @@ class XbtChannelProvider:
         payer_pub = bytes.fromhex(c["payerPub"])
         ecc._decode_pub(payer_pub)
         payer_spk = check_payout_spk(c["payerSpk"]) if c.get("payerSpk") else ""
-        p = ChannelParams.derive(self.pay_to, payer_pub.hex(), int(c["expiry"]), self.close_fee, payer_spk)
+        # v1.1 derivation only: a redeemScript built with the v1.0 tweak (no network) fails here
+        p = ChannelParams.derive(self.pay_to, payer_pub.hex(), int(c["expiry"]), self.close_fee, payer_spk,
+                                 network=self.network)
         if c["redeemScript"].lower() != p.script.hex():
             raise ChannelError("bad_funding", "redeemScript does not match payTo/payerPub/expiry")
         chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
@@ -195,8 +242,13 @@ class XbtChannelProvider:
             self.ledger.save(st)
         return {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
 
+    def _chan_secret(self, p: ChannelParams) -> int:
+        """The channel payee secret p = payTo_secret + t, t committing to this provider's network (M2).
+        It never leaves the provider: one leaked p gives payTo_secret."""
+        return channel_payee_secret(self.network, self.secret, bytes.fromhex(p.payer_pub), p.expiry)
+
     def _payee(self, st: ChannelState) -> Payee:
-        payee = Payee(st.params, channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry))
+        payee = Payee(st.params, self._chan_secret(st.params))
         payee.best_amount, payee.best_sig = st.best_cum, bytes.fromhex(st.best_sig) if st.best_sig else b""
         return payee
 
@@ -212,7 +264,7 @@ class XbtChannelProvider:
         if cid not in self._auth_keys:
             p = st.params
             self._auth_keys[cid] = channel_auth_key(
-                channel_payee_secret(self.secret, bytes.fromhex(p.payer_pub), p.expiry), bytes.fromhex(p.payer_pub))
+                self._chan_secret(p), bytes.fromhex(p.payer_pub))
         want = request_auth(self._auth_keys[cid], cid, seq, pl.get("cum"), pl.get("sig"),
                             request_digest(method, path, body))
         return hmac.compare_digest(want, str(pl.get("auth", "")))
@@ -276,7 +328,7 @@ class XbtChannelProvider:
         if self._cond_value(st) > st.best_cum:
             cp, uncond, _ = self._cond_state(st)
             tx = cp.state_tx(uncond)
-            payee = channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry)
+            payee = self._chan_secret(st.params)
             mine = ecc.sign(payee, cp.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
             tx.inputs[0].witness = [bytes.fromhex(st.cond_sig), mine, b"\x01", st.params.script]
             return tx, True
@@ -289,7 +341,7 @@ class XbtChannelProvider:
         cp, _, k = self._cond_state(st)
         close = Tx.parse(bytes.fromhex(st.extra["close_hex"]))
         vout = next(i for i, o in enumerate(close.outputs) if o.script_pubkey == cp.spk)
-        payee = channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry)
+        payee = self._chan_secret(st.params)
         return cp.claim_tx(st.closed_txid, vout, k, payee, bytes.fromhex(st.params.payee_spk), self.claim_fee), vout
 
     def _claim(self, st: ChannelState):
@@ -369,32 +421,67 @@ class XbtChannelProvider:
             st = next((s for s in self.ledger.channels.values() if s.closed_txid == close_txid), None)
             if not st:
                 raise ChannelError("unknown_channel", "no channel closed with that txid")
-            secret = channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry)
+            secret = self._chan_secret(st.params)
         return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee)
 
     def supported(self) -> dict:
-        return {"kinds": [{"scheme": SCHEME, "network": self.network}]}
+        return {"kinds": [{"x402Version": 2, "scheme": SCHEME, "network": self.network}],
+                "extensions": [], "signers": {}}
+
+    def _facilitator_payload(self, req: dict) -> dict:
+        """The scheme payload of an x402 v2 facilitator body, once both the requirements and the
+        payload's `accepted` name this scheme, network and payTo."""
+        if not isinstance(req, dict) or req.get("x402Version") != 2:
+            raise ChannelError("bad_payload", "x402Version 2 facilitator body expected")
+        pp, want = req.get("paymentPayload"), req.get("paymentRequirements")
+        if not (isinstance(pp, dict) and isinstance(want, dict) and isinstance(pp.get("accepted"), dict)
+                and isinstance(pp.get("payload"), dict)) or pp.get("x402Version") != 2:
+            raise ChannelError("bad_payload", "paymentPayload {x402Version, accepted, payload} and "
+                                              "paymentRequirements expected")
+        for acc in (want, pp["accepted"]):
+            if acc.get("scheme") != SCHEME or acc.get("network") != self.network or acc.get("payTo") != self.pay_to:
+                raise ChannelError("unsupported_scheme_or_network")
+        return pp["payload"]
 
     def facilitator_verify(self, req: dict) -> dict:
-        """Check (and keep, if higher) a signed state. Unauthenticated, so it needs a payer signature
-        for exactly the cum it names, reports nothing the caller did not send, and never moves seq:
-        otherwise it would tell anyone a channel's cum, or let them lock the payer out with a huge seq."""
-        pl = req.get("payload") or req
-        with self.ledger.lock:
-            st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
-            if not st:
-                raise ChannelError("unknown_channel")
-            cum = int(pl["cum"])
-            if not pl.get("sig"):
-                raise ChannelError("bad_sig", "verify needs a signed state")
-            self._payee(st).verify_state(cum, bytes.fromhex(pl["sig"]))
-            if cum > st.best_cum:
-                st.best_cum, st.best_sig = cum, pl["sig"]
-                self.ledger.save(st)
-            return {"valid": True, "chan": st.params.channel_id, "cum": str(cum)}
+        """x402 VerifyResponse for a signed state, kept if higher. Unauthenticated, so it needs a payer
+        signature for exactly the cum it names, reports nothing the caller did not send, and never
+        moves seq: otherwise it would tell anyone a channel's cum, or let them lock the payer out with
+        a huge seq."""
+        try:
+            pl = self._facilitator_payload(req)
+            with self.ledger.lock:
+                st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
+                if not st:
+                    raise ChannelError("unknown_channel")
+                cum = int(pl["cum"])
+                if not pl.get("sig"):
+                    raise ChannelError("bad_sig", "verify needs a signed state")
+                self._payee(st).verify_state(cum, bytes.fromhex(pl["sig"]))
+                if cum > st.best_cum:
+                    st.best_cum, st.best_sig = cum, pl["sig"]
+                    self.ledger.save(st)
+        except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
+            return {"isValid": False, "invalidReason": upstream_code(getattr(e, "code", "bad_payload"))}
+        return {"isValid": True, "payer": st.params.payer_pub, "extra": {"chan": st.params.channel_id, "cum": str(cum)}}
+
+    def _close_paid(self, st: ChannelState) -> int:
+        """Sat the recorded close pays the provider (a conditional close: before the claim fee)."""
+        cond = self._cond_state(st) if (st.extra or {}).get("cond_close") else None
+        return cond[1] + cond[0].cond_amount if cond else st.best_cum
 
     def facilitator_settle(self, req: dict) -> dict:
-        return self.close(req)
+        """x402 SettlementResponse for a close request ({chan, sig, payload?}, as extra.closeUrl takes)."""
+        try:
+            r = self.close(self._facilitator_payload(req))
+            with self.ledger.lock:
+                st = self.ledger.channels[r["chan"]]
+                paid, payer = self._close_paid(st), st.params.payer_pub
+        except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
+            return {"success": False, "errorReason": upstream_code(getattr(e, "code", "bad_payload")),
+                    "transaction": "", "network": self.network}
+        return {"success": True, "transaction": r["txid"], "network": self.network, "payer": payer,
+                "amount": str(paid), "extra": {"chan": r["chan"], "unpaidMsat": r["unpaidMsat"]}}
 
     def offer_conditional(self, path: str, price: int, plaintext: bytes):
         """Prepare a hash-locked deliverable for `path`. Returns (H, ciphertext, k)."""
@@ -532,15 +619,14 @@ class XbtChannelProvider:
                 charged = 0
             if charged != price:
                 self.ledger.save(st)
-            r = {"success": status < 400, "scheme": SCHEME, "network": self.network, "chan": st.params.channel_id,
-                 "seq": st.seq, "cum": str(st.best_cum), "charged": str(charged), "spentMsat": str(st.spent_msat),
+            r = {"scheme": SCHEME, "chan": st.params.channel_id, "seq": st.seq, "cum": str(st.best_cum), "charged": str(charged), "spentMsat": str(st.spent_msat),
                  "owedMsat": str(max(0, st.spent_msat - st.best_cum * 1000)),
                  "creditMsat": str(max(0, st.best_cum * 1000 - st.spent_msat)), "expiry": st.params.expiry,
                  "req": request_digest(method, path, body)}
-            secret = channel_payee_secret(self.secret, bytes.fromhex(st.params.payer_pub), st.params.expiry)
+            secret = self._chan_secret(st.params)
         r["sig"] = ecc.sign(secret, receipt_message(r)).hex()
         hdrs = dict(hdrs)
-        hdrs["PAYMENT-RESPONSE"] = b64json(r)
+        hdrs["PAYMENT-RESPONSE"] = b64json(settlement_response(r, self.network, st.params.payer_pub, status < 400))
         return status, hdrs, out
 
     def http_server(self, port: int) -> ThreadingHTTPServer:
@@ -648,6 +734,9 @@ class XbtChannelClient:
                     raise ChannelError("too_expensive", f"{acc['amount']} sat > max {self.max_price}")
                 if int(acc["extra"]["closeFeeSat"]) > self.max_close_fee:
                     raise ChannelError("bad_offer", "closeFeeSat above our cap")
+                if acc["extra"].get("derivation") != DERIVATION:   # before funding: never strand coins
+                    raise ChannelError("bad_offer", f"payee key derivation {acc['extra'].get('derivation')!r}, "
+                                                    f"this client speaks {DERIVATION!r} (xbt402 v1.1)")
                 return acc
         raise ChannelError("no_scheme", f"no {SCHEME} offer on {self.network}")
 
@@ -664,7 +753,7 @@ class XbtChannelClient:
             pub = ecc.pubkey(secret).hex()
         blocks = min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
         expiry = self.height() + blocks
-        p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]))
+        p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network)
         fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
         txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
@@ -761,7 +850,10 @@ class XbtChannelClient:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body)
         return status, rh, out
 
-    def _receipt(self, ch: ClientChannel, r: dict, method, path, body):
+    def _receipt(self, ch: ClientChannel, resp: dict, method, path, body):
+        r = receipt_of(resp)
+        if resp.get("network") != self.network or resp.get("payer") != ch.payer.params.payer_pub:
+            raise ChannelError("bad_receipt", "PAYMENT-RESPONSE is for another network or payer")
         if r["req"] != request_digest(method, path, body):
             raise ChannelError("bad_receipt", "receipt is for another request")
         if not ecc.verify(bytes.fromhex(ch.payer.params.payee_pub), receipt_message(r), bytes.fromhex(r["sig"])):
@@ -802,7 +894,7 @@ class XbtChannelClient:
             pub = ecc.pubkey(secret2).hex()
         expiry = self.height() + min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
                                      int(ex["maxExpiryBlocks"]) - 1)
-        nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]))
+        nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network)
         next_cap = min(self.capacity, ch.payer.params.capacity - owed - ch.payer.params.close_fee)
         if next_cap < int(ex["minCapacity"]):
             raise ChannelError("exhausted", "not enough leftover to roll into a new channel")
@@ -859,9 +951,10 @@ class XbtChannelClient:
         if new_cum > ch.payer.signed:
             ch.last_sig = ch.payer.sign_state(new_cum).hex()
         try:
-            self._post(origin + FACILITATOR_VERIFY, {"payload": {"chan": ch.payer.params.channel_id,
-                                                                 "cum": str(new_cum), "sig": ch.last_sig}})
-            ch.acked_cum = max(ch.acked_cum, new_cum)
+            v = self._post(origin + FACILITATOR_VERIFY, facilitator_request(
+                acc, {"chan": ch.payer.params.channel_id, "cum": str(new_cum), "sig": ch.last_sig}))
+            if v.get("isValid") is True:
+                ch.acked_cum = max(ch.acked_cum, new_cum)
         except (ChannelError, ValueError, OSError):
             pass                           # the next paid call on this channel carries it again
         return status, rh, out, plain

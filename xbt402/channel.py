@@ -75,20 +75,37 @@ def funding_script(payer_pub: bytes, payee_pub: bytes, expiry: int) -> bytes:
             + push(payer_pub) + bytes([OP_CHECKSIG]))
 
 
-def _payee_tweak(pay_to: bytes, payer_pub: bytes, expiry: int) -> int:
-    return int.from_bytes(tagged_hash("xbt-channel/payee", pay_to + payer_pub + expiry.to_bytes(4, "little")),
+PAYEE_TAG = "xbt-channel/payee/v2"   # v1.0 was "xbt-channel/payee", without the network
+DERIVATION = "v2"                     # advertised as PaymentRequirements.extra.derivation
+
+
+def payee_tweak_preimage(network: str, pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:
+    """len8(NET) || NET || payTo || A || LE32(expiry), NET = the UTF-8 CAIP-2 network string exactly
+    as in the 402 (both sides already hold and compare it). The length byte keeps the encoding
+    injective: no (NET, payTo) pair can be re-split into another."""
+    net = network.encode() if isinstance(network, str) else b""
+    if not 0 < len(net) < 256:
+        raise ChannelError("wrong_network", "network must be a non-empty CAIP-2 string")
+    return bytes([len(net)]) + net + pay_to + payer_pub + expiry.to_bytes(4, "little")
+
+
+def _payee_tweak(network: str, pay_to: bytes, payer_pub: bytes, expiry: int) -> int:
+    return int.from_bytes(tagged_hash(PAYEE_TAG, payee_tweak_preimage(network, pay_to, payer_pub, expiry)),
                           "big") % ecc.N
 
 
-def channel_payee_pub(pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:
-    """Per-channel payee key P = payTo + t*G, t = H(payTo || A || expiry). The payer derives it
-    from the 402 challenge alone, so opening is one round trip, and no two channels share a key."""
-    x, y = ecc._add(ecc._decode_pub(pay_to), ecc._mul(_payee_tweak(pay_to, payer_pub, expiry)))
+def channel_payee_pub(network: str, pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:
+    """Per-channel payee key P = payTo + t*G, t = H(NET || payTo || A || expiry). The payer derives it
+    from the 402 challenge alone, so opening is one round trip, and no two channels share a key. The
+    network is in t, so one payTo reused on regtest, testnet and mainnet derives unrelated channel keys
+    (M2): a key leaked from a test deployment is not a production key. Still non-hardened: never
+    export a per-channel secret."""
+    x, y = ecc._add(ecc._decode_pub(pay_to), ecc._mul(_payee_tweak(network, pay_to, payer_pub, expiry)))
     return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
 
 
-def channel_payee_secret(pay_to_secret: int, payer_pub: bytes, expiry: int) -> int:
-    return (pay_to_secret + _payee_tweak(ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
+def channel_payee_secret(network: str, pay_to_secret: int, payer_pub: bytes, expiry: int) -> int:
+    return (pay_to_secret + _payee_tweak(network, ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
 
 
 def channel_auth_key(secret: int, other_pub: bytes) -> bytes:
@@ -123,9 +140,10 @@ class ChannelParams:
         return f"{self.funding_txid}:{self.funding_vout}"
 
     @classmethod
-    def derive(cls, pay_to: str, payer_pub: str, expiry: int, close_fee: int, payer_spk: str = "") -> "ChannelParams":
-        """Terms both sides compute from the challenge + the payer's key and expiry."""
-        payee = channel_payee_pub(bytes.fromhex(pay_to), bytes.fromhex(payer_pub), expiry)
+    def derive(cls, pay_to: str, payer_pub: str, expiry: int, close_fee: int, payer_spk: str = "", *,
+               network: str) -> "ChannelParams":
+        """Terms both sides compute from the challenge (payTo, network) + the payer's key and expiry."""
+        payee = channel_payee_pub(network, bytes.fromhex(pay_to), bytes.fromhex(payer_pub), expiry)
         return cls(payer_pub=payer_pub, payee_pub=payee.hex(), expiry=expiry,
                    payer_spk=payer_spk or p2wpkh_spk(bytes.fromhex(payer_pub)).hex(),
                    payee_spk=p2wpkh_spk(payee).hex(), close_fee=close_fee)

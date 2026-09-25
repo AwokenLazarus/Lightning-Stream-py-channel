@@ -115,7 +115,7 @@ def make_provider(xc, node, billing="postpay", secret=0xB0B):
 def make_channel(ch, prov, node, a=0xA11CE, capacity=200_000, vout=0, confs=6, payer_spk="", txid=None,
                  open_as=None, expiry_in=2000):
     """Fund and open a channel (module `ch` = channel module of the same tree). Returns (params, payer)."""
-    p = ch.ChannelParams.derive(prov.pay_to, _pub(ch, a), node.height + expiry_in, prov.close_fee, payer_spk)
+    p = derive(ch, prov.network, prov.pay_to, _pub(ch, a), node.height + expiry_in, prov.close_fee, payer_spk)
     p.funding_txid, p.funding_vout, p.capacity = txid or os.urandom(32).hex(), vout, capacity
     node.add_funding(p, confirmations=confs)
     for t in open_as or [p.funding_txid]:
@@ -125,6 +125,13 @@ def make_channel(ch, prov, node, a=0xA11CE, capacity=200_000, vout=0, confs=6, p
             c["payerSpk"] = payer_spk
         prov.open({"x402Version": 2, "network": prov.network, "channel": c})
     return p, ch.Payer(p, a)
+
+
+def derive(ch, network, pay_to, payer_pub, expiry, close_fee, payer_spk=""):
+    """ChannelParams.derive of either tree: v1.1 commits to the network (AGP-004, M2), wave 2 did not."""
+    import inspect
+    kw = {"network": network} if "network" in inspect.signature(ch.ChannelParams.derive).parameters else {}
+    return ch.ChannelParams.derive(pay_to, payer_pub, expiry, close_fee, payer_spk, **kw)
 
 
 def _pub(ch, a):

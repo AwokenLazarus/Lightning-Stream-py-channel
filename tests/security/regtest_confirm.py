@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from xbt402 import channel as hch, x402_channel as hxc                  # noqa: E402  (hardened)
 from xbt402.rpc import RPC, RPCError                                    # noqa: E402
 from xbt402.tx import segwit_address                                    # noqa: E402
-from sechelp import authed, base, lax_der                               # noqa: E402
+from sechelp import authed, base, derive, lax_der                       # noqa: E402
 
 bch, bxc, ecc = base("channel"), base("x402_channel"), base("ecc")      # unpatched wave 2
 ecc.BACKEND = "oracle"
@@ -59,7 +59,7 @@ def provider(xc=bxc):
 
 def open_channel(prov, payer_spk="", confirm=True, ch=bch):
     a = secrets.randbelow(ecc.N - 1) + 1
-    p = ch.ChannelParams.derive(prov.pay_to, ecc.pubkey(a).hex(), node.getblockcount() + 1100, prov.close_fee, payer_spk)
+    p = derive(ch, prov.network, prov.pay_to, ecc.pubkey(a).hex(), node.getblockcount() + 1100, prov.close_fee, payer_spk)
     addr = segwit_address("bcrt", p.spk)
     txid = w.sendtoaddress(addr, 200_000 / SAT)
     raw = node.getrawtransaction(txid, True)
@@ -174,7 +174,8 @@ def f4_reorg():
     prov, hard = provider(), provider(hxc)
     # a second channel, on the hardened provider, funded into the same block as the unpatched one's
     ha = secrets.randbelow(ecc.N - 1) + 1
-    hp = hch.ChannelParams.derive(hard.pay_to, ecc.pubkey(ha).hex(), node.getblockcount() + 1100, hard.close_fee)
+    hp = hch.ChannelParams.derive(hard.pay_to, ecc.pubkey(ha).hex(), node.getblockcount() + 1100, hard.close_fee,
+                                  network=hard.network)
     haddr = segwit_address("bcrt", hp.spk)
     htxid = w.sendtoaddress(haddr, 200_000 / SAT)
     hp.funding_txid, hp.capacity = htxid, 200_000

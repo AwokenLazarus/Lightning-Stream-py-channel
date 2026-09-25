@@ -74,7 +74,7 @@ class ClientDrain(Repro, unittest.TestCase):
         origin = f"http://127.0.0.1:{PORT + 1}"
 
         def client():
-            p = cp.ChannelParams.derive(prov.pay_to, e.pubkey(0xA1).hex(), 3000, 600)
+            p = cp.ChannelParams.derive(prov.pay_to, e.pubkey(0xA1).hex(), 3000, 600, network=prov.network)
             p.funding_txid, p.funding_vout, p.capacity = "ab" * 32, 0, 200_000
             c = xp.XbtChannelClient(prov.network, None, lambda: 1000)
             c.channels[origin] = xp.ClientChannel(cp.Payer(p, 0xA1), origin, opened, price=150)

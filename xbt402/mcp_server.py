@@ -48,8 +48,8 @@ def xbt402_pay(client, url: str, method: str = "GET", body: bytes = b"", max_sat
         client.max_price = old
     receipt = None
     if "PAYMENT-RESPONSE" in {k.upper(): v for k, v in hdrs.items()}:
-        from .x402_channel import unb64json
-        receipt = unb64json(hdrs.get("PAYMENT-RESPONSE") or hdrs.get("payment-response"))
+        from .x402_channel import receipt_of, unb64json   # the client already verified it
+        receipt = receipt_of(unb64json(hdrs.get("PAYMENT-RESPONSE") or hdrs.get("payment-response")))
     ch = client.channels.get(origin)
     # The tool's own fields: numbers and our channel id, never provider strings. Only these go
     # through the key-material filter; the provider body is untrusted data, returned as is (L7).

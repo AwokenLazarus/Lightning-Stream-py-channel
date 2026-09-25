@@ -66,12 +66,14 @@ class RouteShadowing(Repro, unittest.TestCase):
         st, _, out = prov.serve("GET", "/x402/supported", {}, b"")
         self.assertEqual((st, json.loads(out)["kinds"][0]["scheme"]), (200, "xbt-channel"))
         sig = payer.sign_state(2000).hex()
-        st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps(
-            {"payload": {"chan": p.channel_id, "cum": "2000", "sig": sig}}).encode())
-        self.assertEqual((st, json.loads(out)["valid"]), (200, True))
+        acc = prov.requirements(PRICE)
+        st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps(xm.facilitator_request(
+            acc, {"chan": p.channel_id, "cum": "2000", "sig": sig})).encode())
+        self.assertEqual((st, json.loads(out)["isValid"]), (200, True))
         self.assertEqual(prov.ledger.channels[p.channel_id].best_cum, 2000)
-        st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps({"chan": p.channel_id, "cum": "0"}).encode())
-        self.assertEqual((st, json.loads(out)["error"]), (400, "bad_sig"))
+        st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps(xm.facilitator_request(
+            acc, {"chan": p.channel_id, "cum": "0"})).encode())
+        self.assertEqual((st, json.loads(out)["invalidReason"]), (200, "invalid_xbt_channel_signature"))
         self.assertEqual(prov.serve("GET", "/x402/verify", {}, b"")[0], 405)
 
     def check_transport(self, send):
@@ -85,9 +87,9 @@ class RouteShadowing(Repro, unittest.TestCase):
         st, out = send(prov, "GET", "/x402/supported", b"", {})
         self.assertEqual((st, json.loads(out)["kinds"][0]["network"]), (200, prov.network))
         sig = payer.sign_state(3000).hex()
-        st, out = send(prov, "POST", "/x402/verify", json.dumps(
-            {"payload": {"chan": p.channel_id, "cum": "3000", "sig": sig}}).encode(), {})
-        self.assertEqual((st, json.loads(out)["cum"]), (200, "3000"))
+        st, out = send(prov, "POST", "/x402/verify", json.dumps(xm.facilitator_request(
+            prov.requirements(PRICE), {"chan": p.channel_id, "cum": "3000", "sig": sig})).encode(), {})
+        self.assertEqual((st, json.loads(out)["extra"]["cum"]), (200, "3000"))
 
     def test_fixed_http_server_transport(self):
         servers = {}

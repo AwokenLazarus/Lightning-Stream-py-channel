@@ -90,13 +90,13 @@ class BearerPayload(Repro, unittest.TestCase):
         sig3 = payer.sign_state(3000).hex()
         self.assertEqual(pay(xp, prov, authed(xp, cp, payer, p.payee_pub,
                                               {"chan": p.channel_id, "seq": 1, "cum": "3000", "sig": sig3}))[0], 200)
+        acc = prov.requirements(150)
         for req in ({"chan": p.channel_id, "cum": "0"}, {"chan": p.channel_id, "cum": "3000", "seq": 10**9}):
-            st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(req).encode())
-            self.assertEqual((st, json.loads(out)["error"]), (400, "bad_sig"))
-            self.assertNotIn("3000", json.loads(out)["detail"])
-        st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(
-            {"chan": p.channel_id, "cum": "3000", "sig": sig3, "seq": 10**9}).encode())
-        self.assertEqual(st, 200)
+            st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(xp.facilitator_request(acc, req)).encode())
+            self.assertEqual((st, json.loads(out)), (200, {"isValid": False, "invalidReason": "invalid_xbt_channel_signature"}))
+        st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(xp.facilitator_request(
+            acc, {"chan": p.channel_id, "cum": "3000", "sig": sig3, "seq": 10**9})).encode())
+        self.assertEqual((st, json.loads(out)["isValid"]), (200, True))
         self.assertEqual(prov.ledger.channels[p.channel_id].seq, 1)          # /verify never moves seq
         self.assertEqual(pay(xp, prov, authed(xp, cp, payer, p.payee_pub,
                                               {"chan": p.channel_id, "seq": 2, "cum": "3000"}))[0], 200)
