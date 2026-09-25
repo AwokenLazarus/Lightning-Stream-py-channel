@@ -4,7 +4,7 @@
 2. Agent (signer-backed SDK + httpx) opens a channel and makes 1,000 postpay calls.
 3. One hash-locked conditional call (pay-on-preimage); plaintext recovered.
 4. MCP `xbt402_pay` one more call (no keys in the result).
-5. Refusals: stale, relabelled sig, wrong network, unpaid owed call.
+5. Refusals: stale, relabelled sig, wrong network, no request auth, unpaid owed call.
 6. Cooperative close; payee on-chain total equals signed calls. Optional CPFP child.
 7. Prepay provider vanishes; refund custody broadcasts after expiry.
 
@@ -27,7 +27,8 @@ from xbt402.rpc import RPC, RPCError                                            
 from xbt402.signer import ChannelSigner                                           # noqa: E402
 from xbt402.watcher import Watcher                                                # noqa: E402
 from xbt402.x402_channel import (RefundCustody, XbtChannelClient,                 # noqa: E402
-                                 XbtChannelProvider, b64json, network_id, unb64json)
+                                 XbtChannelProvider, b64json, network_id, request_digest,
+                                 unb64json)
 
 SAT = 100_000_000
 PRICE = 150
@@ -135,7 +136,12 @@ def main():
           "MCP result has no key material")
 
     print("[5] refusals")
-    def pay(payload, accepted=None):
+    def pay(payload, accepted=None, auth=True):
+        if auth:   # hand-built payloads still carry the signer's request auth and a fresh seq
+            ch.seq += 1
+            payload = {**payload, "seq": ch.seq}
+            payload["auth"] = signer.request_auth(payload["chan"], ch.seq, payload["cum"], payload.get("sig"),
+                                                  request_digest("GET", "/v1/infer", b""))
         hdr = b64json({"x402Version": 2, "accepted": accepted or ch.accepted, "payload": payload})
         st, h, out = client.http("GET", base + "/v1/infer", headers={"PAYMENT-SIGNATURE": hdr})
         return st, unb64json(h["PAYMENT-REQUIRED"])["error"] if st == 402 else ""
@@ -148,6 +154,8 @@ def main():
           "last signature relabelled with a higher cum -> bad_sig")
     check(pay({"chan": cid, "cum": str(signed)}, {**ch.accepted, "network": "bip122:000000000019d6689c085ae165831e93"})[1]
           == "unsupported_scheme_or_network", "SHA-256 Bitcoin network id -> refused")
+    check(pay({"chan": cid, "seq": 10**9, "cum": str(signed)}, auth=False)[1] == "bad_auth",
+          "known channel id and cum but no request auth -> bad_auth (no bearer spending)")
     check(pay({"chan": cid, "cum": str(signed)})[1] == "insufficient_payment",
           "call without paying the owed sat -> insufficient_payment")
 

@@ -12,7 +12,9 @@ Spec: ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment cha
   open:   POST extra.openUrl {x402Version, network, channel: {txid, vout, capacity, expiry, payerPub,
           payerSpk?, redeemScript}}  -> {chan, expiry, maxCum, confirmations}
   pay:    PAYMENT-SIGNATURE: base64({x402Version: 2, accepted: <requirements>,
-          payload: {chan, seq, cum, sig?}})        sig = payer DER || 0x21 over the state for cum
+          payload: {chan, seq, cum, sig?, auth}})  sig = payer DER || 0x21 over the state for cum
+          auth = HMAC-SHA256(tagged_hash("xbt402/auth-key", ECDH(A, P)),
+                 "xbt402/auth|chan|seq|cum|sig|sha256(method|path|body)"), seq above every earlier one
   result: PAYMENT-RESPONSE: base64({success, scheme, network, chan, seq, cum, charged, spentMsat,
           owedMsat, creditMsat, expiry, req, sig})  sig = receipt by the channel payee key
   close:  POST extra.closeUrl {chan, sig, payload?}  sig = payer over tagged_hash("xbt402/close", chan);
@@ -20,6 +22,7 @@ Spec: ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment cha
 """
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -33,8 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
 from . import ecc
-from .channel import (DUST, ChannelError, ChannelParams, Payee, Payer, canonical_chan, channel_payee_secret,
-                      check_payout_spk)
+from .channel import (DUST, ChannelError, ChannelParams, Payee, Payer, canonical_chan, channel_auth_key,
+                      channel_payee_secret, check_payout_spk)
 from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
@@ -53,6 +56,13 @@ def unb64json(s: str):
 
 def request_digest(method: str, path: str, body: bytes) -> str:
     return hashlib.sha256(method.encode() + b"|" + path.encode() + b"|" + body).hexdigest()
+
+
+def request_auth(key: bytes, chan: str, seq, cum, sig, req: str) -> str:
+    """payload.auth: binds one paid request (method, path, body) to the channel, a fresh seq and the
+    state it carries. Without it `{chan, cum}` was a bearer token anyone could spend."""
+    msg = "|".join(("xbt402/auth", chan, str(seq), str(cum), sig or "", req)).encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def receipt_message(r: dict) -> bytes:
@@ -127,6 +137,7 @@ class XbtChannelProvider:
         self.billing, self.close_fee, self.close_margin, self.hrp = billing, close_fee, close_margin, hrp
         self.policy = policy or FundingPolicy(min_expiry_blocks=1_008, close_margin=close_margin)
         self._height, self._height_at, self.height_ttl = 0, 0.0, height_ttl
+        self._auth_keys: Dict[str, bytes] = {}
 
     def height(self) -> int:
         """Chain tip, cached for height_ttl seconds so a paid call costs no RPC."""
@@ -177,9 +188,27 @@ class XbtChannelProvider:
         payee.best_amount, payee.best_sig = st.best_cum, bytes.fromhex(st.best_sig) if st.best_sig else b""
         return payee
 
+    def _authentic(self, st: ChannelState, pl: dict, method: str, path: str, body: bytes) -> bool:
+        """payload.auth is the channel's HMAC over this request and a seq above every earlier one."""
+        try:
+            seq = int(pl["seq"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if seq <= st.seq:
+            return False
+        cid = st.params.channel_id
+        if cid not in self._auth_keys:
+            p = st.params
+            self._auth_keys[cid] = channel_auth_key(
+                channel_payee_secret(self.secret, bytes.fromhex(p.payer_pub), p.expiry), bytes.fromhex(p.payer_pub))
+        want = request_auth(self._auth_keys[cid], cid, seq, pl.get("cum"), pl.get("sig"),
+                            request_digest(method, path, body))
+        return hmac.compare_digest(want, str(pl.get("auth", "")))
+
     def _apply(self, st: ChannelState, pl: dict):
-        """O(1) per call: at most one ECDSA verify and a few comparisons."""
-        cum, seq = int(pl["cum"]), int(pl.get("seq", 0))
+        """O(1) per call: at most one ECDSA verify and a few comparisons. Never touches seq: only an
+        authenticated paid request moves it (serve)."""
+        cum = int(pl["cum"])
         if cum > st.best_cum:
             if "sig" not in pl:
                 raise ChannelError("bad_sig", "a higher cum needs a signature")
@@ -190,7 +219,6 @@ class XbtChannelProvider:
             raise ChannelError("stale_amount", f"have {st.best_cum}, got {cum}")
         elif pl.get("sig") and pl["sig"] != st.best_sig:
             raise ChannelError("bad_sig", "signature differs from the stored state for this cum")
-        st.seq = max(st.seq, seq)
 
     def close(self, req: dict) -> dict:
         with self.ledger.lock:
@@ -266,13 +294,22 @@ class XbtChannelProvider:
         return {"kinds": [{"scheme": SCHEME, "network": self.network}]}
 
     def facilitator_verify(self, req: dict) -> dict:
+        """Check (and keep, if higher) a signed state. Unauthenticated, so it needs a payer signature
+        for exactly the cum it names, reports nothing the caller did not send, and never moves seq:
+        otherwise it would tell anyone a channel's cum, or let them lock the payer out with a huge seq."""
         pl = req.get("payload") or req
         with self.ledger.lock:
             st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
             if not st:
                 raise ChannelError("unknown_channel")
-            self._apply(st, pl)
-            return {"valid": True, "chan": st.params.channel_id, "cum": str(st.best_cum)}
+            cum = int(pl["cum"])
+            if not pl.get("sig"):
+                raise ChannelError("bad_sig", "verify needs a signed state")
+            self._payee(st).verify_state(cum, bytes.fromhex(pl["sig"]))
+            if cum > st.best_cum:
+                st.best_cum, st.best_sig = cum, pl["sig"]
+                self.ledger.save()
+            return {"valid": True, "chan": st.params.channel_id, "cum": str(cum)}
 
     def facilitator_settle(self, req: dict) -> dict:
         return self.close(req)
@@ -343,6 +380,9 @@ class XbtChannelProvider:
                 st = None
             if not st:
                 return self._payment_required(url, price, "unknown_channel")
+            if not self._authentic(st, pl, method, path, body):   # no channel details for strangers
+                return self._payment_required(url, price, "bad_auth")
+            st.seq = int(pl["seq"])                               # spent, whatever happens next
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
                 return self._payment_required(url, price, "channel_closing", st)
             if st.suspended:
@@ -435,6 +475,7 @@ class ClientChannel:
     origin: str
     accepted: dict
     refund_hex: str = ""
+    auth_key: bytes = b""        # without a signer; with one, the signer computes payload.auth
     seq: int = 0
     spent_msat: int = 0          # from the last verified receipt
     receipts: list = field(default_factory=list)
@@ -513,7 +554,8 @@ class XbtChannelClient:
         else:
             refund_hex = p.refund_tx(secret).hex()
             payer = Payer(p, secret)
-        ch = ClientChannel(payer, origin, acc, refund_hex=refund_hex)
+        ch = ClientChannel(payer, origin, acc, refund_hex=refund_hex,
+                           auth_key=b"" if self.signer else channel_auth_key(secret, bytes.fromhex(p.payee_pub)))
         if self.refunds:
             self.refunds.add(ch.refund_hex, expiry, p.channel_id)
         if self.on_refund:
@@ -528,7 +570,16 @@ class XbtChannelClient:
     def hrp_for(self) -> str:
         return "bc" if self.network == XBT_MAINNET else "bcrt"
 
-    def _payload(self, ch: ClientChannel, price: int) -> dict:
+    def _auth(self, ch: ClientChannel, pl: dict, method: str, path: str, body: bytes) -> dict:
+        """Add payload.auth for this request. With a signer the ECDH key never leaves it."""
+        req = request_digest(method, path, body)
+        if self.signer:
+            pl["auth"] = self.signer.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
+        else:
+            pl["auth"] = request_auth(ch.auth_key, pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
+        return pl
+
+    def _payload(self, ch: ClientChannel, price: int, method: str = "", path: str = "", body: bytes = b"") -> dict:
         billing = ch.accepted["extra"].get("billing", "postpay")
         need_msat = ch.spent_msat + (price * 1000 if billing == "prepay" else 0)
         cum = max(-(-need_msat // 1000), ch.payer.signed)
@@ -550,7 +601,7 @@ class XbtChannelClient:
             delta = cum - ch.payer.signed
             pl["sig"] = ch.payer.sign_state(cum).hex()
             self.day_spent += max(0, delta)
-        return pl
+        return self._auth(ch, pl, method, path, body)
 
     def request(self, method: str, url: str, body: bytes = b""):
         origin = "/".join(url.split("/")[:3])
@@ -559,7 +610,8 @@ class XbtChannelClient:
         hdrs = {}
         if ch:
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": ch.accepted,
-                                                  "payload": self._payload(ch, int(ch.accepted["amount"]))})}
+                                                  "payload": self._payload(ch, int(ch.accepted["amount"]),
+                                                                          method, path, body)})}
         status, rh, out = self.http(method, url, body, hdrs)
         if status == 402:
             pr = unb64json(rh["PAYMENT-REQUIRED"])
@@ -574,7 +626,7 @@ class XbtChannelClient:
                     raise ChannelError("bad_offer", "provider claims charges we have no receipts for")
                 ch.spent_msat = max(ch.spent_msat, claimed)
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc,
-                                                  "payload": self._payload(ch, int(acc["amount"]))})}
+                                                  "payload": self._payload(ch, int(acc["amount"]), method, path, body)})}
             status, rh, out = self.http(method, url, body, hdrs)
         if "PAYMENT-RESPONSE" in rh:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body)
@@ -640,13 +692,13 @@ class XbtChannelClient:
             raise ChannelError("bad_offer", "expected a 402 with a hashlock")
         pr = unb64json(rh["PAYMENT-REQUIRED"])
         acc = self._pick(pr)
-        ch.accepted = acc
         extra = acc["extra"].get("conditional") or {}
         if not extra.get("hash"):
             raise ChannelError("bad_offer", "no conditional hashlock in the 402")
         if not ch:
             ch = self._open(origin, acc)
             self.channels[origin] = ch
+        ch.accepted = acc
         h = bytes.fromhex(extra["hash"])
         cond_amt = int(extra["amount"])
         cond = ConditionalParams(ch.payer.params, h, cond_amt, int(extra.get("csvDelta", 10)))
@@ -659,6 +711,7 @@ class XbtChannelClient:
         ch.seq += 1
         pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(uncond),
               "hashlock": extra["hash"], "sig": sig}
+        self._auth(ch, pl, method, path, body)
         hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": pl})}
         status, rh, out = self.http(method, url, body, hdrs)
         data = json.loads(out)

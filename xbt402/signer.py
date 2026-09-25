@@ -2,13 +2,13 @@
 
 XBT-062's B2 policy engine should implement the same method names on its unix-socket
 signer (`xbt402_new_key`, `xbt402_sign_state`, `xbt402_sign_close`, `xbt402_sign_refund`,
-`xbt402_fund`). The MCP tool in `mcp_server.py` talks only to this API.
+`xbt402_fund`, and since XBT-061 `xbt402_request_auth`). The MCP tool in `mcp_server.py` talks only to this API.
 """
 import secrets
 from typing import Callable, Optional
 
 from . import ecc
-from .channel import ChannelError, ChannelParams, Payer
+from .channel import ChannelError, ChannelParams, Payer, channel_auth_key
 from .tx import SIGHASH_ALL_UNIFIED, SIGHASH_SINGLE_ACP_UNIFIED, tagged_hash
 
 
@@ -77,6 +77,12 @@ class ChannelSigner:
     def sign_refund(self, chan: str) -> str:
         return self._params[chan].refund_tx(self._secret(chan)).hex()
 
+    def request_auth(self, chan: str, seq: int, cum, sig, req: str) -> str:
+        """payload.auth for one paid request (XBT-061 H3). The ECDH key stays in here."""
+        from .x402_channel import request_auth
+        key = channel_auth_key(self._secret(chan), bytes.fromhex(self._params[chan].payee_pub))
+        return request_auth(key, chan, seq, cum, sig, req)
+
     def sign_conditional(self, chan: str, uncond: int, cond) -> str:
         """`cond` is a ConditionalParams. Policy sees uncond+cond_amount."""
         if self.policy:
@@ -131,6 +137,9 @@ class SignerSocketAdapter:
 
     def sign_refund(self, chan: str) -> str:
         return self.client.call("xbt402_sign_refund", chan=chan)["hex"]
+
+    def request_auth(self, chan: str, seq: int, cum, sig, req: str) -> str:
+        return self.client.call("xbt402_request_auth", chan=chan, seq=seq, cum=str(cum), sig=sig or "", req=req)["auth"]
 
     def fund(self, address: str, sats: int):
         r = self.client.call("xbt402_fund", address=address, sats=sats)

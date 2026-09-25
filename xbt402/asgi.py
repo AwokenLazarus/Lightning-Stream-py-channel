@@ -5,6 +5,14 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 
+def _raw_path(scope) -> str:
+    """The request target as sent (percent-escapes intact), like http.server's self.path: the payer's
+    payload.auth and receipt digest cover these exact bytes, not Starlette's decoded path."""
+    raw = scope.get("raw_path") or scope["path"].encode()
+    q = scope.get("query_string") or b""
+    return (raw + (b"?" + q if q else b"")).decode("latin-1")
+
+
 class Xbt402Middleware:
     """ASGI middleware: every request goes through `provider.serve` (402 / open / close / pay)."""
 
@@ -17,7 +25,7 @@ class Xbt402Middleware:
             return
         request = Request(scope, receive)
         body = await request.body()
-        path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        path = _raw_path(request.scope)
         status, hdrs, out = self.provider.serve(
             request.method, path, {k: v for k, v in request.headers.items()},
             body, str(request.url),
@@ -30,7 +38,7 @@ def asgi_app(provider) -> Starlette:
 
     async def catchall(request: Request):
         body = await request.body()
-        path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        path = _raw_path(request.scope)
         status, hdrs, out = provider.serve(
             request.method, path, {k: v for k, v in request.headers.items()},
             body, str(request.url),
