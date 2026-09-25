@@ -43,6 +43,7 @@ from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
 SCHEME = "xbt-channel"
+MAX_BODY = 1 << 20                                          # bytes per request body
 XBT_MAINNET = "bip122:0000000000000050c1e5f69672f45929"   # block 961640, the first BLAKE2b block
 
 
@@ -56,6 +57,12 @@ def unb64json(s: str):
 
 def request_digest(method: str, path: str, body: bytes) -> str:
     return hashlib.sha256(method.encode() + b"|" + path.encode() + b"|" + body).hexdigest()
+
+
+def unsafe_headers(hdrs: dict) -> bool:
+    """A CR, LF or NUL in a response header name or value: a handler reflecting request data would
+    inject headers (or split the response) on transports that do not check, like http.server."""
+    return any(c in str(k) + str(v) for k, v in hdrs.items() for c in "\r\n\0")
 
 
 def request_auth(key: bytes, chan: str, seq, cum, sig, req: str) -> str:
@@ -416,6 +423,8 @@ class XbtChannelProvider:
             st.spent_msat += price * 1000        # reserve the max; refunded below if metered lower
             self.ledger.save()
         status, hdrs, out = self.handler(method, path, body)
+        if unsafe_headers(hdrs):                 # no header injection, whatever the transport
+            status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
         if path_key in getattr(self, "_cond", {}) and pl.get("hashlock"):
             offer = self._cond[path_key]
             out = json.dumps({"cipher": offer["cipher"].hex(), "preimage": offer["k"].hex(),
@@ -449,10 +458,28 @@ class XbtChannelProvider:
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def _refuse(self, status, why):
+                self.close_connection = True
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(why)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(why)
+
             def _go(self):
-                n = int(self.headers.get("Content-Length") or 0)
-                status, hdrs, out = app.serve(self.command, self.path, dict(self.headers), self.rfile.read(n),
+                # Content-Length only, bounded: a chunked body read as the next request smuggles one
+                # request inside another behind a proxy; a negative or huge length pins a thread
+                if self.headers.get("Transfer-Encoding"):
+                    return self._refuse(501, b"transfer-encoding not supported")
+                cl = self.headers.get_all("Content-Length") or ["0"]
+                if len(cl) != 1 or not cl[0].isdigit() or int(cl[0]) > MAX_BODY:
+                    return self._refuse(413 if cl[0].isdigit() else 400, b"bad content-length")
+                if len(self.headers.get_all("PAYMENT-SIGNATURE") or []) > 1:
+                    return self._refuse(400, b"duplicate PAYMENT-SIGNATURE")
+                status, hdrs, out = app.serve(self.command, self.path, dict(self.headers), self.rfile.read(int(cl[0])),
                                               f"http://{self.headers.get('Host', '')}{self.path}")
+                if unsafe_headers(hdrs):
+                    return self._refuse(500, b"handler returned a header with CR/LF")
                 self.send_response(status)
                 for k, v in hdrs.items():
                     self.send_header(k, v)
