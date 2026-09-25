@@ -26,13 +26,13 @@ def mine(n=1):
     return Ctx.node.generatetoaddress(n, Ctx.w.getnewaddress())
 
 
-def open_channel(capacity, expiry_delta, payer_secret, payee_secret, fee_rate=2):
+def open_channel(capacity, expiry_delta, payer_secret, payee_secret, close_fee=380):
     height = Ctx.node.getblockcount()
     p = ChannelParams(
         payer_pub=ecc.pubkey(payer_secret).hex(), payee_pub=ecc.pubkey(payee_secret).hex(),
         expiry=height + expiry_delta,
         payer_spk=address_to_spk(Ctx.w.getnewaddress("", "bech32")).hex(),
-        payee_spk=address_to_spk(Ctx.w.getnewaddress("", "bech32")).hex(), fee_rate=fee_rate)
+        payee_spk=address_to_spk(Ctx.w.getnewaddress("", "bech32")).hex(), close_fee=close_fee)
     addr = segwit_address("bcrt", p.spk)
     txid = Ctx.w.sendtoaddress(addr, capacity / SAT)
     raw = Ctx.node.getrawtransaction(txid, True)
@@ -97,7 +97,7 @@ class RegtestChannel(unittest.TestCase):
     def test_coinbase_funding_refused(self):
         blk = Ctx.node.getblock(Ctx.node.getbestblockhash())
         cb = Ctx.node.getrawtransaction(blk["tx"][0], True)
-        p = ChannelParams(ecc.pubkey(1).hex(), ecc.pubkey(2).hex(), 10_000, "", "", 1,
+        p = ChannelParams(ecc.pubkey(1).hex(), ecc.pubkey(2).hex(), 10_000, "", "", 600,
                           funding_txid=cb["txid"], funding_vout=0,
                           capacity=round(cb["vout"][0]["value"] * SAT))
         with self.assertRaises(Exception) as e:

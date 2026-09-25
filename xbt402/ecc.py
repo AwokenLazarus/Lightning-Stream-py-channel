@@ -14,28 +14,92 @@ G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
 
 
 def _add(a, b):
+    """Affine point addition (None = infinity). Slow (one inversion); used only off the hot path."""
     if a is None:
         return b
     if b is None:
         return a
-    if a[0] == b[0] and (a[1] + b[1]) % P == 0:
+    return _to_affine(_jadd(_to_jac(a), _to_jac(b)))
+
+
+# Jacobian coordinates (X, Y, Z) with x = X/Z^2, y = Y/Z^3; Z == 0 is infinity. No inversions
+# until the end, which makes the pure-Python path ~10x faster than affine.
+_INF = (0, 1, 0)
+
+
+def _to_jac(pt):
+    return _INF if pt is None else (pt[0], pt[1], 1)
+
+
+def _to_affine(j):
+    if j[2] == 0:
         return None
-    if a == b:
-        lam = 3 * a[0] * a[0] * pow(2 * a[1], P - 2, P) % P
-    else:
-        lam = (b[1] - a[1]) * pow(b[0] - a[0], P - 2, P) % P
-    x = (lam * lam - a[0] - b[0]) % P
-    return x, (lam * (a[0] - x) - a[1]) % P
+    zi = pow(j[2], P - 2, P)
+    zi2 = zi * zi % P
+    return j[0] * zi2 % P, j[1] * zi2 * zi % P
+
+
+def _jdouble(j):
+    X, Y, Z = j
+    if Z == 0 or Y == 0:
+        return _INF
+    YY = Y * Y % P
+    S = 4 * X * YY % P
+    M = 3 * X * X % P
+    X3 = (M * M - 2 * S) % P
+    return X3, (M * (S - X3) - 8 * YY * YY) % P, 2 * Y * Z % P
+
+
+def _jadd(a, b):
+    if a[2] == 0:
+        return b
+    if b[2] == 0:
+        return a
+    Z1Z1, Z2Z2 = a[2] * a[2] % P, b[2] * b[2] % P
+    U1, U2 = a[0] * Z2Z2 % P, b[0] * Z1Z1 % P
+    S1, S2 = a[1] * Z2Z2 * b[2] % P, b[1] * Z1Z1 * a[2] % P
+    if U1 == U2:
+        return _jdouble(a) if S1 == S2 else _INF
+    H, R = (U2 - U1) % P, (S2 - S1) % P
+    HH = H * H % P
+    HHH = H * HH % P
+    V = U1 * HH % P
+    X3 = (R * R - HHH - 2 * V) % P
+    return X3, (R * (V - X3) - S1 * HHH) % P, H * a[2] * b[2] % P
+
+
+def _jmul(k, j):
+    out = _INF
+    for bit in bin(k)[2:]:
+        out = _jdouble(out)
+        if bit == "1":
+            out = _jadd(out, j)
+    return out
+
+
+# Fixed-base table: 2^i * G, so k*G is additions only.
+_GTABLE = []
+_t = _to_jac(G)
+for _ in range(256):
+    _GTABLE.append(_t)
+    _t = _jdouble(_t)
+
+
+def _gmul_jac(k):
+    out, i = _INF, 0
+    while k:
+        if k & 1:
+            out = _jadd(out, _GTABLE[i])
+        k >>= 1
+        i += 1
+    return out
 
 
 def _mul(k, pt=G):
-    out = None
-    while k:
-        if k & 1:
-            out = _add(out, pt)
-        pt = _add(pt, pt)
-        k >>= 1
-    return out
+    k %= N
+    if pt == G:
+        return _to_affine(_gmul_jac(k))
+    return _to_affine(_jmul(k, _to_jac(pt)))
 
 
 def pubkey(secret: int) -> bytes:
@@ -116,5 +180,5 @@ def verify(pub: bytes, msg32: bytes, der: bytes) -> bool:
         return False
     w = pow(s, N - 2, N)
     z = int.from_bytes(msg32, "big")
-    q = _add(_mul(z * w % N), _mul(r * w % N, pt))
+    q = _to_affine(_jadd(_gmul_jac(z * w % N), _jmul(r * w % N, _to_jac(pt))))
     return q is not None and q[0] % N == r

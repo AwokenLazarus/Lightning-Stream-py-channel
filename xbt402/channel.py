@@ -21,7 +21,7 @@ from dataclasses import dataclass, asdict
 from . import ecc
 from .tx import (OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_DROP, OP_ELSE,
                  OP_ENDIF, OP_IF, SIGHASH_ALL_UNIFIED, ST_WITNESS_V0, Tx, TxIn, TxOut,
-                 p2wsh_spk, push, script_num, unified_sighash)
+                 p2wpkh_spk, p2wsh_spk, push, script_num, tagged_hash, unified_sighash)
 
 DUST = 546            # conservative dust floor for any output we create
 STATE_VSIZE = 190     # 1-in/2-out close: ~113 B base + ~229 B witness -> ~171 vB, plus room for a P2TR change
@@ -45,6 +45,22 @@ def funding_script(payer_pub: bytes, payee_pub: bytes, expiry: int) -> bytes:
             + push(payer_pub) + bytes([OP_CHECKSIG]))
 
 
+def _payee_tweak(pay_to: bytes, payer_pub: bytes, expiry: int) -> int:
+    return int.from_bytes(tagged_hash("xbt-channel/payee", pay_to + payer_pub + expiry.to_bytes(4, "little")),
+                          "big") % ecc.N
+
+
+def channel_payee_pub(pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:
+    """Per-channel payee key P = payTo + t*G, t = H(payTo || A || expiry). The payer derives it
+    from the 402 challenge alone, so opening is one round trip, and no two channels share a key."""
+    x, y = ecc._add(ecc._decode_pub(pay_to), ecc._mul(_payee_tweak(pay_to, payer_pub, expiry)))
+    return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
+
+
+def channel_payee_secret(pay_to_secret: int, payer_pub: bytes, expiry: int) -> int:
+    return (pay_to_secret + _payee_tweak(ecc.pubkey(pay_to_secret), payer_pub, expiry)) % ecc.N
+
+
 @dataclass
 class ChannelParams:
     """Everything both sides need to rebuild any state tx byte for byte."""
@@ -53,7 +69,7 @@ class ChannelParams:
     expiry: int         # absolute block height
     payer_spk: str      # hex scriptPubKey of the payer's change
     payee_spk: str      # hex scriptPubKey of the payee's earnings
-    fee_rate: int       # sat/vB for the close, fixed at open
+    close_fee: int      # sats, fixed at open (x402 extra.closeFeeSat); the payer pays it
     funding_txid: str = ""
     funding_vout: int = 0
     capacity: int = 0   # sats in the funding output
@@ -70,9 +86,13 @@ class ChannelParams:
     def channel_id(self) -> str:
         return f"{self.funding_txid}:{self.funding_vout}"
 
-    @property
-    def close_fee(self) -> int:
-        return self.fee_rate * STATE_VSIZE
+    @classmethod
+    def derive(cls, pay_to: str, payer_pub: str, expiry: int, close_fee: int, payer_spk: str = "") -> "ChannelParams":
+        """Terms both sides compute from the challenge + the payer's key and expiry."""
+        payee = channel_payee_pub(bytes.fromhex(pay_to), bytes.fromhex(payer_pub), expiry)
+        return cls(payer_pub=payer_pub, payee_pub=payee.hex(), expiry=expiry,
+                   payer_spk=payer_spk or p2wpkh_spk(bytes.fromhex(payer_pub)).hex(),
+                   payee_spk=p2wpkh_spk(payee).hex(), close_fee=close_fee)
 
     @property
     def max_amount(self) -> int:
@@ -106,11 +126,12 @@ class ChannelParams:
         return unified_sighash(tx, [self.funding_prevout()], 0, ST_WITNESS_V0, self.script,
                                SIGHASH_ALL_UNIFIED)
 
-    def refund_tx(self, payer_secret: int, dest_spk: bytes = None) -> Tx:
+    def refund_tx(self, payer_secret: int, dest_spk: bytes = None, fee: int = None) -> Tx:
         """Payer's unilateral refund, valid once the chain reaches `expiry`."""
         dest = dest_spk if dest_spk is not None else bytes.fromhex(self.payer_spk)
+        fee = self.close_fee if fee is None else fee
         tx = Tx(version=2, inputs=[self._funding_in(0xFFFFFFFE)],
-                outputs=[TxOut(self.capacity - self.fee_rate * REFUND_VSIZE, dest)],
+                outputs=[TxOut(self.capacity - fee, dest)],
                 locktime=self.expiry)
         sig = ecc.sign(payer_secret, self.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
         tx.inputs[0].witness = [sig, b"", self.script]

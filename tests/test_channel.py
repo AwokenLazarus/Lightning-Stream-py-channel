@@ -12,7 +12,7 @@ def params(capacity=100_000):
     return ChannelParams(
         payer_pub=ecc.pubkey(PAYER).hex(), payee_pub=ecc.pubkey(PAYEE).hex(), expiry=1000,
         payer_spk=p2wpkh_spk(ecc.pubkey(PAYER)).hex(), payee_spk=p2wpkh_spk(ecc.pubkey(PAYEE)).hex(),
-        fee_rate=2, funding_txid="ab" * 32, funding_vout=1, capacity=capacity)
+        close_fee=380, funding_txid="ab" * 32, funding_vout=1, capacity=capacity)
 
 
 class ChannelTest(unittest.TestCase):

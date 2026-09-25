@@ -264,3 +264,22 @@ def unified_sighash(tx: Tx, prevouts: List[TxOut], index: int, script_type: int,
             raise ValueError("tapscript needs leaf hash")
         m += leaf_hash + b"\x00" + b"\xff\xff\xff\xff"
     return tagged_hash("UnifiedSighash", bytes(m))
+
+
+def bip143_sighash(tx: Tx, index: int, script_code: bytes, value: int, hash_type: int = SIGHASH_ALL) -> bytes:
+    """Legacy segwit v0 message (BIP143, SIGHASH_ALL only): what SHA-256d Bitcoin verifies.
+    Used only in tests, to build the replayable counterpart of a unified signature."""
+    if hash_type != SIGHASH_ALL:
+        raise ValueError("only SIGHASH_ALL")
+    i = tx.inputs[index]
+    m = struct.pack("<i", tx.version)
+    m += dsha256(b"".join(x.outpoint() for x in tx.inputs))
+    m += dsha256(b"".join(struct.pack("<I", x.sequence) for x in tx.inputs))
+    m += i.outpoint() + varbytes(script_code) + struct.pack("<q", value) + struct.pack("<I", i.sequence)
+    m += dsha256(b"".join(o.serialize() for o in tx.outputs))
+    m += struct.pack("<I", tx.locktime) + struct.pack("<I", hash_type)
+    return dsha256(m)
+
+
+def p2wpkh_script_code(pub: bytes) -> bytes:
+    return b"\x76\xa9\x14" + hashlib.new("ripemd160", sha256(pub)).digest() + b"\x88\xac"
