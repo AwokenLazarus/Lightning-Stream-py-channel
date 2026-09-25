@@ -6,9 +6,14 @@
 
 Every value in vectors.json is recomputed here with the reference library (`xbt402/`, the package
 at the root of this repository). The check also verifies what can be verified independently of the
-generator: each signature verifies under the key the spec says signed it, p·G = P, both ECDH sides
-agree on K, a non-strict-DER or 0x01 re-encoding of a state signature is refused, and a replayed
+generator: each tweak is the tagged hash of a preimage laid out as the spec says (len8(network) ‖
+network ‖ payTo ‖ A ‖ LE32(expiry)), p·G = P, one payTo derives different keys on different networks
+and differs from the v1.0 derivation, each signature verifies under the key the spec says signed it,
+both ECDH sides agree on K, a non-strict-DER or 0x01 re-encoding of a state signature is refused, every
+PAYMENT-RESPONSE is a SettlementResponse whose receipt verifies under P, and a replayed
 PAYMENT-SIGNATURE is refused with `bad_auth`. Exits 0 when everything matches, 1 on any mismatch.
+Run it under both crypto backends: the project venv (libsecp256k1 via coincurve) and a Python without
+coincurve (the pure-Python fallback); the output names the backend.
 
 Signatures are deterministic (RFC 6979, low S), so the vectors are byte-exact. The keys below are
 test keys: never fund them.
@@ -24,11 +29,13 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import (ChannelError, ChannelParams, Payee, Payer, _payee_tweak,  # noqa: E402
-                            channel_auth_key, channel_payee_pub, channel_payee_secret)
+from xbt402.channel import (DERIVATION, PAYEE_TAG, ChannelError, ChannelParams, Payee, Payer,  # noqa: E402
+                            _payee_tweak, channel_auth_key, channel_payee_pub, channel_payee_secret,
+                            payee_tweak_preimage)
 from xbt402.tx import SIGHASH_ALL, SIGHASH_ALL_UNIFIED, Tx, segwit_address, sha256, tagged_hash  # noqa: E402
-from xbt402.x402_channel import (XBT_MAINNET, XbtChannelProvider, b64json, close_message,  # noqa: E402
-                                 receipt_message, request_auth, request_digest, unb64json)
+from xbt402.x402_channel import (FACILITATOR_SETTLE, FACILITATOR_SUPPORTED, FACILITATOR_VERIFY,  # noqa: E402
+                                 XBT_MAINNET, XbtChannelProvider, b64json, close_message, facilitator_request,
+                                 receipt_message, receipt_of, request_auth, request_digest, unb64json)
 
 VECTORS = os.path.join(HERE, "vectors.json")
 
@@ -38,6 +45,8 @@ PAYER_SECRETS = [int.from_bytes(sha256(b"xbt402 test vector: payer secret %d" % 
                  for i in range(3)]
 FUNDING_TXID = sha256(b"xbt402 test vector: funding tx").hex()   # stands in for a real funding txid
 NETWORK = XBT_MAINNET
+OTHER_NETWORKS = ["bip122:" + "11" * 16,      # example regtest id (the real one is per chain: block 101)
+                  "bip122:000000000933ea01ad0ee984209779ba"]   # Bitcoin testnet3's id: any other network
 TIP = 1_000                    # stub chain tip for the round trip
 EXPIRY = TIP + 1_014           # the reference client's default: minExpiryBlocks + 6
 CAPACITY = 200_000
@@ -50,7 +59,7 @@ def _pub(secret: int) -> str:
 
 
 def _params(payer_secret: int, expiry: int = EXPIRY, capacity: int = CAPACITY, vout: int = 0) -> ChannelParams:
-    p = ChannelParams.derive(_pub(PAYTO_SECRET), _pub(payer_secret), expiry, CLOSE_FEE)
+    p = ChannelParams.derive(_pub(PAYTO_SECRET), _pub(payer_secret), expiry, CLOSE_FEE, network=NETWORK)
     p.funding_txid, p.funding_vout, p.capacity = FUNDING_TXID, vout, capacity
     return p
 
@@ -63,24 +72,32 @@ def _lax_der(der: bytes) -> bytes:
     return b"\x30" + bytes([len(body)]) + body
 
 
-# --- 1. payee key derivation P = payTo + t·G ------------------------------------------------------
+# --- 1. payee key derivation P = payTo + t·G --------------------------------------------------------
+def _v10_payee_pub(pay_to: bytes, payer: bytes, expiry: int) -> str:
+    """v1.0's P (tag "xbt-channel/payee", no network), which a v1.1 provider refuses: a cross-check."""
+    t = int.from_bytes(tagged_hash("xbt-channel/payee", pay_to + payer + expiry.to_bytes(4, "little")), "big") % ecc.N
+    return ecc.pubkey((PAYTO_SECRET + t) % ecc.N).hex()
+
+
 def gen_derivation():
     out = []
-    cases = [(PAYER_SECRETS[0], EXPIRY), (PAYER_SECRETS[0], EXPIRY + 1), (PAYER_SECRETS[1], 961_640 + 8_000)]
-    for a, expiry in cases:
+    cases = [(NETWORK, PAYER_SECRETS[0], EXPIRY), (NETWORK, PAYER_SECRETS[0], EXPIRY + 1),
+             (NETWORK, PAYER_SECRETS[1], 961_640 + 8_000)] + [(n, PAYER_SECRETS[0], EXPIRY) for n in OTHER_NETWORKS]
+    for network, a, expiry in cases:
         pay_to, payer = bytes.fromhex(_pub(PAYTO_SECRET)), bytes.fromhex(_pub(a))
-        t = _payee_tweak(pay_to, payer, expiry)
-        p = ChannelParams.derive(pay_to.hex(), payer.hex(), expiry, CLOSE_FEE)
+        t = _payee_tweak(network, pay_to, payer, expiry)
+        p = ChannelParams.derive(pay_to.hex(), payer.hex(), expiry, CLOSE_FEE, network=network)
         out.append({
-            "payTo": pay_to.hex(), "payerPub": payer.hex(), "expiry": expiry,
+            "network": network, "payTo": pay_to.hex(), "payerPub": payer.hex(), "expiry": expiry,
             "expiryLE32": expiry.to_bytes(4, "little").hex(),
-            "tweakPreimage": (pay_to + payer + expiry.to_bytes(4, "little")).hex(),
+            "tweakPreimage": payee_tweak_preimage(network, pay_to, payer, expiry).hex(),
             "t": "%064x" % t,
-            "payeePub": channel_payee_pub(pay_to, payer, expiry).hex(),
+            "payeePub": channel_payee_pub(network, pay_to, payer, expiry).hex(),
             "redeemScript": p.script.hex(),
             "fundingSpk": p.spk.hex(),
             "fundingAddressMainnet": segwit_address("bc", p.spk),
             "payeeSpk": p.payee_spk, "payerSpk": p.payer_spk,
+            "_payeePubV10": _v10_payee_pub(pay_to, payer, expiry),
         })
     return out
 
@@ -89,7 +106,7 @@ def gen_derivation():
 def gen_auth():
     a = PAYER_SECRETS[0]
     p = _params(a)
-    payee_secret = channel_payee_secret(PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
+    payee_secret = channel_payee_secret(NETWORK, PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
     k_payer = channel_auth_key(a, bytes.fromhex(p.payee_pub))
     k_payee = channel_auth_key(payee_secret, bytes.fromhex(p.payer_pub))
     shared = ecc.ecdh(a, bytes.fromhex(p.payee_pub))
@@ -112,7 +129,7 @@ def gen_auth():
 def gen_states():
     a = PAYER_SECRETS[0]
     p = _params(a)
-    payee_secret = channel_payee_secret(PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
+    payee_secret = channel_payee_secret(NETWORK, PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
     out = {"payerSecret": "%064x" % a, "payToSecret": "%064x" % PAYTO_SECRET, "payeeSecret": "%064x" % payee_secret,
            "params": p.to_dict(), "chan": p.channel_id, "maxCum": p.max_amount, "states": []}
     for cum in (546, 150_000, p.max_amount - 545, p.max_amount):
@@ -201,15 +218,28 @@ def gen_roundtrip():
             hdr = b64json({"x402Version": 2, "accepted": accepted, "payload": pl})
             headers.append(hdr)
             status, h, out = prov.serve(method, path, {"PAYMENT-SIGNATURE": hdr}, body, url)
-            receipt = unb64json(h["PAYMENT-RESPONSE"])
+            resp = unb64json(h["PAYMENT-RESPONSE"])
+            receipt = receipt_of(resp)
             spent_msat = int(receipt["spentMsat"])
             steps.append({"step": "paid call %d" % (n + 1), "PAYMENT-SIGNATURE": hdr, "payload": pl,
                           "status": status, "bodyHex": out.hex(), "PAYMENT-RESPONSE": h["PAYMENT-RESPONSE"],
-                          "receipt": receipt})
+                          "settlementResponse": resp, "receipt": receipt})
 
         status, h, out = prov.serve(method, path, {"PAYMENT-SIGNATURE": headers[-1]}, body, url)
         steps.append({"step": "replay of paid call 5", "PAYMENT-SIGNATURE": headers[-1], "status": status,
                       "error": json.loads(out)["error"], "hasChannelDetails": "channel" in json.loads(out)})
+
+        status, _, out = prov.serve("GET", FACILITATOR_SUPPORTED, {}, b"")
+        steps.append({"step": "facilitator supported", "path": FACILITATOR_SUPPORTED, "status": status,
+                      "response": json.loads(out)})
+        last_sig = next(s["payload"]["sig"] for s in reversed(steps) if "sig" in s.get("payload", {}))
+        signed = {"chan": p.channel_id, "cum": str(payer.signed), "sig": last_sig}   # the best state so far
+        for what, pl in (("facilitator verify", signed),
+                         ("facilitator verify, cum relabelled", {**signed, "cum": str(payer.signed + 1)})):
+            req = facilitator_request(accepted, pl)
+            status, _, out = prov.serve("POST", FACILITATOR_VERIFY, {}, json.dumps(req).encode())
+            steps.append({"step": what, "path": FACILITATOR_VERIFY, "request": req, "status": status,
+                          "response": json.loads(out)})
 
         final = max(-(-spent_msat // 1000), payer.signed)   # the final state pays what is owed
         seq += 1
@@ -221,6 +251,10 @@ def gen_roundtrip():
         status, _, out = prov.serve("POST", accepted["extra"]["closeUrl"], {}, json.dumps(close_req).encode())
         steps.append({"step": "cooperative close", "path": accepted["extra"]["closeUrl"], "request": close_req,
                       "status": status, "response": json.loads(out), "closeTx": node.sent[-1]})
+        req = facilitator_request(accepted, close_req)    # the same close through the facilitator: idempotent
+        status, _, out = prov.serve("POST", FACILITATOR_SETTLE, {}, json.dumps(req).encode())
+        steps.append({"step": "facilitator settle (same close)", "path": FACILITATOR_SETTLE, "request": req,
+                      "status": status, "response": json.loads(out)})
     return {"network": NETWORK, "tip": TIP, "payToSecret": "%064x" % PAYTO_SECRET, "payerSecret": "%064x" % a,
             "url": url, "price": PRICE, "billing": "postpay", "handlerBodyHex": handler_body.hex(), "steps": steps}
 
@@ -228,15 +262,16 @@ def gen_roundtrip():
 def generate():
     return {
         "title": "x402 xbt-channel test vectors",
-        "version": "1.1-draft (wire-compatible with v1.0)",
-        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 (commit 702b262)",
+        "version": "1.1-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes)" % DERIVATION,
+        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.1 (AGP-004)",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",
                   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
                   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
                   "Fields starting with '_' are cross-checks, not wire values."],
         "constants": {"network": NETWORK, "dust": 546, "closeFeeSat": CLOSE_FEE, "capacity": CAPACITY,
                       "sighashAllUnified": SIGHASH_ALL_UNIFIED,
-                      "tags": ["xbt-channel/payee", "xbt402/auth-key", "xbt402/receipt", "xbt402/close",
+                      "derivation": DERIVATION,
+                      "tags": [PAYEE_TAG, "xbt402/auth-key", "xbt402/receipt", "xbt402/close",
                                "UnifiedSighash"]},
         "derivation": gen_derivation(),
         "auth": gen_auth(),
@@ -254,10 +289,18 @@ def independent_checks(v) -> list:
             errs.append(what)
 
     for i, d in enumerate(v["derivation"]):
-        need(int.from_bytes(tagged_hash("xbt-channel/payee", bytes.fromhex(d["tweakPreimage"])), "big") % ecc.N
+        net = d["network"].encode()
+        need(bytes.fromhex(d["tweakPreimage"]) == bytes([len(net)]) + net + bytes.fromhex(d["payTo"])
+             + bytes.fromhex(d["payerPub"]) + bytes.fromhex(d["expiryLE32"]),
+             f"derivation[{i}]: preimage != len8(network) ‖ network ‖ payTo ‖ A ‖ LE32(expiry)")
+        need(int.from_bytes(tagged_hash("xbt-channel/payee/v2", bytes.fromhex(d["tweakPreimage"])), "big") % ecc.N
              == int(d["t"], 16), f"derivation[{i}]: t != tagged_hash(preimage) mod n")
         p = (PAYTO_SECRET + int(d["t"], 16)) % ecc.N
         need(ecc.pubkey(p).hex() == d["payeePub"], f"derivation[{i}]: (payTo_secret + t)·G != P")
+        need(d["payeePub"] != d["_payeePubV10"], f"derivation[{i}]: v1.1 key equals the v1.0 key")
+    same = {d["payeePub"] for d in v["derivation"]
+            if (d["payerPub"], d["expiry"]) == (v["derivation"][0]["payerPub"], v["derivation"][0]["expiry"])}
+    need(len(same) == 1 + len(OTHER_NETWORKS), "derivation: one payTo, A, expiry must give one key per network")
     au = v["auth"]
     need(au["K"] == au["_K_payee_side"], "auth: payer and payee disagree on K")
     need(tagged_hash("xbt402/auth-key", bytes.fromhex(au["ecdhX"])).hex() == au["K"], "auth: K != tagged_hash(x)")
@@ -279,10 +322,25 @@ def independent_checks(v) -> list:
     payee_pub = v["derivation"][0]["payeePub"]
     for s in rt["steps"]:
         if "receipt" in s:
-            r = s["receipt"]
+            r, resp = s["receipt"], s["settlementResponse"]
             need(ecc.verify(bytes.fromhex(payee_pub), receipt_message(r), bytes.fromhex(r["sig"])),
                  f"{s['step']}: receipt not signed by P")
-            need(unb64json(s["PAYMENT-RESPONSE"]) == r, f"{s['step']}: header does not decode to the receipt")
+            need(unb64json(s["PAYMENT-RESPONSE"]) == resp, f"{s['step']}: header does not decode to the response")
+            need(set(resp) == {"success", "transaction", "network", "payer", "amount", "extra"}
+                 and resp["transaction"] == "" and resp["network"] == rt["network"]
+                 and resp["payer"] == v["derivation"][0]["payerPub"] and resp["extra"]["receipt"] == r
+                 and resp["extra"]["chargedAmount"] == r["charged"],
+                 f"{s['step']}: PAYMENT-RESPONSE is not the SettlementResponse around the receipt")
+        if s["step"] == "facilitator verify":
+            need(s["response"].get("isValid") is True, "verify: a signed state must be valid")
+        if s["step"].startswith("facilitator verify,"):
+            need(s["response"] == {"isValid": False, "invalidReason": "invalid_xbt_channel_signature"},
+                 "verify: a relabelled cum must be invalid_xbt_channel_signature")
+        if s["step"].startswith("facilitator settle"):
+            close = next(c for c in rt["steps"] if c["step"] == "cooperative close")
+            need(s["response"].get("success") is True and s["response"].get("transaction") == close["response"]["txid"]
+                 == Tx.parse(bytes.fromhex(close["closeTx"])).txid(),
+                 "settle: SettlementResponse.transaction must be the close txid")
         if s["step"].startswith("replay"):
             need(s["status"] == 402 and s["error"] == "bad_auth" and not s["hasChannelDetails"],
                  "replay: expected 402 bad_auth with no channel details")

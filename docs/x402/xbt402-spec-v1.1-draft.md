@@ -1,7 +1,9 @@
 # xbt402: HTTP 402 payment channels on XBT (x402 scheme `xbt-channel`)
 
-**Version 1.1-draft**, 2026-09-25. Status: draft, unpublished. Wire-compatible with v1.0 except where
-[Changes from v1.0](#changes-from-v10) says otherwise.
+**Version 1.1-draft**, 2026-09-25. Status: draft, unpublished. **Not wire-compatible with v1.0**: the
+payee key commits to the network (§5.1, §11) and the payment response and facilitator bodies use the
+x402 v2 shapes (§7.4, §7.6). [Changes from v1.0](#changes-from-v10) lists every difference. The
+reference implementation (`xbt402`) implements this text, and `vectors.json` is generated from it.
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT and MAY are to be interpreted as described
 in RFC 2119 and RFC 8174 when, and only when, they appear in all capitals.
@@ -21,7 +23,7 @@ Companion documents in this directory:
 8. [Channel state machine](#8-channel-state-machine)
 9. [Security requirements](#9-security-requirements)
 10. [Known weaknesses](#10-known-weaknesses)
-11. [Proposed for v1.1: network in the payee tweak](#11-proposed-for-v11-network-in-the-payee-tweak)
+11. [v1.1: network in the payee tweak](#11-v11-network-in-the-payee-tweak)
 12. [Test vectors](#12-test-vectors)
 13. [Changes from v1.0](#changes-from-v10)
 - [Appendix A: security findings referenced in this document](#appendix-a-security-findings-referenced-in-this-document)
@@ -106,6 +108,7 @@ being served). Under **prepay** the client risks one call. Neither can take more
 | `network`, mainnet | `bip122:0000000000000050c1e5f69672f45929` | wire | CAIP-2 `bip122:` + the first 32 hex characters of the hash of block 961640, the first BLAKE2b block (`0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb`). XBT shares Bitcoin's genesis, so, as other Bitcoin forks do, it is identified by a post-fork block. Block 961640 rather than 961632 (the first BIP-110 block) because a SHA-256 chain enforcing BIP-110 without the proof-of-work change would share 961632–961639. |
 | `network`, regtest | `bip122:` + first 32 hex of block 101 | wire | Same rule, on the block where regtest switches to BLAKE2b. |
 | `asset` | `XBT:sat` | wire | Not a CAIP-19 identifier; see [open questions](scheme_xbt-channel.md#open-questions). |
+| `derivation` | `v2` | `extra` | The payee-key derivation of §5.1. v1.0 had no such field (its derivation omitted the network). A client MUST refuse any other value **before funding**. |
 | `DUST` | 546 sat | protocol | Smallest output either side creates, and smallest signed `cum`. |
 | `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the client's side. A close is 170–171 vB, so about 3.5 sat/vB. Clients SHOULD refuse offers above a cap (reference: 2,000). |
 | `minCapacity`, `maxCapacity` | 20,000 / 10,000,000 sat (reference) | `extra` | Provider policy. |
@@ -128,14 +131,15 @@ All public keys are 33-byte compressed SEC1 secp256k1 keys. `G` is the generator
 
 ### 5.1 Per-channel payee key
 ```
-t = int(tagged_hash("xbt-channel/payee", payTo ‖ A ‖ LE32(expiry))) mod n
-P = payTo + t·G                   (provider's secret: p = payTo_secret + t mod n)
+NET = UTF-8 bytes of the CAIP-2 `network` string exactly as in the 402, 1..255 bytes
+t   = int(tagged_hash("xbt-channel/payee/v2", len8(NET) ‖ NET ‖ payTo ‖ A ‖ LE32(expiry))) mod n
+P   = payTo + t·G                 (provider's secret: p = payTo_secret + t mod n)
 ```
-The client computes `P` from the 402 challenge and its own `A` and `expiry`, so opening needs one
-round trip and no two channels share a payee key.
+`len8` is one byte holding the length of `NET`. The client computes `P` from the 402 challenge and its
+own `A` and `expiry`, so opening needs one round trip and no two channels share a payee key. The same
+`payTo`, `A` and `expiry` give unrelated keys on different networks (§11).
 
-The derivation is **non-hardened** and does **not** commit to the network. See §10.1 for what that
-means and the rules that follow from it.
+The derivation is **non-hardened**. See §10.1 for what that means and the rules that follow from it.
 
 ### 5.2 Request-authentication key
 ```
@@ -214,12 +218,20 @@ OP_ENDIF
 and the rest, minus `closeFeeSat`, to the client. Signed `0x21`. Once the client has the preimage `k`
 (`SHA256(k) = H`), it SHOULD fold the increment into an ordinary state paying `uncond + condAmount`.
 
-**Status: not enforceable in v1.0** (finding M6): the reference provider stores the conditional
-signature but has no close path that uses it. Until a provider implements one, a conditional increment
-is only postpay credit. A provider MUST NOT offer conditional calls unless it either (a) closes with the
-conditional state whenever it pays more than the best plain state and then claims with `k` before
-`csvDelta` expires, or (b) refuses a new conditional call until the previous increment has been folded
-into a plain `0x21` state.
+**Enforceable since v1.1** (finding M6; in v1.0 the provider stored the conditional signature but had
+no close path that used it). A provider that offers conditional calls MUST do both:
+1. **Close with the conditional state when it pays more.** When the provider closes (cooperatively, or
+   at `expiry − closeMarginBlocks`) and `uncond + condAmount − claimFee` exceeds the best plain `cum`
+   (the client took the deliverable and never signed the fold), it completes the conditional state
+   with its own signature, broadcasts it, and then spends the hash-lock output with `k` to its own
+   key. The claim MUST confirm within `csvDelta` blocks of the close, when the client's branch opens;
+   the watcher rebroadcasts it every tick until it does. The claim fee comes out of `condAmount`.
+2. **Hold at most one outstanding conditional increment.** While the stored conditional state pays more
+   than the best plain state, a new conditional call is refused with `conditional_outstanding`.
+
+The client folds the increment as soon as it has checked `k`: it signs an ordinary `0x21` state for
+`uncond + condAmount` and hands it over, through `POST /x402/verify` (§7.6) or on its next paid call.
+The provider then closes with the plain state as usual.
 
 ### 6.6 Refund
 The client signs its refund at open (§6.1 refund path; one output to a script of its choice) and keeps
@@ -243,11 +255,14 @@ input; implementations emit lowercase.
    "extra":{"minCapacity":"20000","maxCapacity":"10000000","minExpiryBlocks":1008,
             "maxExpiryBlocks":8640,"closeMarginBlocks":144,"minConf":1,"closeFeeSat":"600",
             "openUrl":"/x402/xbt-channel/open","closeUrl":"/x402/xbt-channel/close",
-            "billing":"postpay"}}]}
+            "billing":"postpay","derivation":"v2"}}]}
 ```
 - `amount` is the per-call **maximum**. A metered call may charge less (x402 `upto`).
 - `payTo` is the provider's 33-byte identity key (hex), not an address.
 - `billing` is `postpay` (a call is paid by the next state) or `prepay` (a call is paid before it is served).
+- `derivation` names the payee-key derivation, `"v2"` (§5.1). A client MUST refuse an offer with any
+  other value, or none, before it funds anything: a script built with another derivation fails the open
+  (`bad_funding`) and strands the funding until `expiry`.
 - `extra.conditional = {"hash","amount","csvDelta"}` appears only on a path offering a hash-locked
   deliverable (§6.5).
 - On a refusal, `error` carries the code (Appendix B). The body adds
@@ -264,7 +279,8 @@ input; implementations emit lowercase.
 The provider MUST check, in this order, refusing with the code shown:
 1. `network` is its own, else `wrong_network`;
 2. `payerPub` is a valid compressed key; `payerSpk`, if present, is P2WPKH, P2WSH or P2TR, else `bad_payer_spk`;
-3. `redeemScript` equals the script it builds from `(payTo, A, expiry)`, else `bad_funding`;
+3. `redeemScript` equals the script it builds from `(network, payTo, A, expiry)` with the §5.1
+   derivation, else `bad_funding` (a v1.0-derived script, or one derived for another network, fails here);
 4. canonicalize the channel id (below); if already known, `duplicate_channel`;
 5. on its own node: funding transaction unknown → `unknown_funding`; a coinbase → `coinbase_funding`;
    output script or value differs → `bad_funding`; capacity outside `[minCapacity, maxCapacity]` →
@@ -324,19 +340,28 @@ valid `0x21` signature over the conditional state with `uncond` = stored `cum` �
 charge is `condAmount`. The response body is `{"cipher","preimage","hash"}` (hex).
 
 ### 7.4 Payment response
-On every served call, header `PAYMENT-RESPONSE: base64(receipt)`:
+On every served call, header `PAYMENT-RESPONSE: base64(SettlementResponse)`, the x402 v2 settlement
+response with the channel receipt in `extra`:
 ```json
-{"success":true,"scheme":"xbt-channel","network":"bip122:…","chan":"<txid>:<vout>","seq":5,
- "cum":"600","charged":"150","spentMsat":"750000","owedMsat":"150000","creditMsat":"0",
- "expiry":2014,"req":"<hex>","sig":"<DER hex>"}
+{"success":true,"transaction":"","network":"bip122:…","payer":"<A hex>","amount":"",
+ "extra":{"chargedAmount":"150",
+          "receipt":{"scheme":"xbt-channel","chan":"<txid>:<vout>","seq":5,"cum":"600","charged":"150",
+                     "spentMsat":"750000","owedMsat":"150000","creditMsat":"0","expiry":2014,
+                     "req":"<hex>","sig":"<DER hex>"}}}
 ```
-`sig` is `P`'s ECDSA signature over
+- `transaction` and `amount` are empty: a paid call broadcasts nothing. Value moves at the close
+  (§7.5, `/x402/settle`).
+- `success` is `true` when the handler's status is below 400. `payer` is the channel's `A`.
+- `extra.chargedAmount` MUST equal `receipt.charged`. Only the receipt is signed; a client MUST use the
+  receipt's fields and refuse a response whose envelope disagrees with it.
+
+`receipt.sig` is `P`'s ECDSA signature over
 `tagged_hash("xbt402/receipt", chan ‖ "|" ‖ seq ‖ "|" ‖ cum ‖ "|" ‖ charged ‖ "|" ‖ spentMsat ‖ "|" ‖ req)`.
 A handler response with status ≥ 500 is not billed (`charged` = "0"). A handler header containing CR,
 LF or NUL MUST be replaced by an unbilled 500 (M4).
 
-**Client checks:** the receipt verifies under `P`; `req` is its own request's digest; `cum` is not more
-than it signed; `charged ≤ amount` (or the conditional amount); `spentMsat` grew by at most one call.
+**Client checks:** `network` and `payer` are its channel's; the receipt verifies under `P`; `req` is
+its own request's digest; `cum` is not more than it signed; `charged ≤ amount` (or the conditional amount); `spentMsat` grew by at most one call.
 When a 402 arrives on an open channel, the client MUST NOT accept a higher `amount` than it opened the
 channel at, and MUST NOT adopt more than **one call's worth of unreceipted charges over the channel's
 life** (M3).
@@ -350,30 +375,38 @@ best state, which the provider may do at any time anyway.
 
 ### 7.6 Facilitator endpoints (optional)
 A provider MAY serve the x402 facilitator interface itself. The paths MUST be under `/x402/` so that
-they never shadow an API route of the same name (L6):
-- `GET /x402/supported` → `{"kinds":[{"x402Version":2,"scheme":"xbt-channel","network":"bip122:…"}]}`.
-- `POST /x402/verify` checks a signed state and records it if higher. It is unauthenticated, so it MUST
-  require `sig` for exactly the `cum` given, MUST report nothing the caller did not send, and MUST NOT
-  move `seq` (otherwise a stranger learns `cum`, or locks the client out with a huge `seq`).
-- `POST /x402/settle` closes the channel, with the same body and rules as §7.5.
-
-Request bodies follow x402 v2: `{"x402Version":2,"paymentPayload":{…},"paymentRequirements":{…}}`.
-`/x402/verify` answers `{"isValid":true,"payer":"<A hex>","extra":{"chan","cum"}}` or
-`{"isValid":false,"invalidReason":"<code>"}`; `/x402/settle` answers a `SettlementResponse` with the close
-txid as `transaction` and the sat paid to the provider as `amount`. Full shapes: `scheme_xbt-channel.md`,
-Facilitator Interface. (The v1.0 reference accepts `{payload}` and answers `{"valid","chan","cum"}`; see §13.)
-
-### 7.7 Upstream envelope for `PAYMENT-RESPONSE` (proposed)
-x402 v2 defines `PAYMENT-RESPONSE` as a `SettlementResponse` (`success`, `transaction`, `network`,
-`payer`, `amount`, `extra`). v1.0 sends the receipt object of §7.4 directly. v1.1 proposes wrapping it,
-unchanged and with the same signature:
+they never shadow an API route of the same name (L6). Bodies follow x402 v2:
 ```json
-{"success":true,"transaction":"","network":"bip122:…","payer":"<A hex>","amount":"",
- "extra":{"chargedAmount":"150","receipt":{<the §7.4 receipt>}}}
+{"x402Version":2,
+ "paymentPayload":{"x402Version":2,"accepted":<PaymentRequirements>,"payload":{…}},
+ "paymentRequirements":<PaymentRequirements>}
 ```
-`transaction` is empty because a paid call broadcasts nothing. A client SHOULD accept both shapes during
-the transition: if the decoded object has `extra.receipt`, verify that; otherwise treat the object itself
-as the receipt.
+Both `paymentRequirements` and `paymentPayload.accepted` MUST name this scheme, the provider's network
+and its `payTo` (else `invalid_xbt_channel_scheme_or_network`); anything else malformed is
+`invalid_xbt_channel_payload`. Answers are HTTP 200 whether valid or not; the reason codes are the
+upstream-style names of Appendix B.
+- `GET /x402/supported` →
+  `{"kinds":[{"x402Version":2,"scheme":"xbt-channel","network":"bip122:…"}],"extensions":[],"signers":{}}`.
+- `POST /x402/verify`, `payload = {"chan","cum","sig"}`: checks a signed state and records it if higher.
+  It is unauthenticated, so it MUST require `sig` for exactly the `cum` given, MUST report nothing the
+  caller did not send, MUST NOT check `auth` and MUST NOT move `seq` (otherwise a stranger learns `cum`,
+  or locks the client out with a huge `seq`). Answer: a `VerifyResponse`,
+  `{"isValid":true,"payer":"<A hex>","extra":{"chan","cum"}}` or
+  `{"isValid":false,"invalidReason":"invalid_xbt_channel_signature"}`. This is also how a client hands
+  over a folded conditional state (§6.5).
+- `POST /x402/settle`, `payload` = the close request of §7.5 (`{"chan","sig","payload"?}`): closes the
+  channel under the same rules. Answer: a `SettlementResponse`,
+  `{"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"<sat paid
+  to the provider>","extra":{"chan","unpaidMsat"}}`, or
+  `{"success":false,"errorReason":"<code>","transaction":"","network":"bip122:…"}`. Settling a channel
+  that is already closed returns the same close.
+
+### 7.7 Relation to the x402 v2 types
+`PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE`, `VerifyResponse` and `SettlementResponse`
+are the x402 v2 types; everything scheme-specific rides in `extra` or `payload`. v1.0 sent the bare
+receipt as `PAYMENT-RESPONSE` and took `{payload}` at `/x402/verify`. v1.1 needs no transition rule for
+those shapes: a v1.1 client refuses a v1.0 offer before funding (it has no `extra.derivation`), so a
+v1.1 client never talks to a v1.0 provider past the 402.
 
 ## 8. Channel state machine
 
@@ -415,33 +448,39 @@ An implementation of this spec MUST meet all of these. Each names the finding in
     response headers (M4).
 12. Recording a paid call costs O(1), independent of the number of channels (M5).
 13. Facilitator endpoints only under `/x402/` (L6).
-14. No conditional calls without an enforceable close path (M6, §6.5).
+14. Conditional calls only with the enforceable close path and one outstanding increment (M6, §6.5).
+15. The payee key commits to the network; clients refuse other derivations before funding (M2, §5.1).
+16. An agent-facing client (an MCP tool) returns the provider's body and receipt verbatim, labelled as
+    untrusted data (the reference: an `untrusted_provider_response` object with `trust: "untrusted"`), and
+    filters only its own fields for key material (L7). Filtering the body made a paid call whose answer
+    merely mentioned "seed" look failed after it had been charged.
 
 ## 10. Known weaknesses
 This section is deliberately blunt. None of these is a way to steal funds from a correct
 implementation that follows the rules above, but each is a place where the protocol leans on operating
 discipline or on assumptions about the chain.
 
-### 10.1 M2: the payee key derivation is non-hardened and network-agnostic
+### 10.1 M2: the payee key derivation is non-hardened
 `t` is computable by anyone who knows `payTo`, `A` and `expiry`, which the client (and anyone who
 watches the funding script appear on-chain) does. So any one per-channel secret `p` reveals
 `payTo_secret = p − t`, and with it the secret of **every** channel the provider has ever had or will
 have. This is the same property as BIP32 non-hardened derivation, and it is the price of opening in one
 round trip without a provider-chosen key.
 
-`t` also omits the network, so the same `payTo` on mainnet, testnet and regtest derives the same channel
-keys. A key leaked from a test deployment compromises production.
+In v1.0, `t` also omitted the network, so the same `payTo` on mainnet, testnet and regtest derived the
+same channel keys, and a key leaked from a test deployment compromised production. v1.1 commits to the
+network (§5.1, §11), which removes that half. The non-hardened half remains.
 
 Operating rules, which are normative (§9 item 9):
 - A provider MUST NOT export a per-channel secret: not to a closing service, a watchtower, a log, a
   crash dump, or another process. To delegate closing, hand out **fully signed close transactions**,
   never `p`.
-- A provider MUST use a distinct `payTo` per network.
+- A provider MUST use a distinct `payTo` per network. The network in `t` makes a reuse harmless for
+  channel keys, but `payTo_secret` itself is still one key: a test host holding it holds production.
 - Signing MUST be constant-time (H4): a timing leak of one `p` is a leak of `payTo_secret`.
 
-§11 proposes committing to the network in `t`. Making the derivation hardened would need a
-provider-chosen per-channel key, and so a second round trip before funding; this draft does not propose
-that.
+Making the derivation hardened would need a provider-chosen per-channel key, and so a second round trip
+before funding; this draft does not propose that.
 
 ### 10.2 Fees and expiry
 - **Fixed close fee.** `closeFeeSat` is fixed at open (600 sat ≈ 3.5 sat/vB for the 171-vB close). If
@@ -489,32 +528,29 @@ that.
 - The facilitator `/x402/verify` endpoint is unauthenticated by design; it can be used to probe whether
   a given signed state is valid, which only the holder of that state can do.
 
-## 11. Proposed for v1.1: network in the payee tweak
-**Proposal (not implemented in the reference):**
+## 11. v1.1: network in the payee tweak
 ```
-t' = int(tagged_hash("xbt-channel/payee/v2", NET ‖ payTo ‖ A ‖ LE32(expiry))) mod n
-NET = UTF-8 of the CAIP-2 network string, e.g. "bip122:0000000000000050c1e5f69672f45929",
-      length-prefixed with one byte
+t = int(tagged_hash("xbt-channel/payee/v2", len8(NET) ‖ NET ‖ payTo ‖ A ‖ LE32(expiry))) mod n
 ```
-The tag changes as well as the preimage, so no `t'` can equal a v1.0 `t` by construction.
+**Encoding.** `NET` is the CAIP-2 `network` string from the 402, as UTF-8 bytes, prefixed with its
+length in one byte. It is the value both sides already hold and compare for equality (the offer's
+`network`, the open's `network`), so there is no second representation to get wrong; a genesis or
+block hash would bring its own byte-order and length conventions and could disagree with the string both
+sides check. The length prefix makes the preimage injective: without it, a network string and a `payTo`
+could in principle be re-split into another pair with the same concatenation. The fixed 33-byte `payTo`
+makes that unlikely; the prefix makes it impossible for one byte.
 
-What it fixes: the cross-network half of M2. A `payTo` accidentally reused on regtest, testnet and
-mainnet no longer derives the same channel keys, so a leaked test key stops being a production key. It
-does **not** fix the non-hardened half (one leaked `p` still gives `payTo_secret`).
+**Tag.** `xbt-channel/payee/v2`, not v1.0's `xbt-channel/payee`. A new tag domain-separates the two
+derivations: no v1.1 preimage can hash to a v1.0 tweak, whatever the lengths.
 
-Compatibility cost:
-- It changes `P`, hence the funding script and address. A v1.0 client and a v1.1 provider (or the
-  reverse) would disagree on `redeemScript`, and the open fails with `bad_funding`. The failure is safe
-  (the client's refund still works) but it strands the funding until `expiry` unless the client notices
-  before funding.
-- So it needs negotiation. Proposed: the 402 advertises `extra.derivation: "v2"`; a provider that
-  supports both accepts an open whose `redeemScript` matches either derivation and records which one;
-  clients use `v2` when offered. Existing channels keep their derivation until they close.
-- Test vectors for `t'` would be added to `vectors.json` once the reference implements it.
+What it fixes: the cross-network half of M2. A `payTo` reused on regtest, testnet and mainnet no longer
+derives the same channel keys, so a per-channel key leaked from a test deployment is not a production
+channel key. It does **not** fix the non-hardened half (one leaked `p` still gives `payTo_secret`).
 
-Recommendation: adopt it in the first published version, before any third-party implementation exists;
-after that it costs a negotiation field forever. The operating rule (one `payTo` per network) stays
-either way.
+**Negotiation.** The 402 advertises `extra.derivation: "v2"`. There is no dual support: nothing depends
+on v1.0, so a v1.1 provider accepts only v2-derived scripts, and a v1.0 open fails with `bad_funding`.
+A v1.1 client refuses an offer without `derivation: "v2"` before funding, so a mismatch costs a 402 and
+never strands coins. A later derivation would be `"v3"` under the same rule.
 
 Other candidates for a later version: advertise the large-channel confirmation rule in `extra`
 (`largeCapacity`, `minConfLarge`); a taproot variant `xbt-channel-tr` (MuSig2 key path, script leaves
@@ -523,36 +559,48 @@ payments without custody.
 
 ## 12. Test vectors
 `vectors.json` holds, for fixed test keys:
-- the payee derivation (`t`, `P`, redeem script, funding scriptPubKey and address) for three channels;
+- the payee derivation (`network`, the tweak preimage, `t`, `P`, redeem script, funding scriptPubKey and
+  address) for three channels on mainnet and for the first of them on two other networks, each with the
+  v1.0 key for the same inputs as a cross-check (`_payeePubV10`);
 - the request-authentication key (ECDH x, `K` from both sides) and three `auth` values;
 - four state transactions with their UnifiedSighash and the client's signature, a fully signed close,
   a signed refund, and three invalid signatures with the error each must produce;
-- an eight-step exchange: the 402, the open, five paid calls (with the exact `PAYMENT-SIGNATURE` and
-  `PAYMENT-RESPONSE` header values), a replayed header refused with `bad_auth`, and a cooperative close
-  with its transaction.
+- a twelve-step exchange: the 402, the open, five paid calls (with the exact `PAYMENT-SIGNATURE` and
+  `PAYMENT-RESPONSE` header values and the decoded `SettlementResponse`), a replayed header refused with
+  `bad_auth`, `/x402/supported`, `/x402/verify` with a valid state and with a relabelled `cum`, a
+  cooperative close with its transaction, and `/x402/settle` returning the same close.
 
 `check_vectors.py` recomputes every value with the reference implementation and exits non-zero on any
-difference. It also verifies every signature under the key that should have made it. The vectors are
+difference. It also checks what does not depend on the generator: the preimage layout, `t` against
+the tagged hash, `p·G = P`, one key per network and none equal to v1.0's, every signature under the key
+that should have made it, and every `PAYMENT-RESPONSE` against the receipt it wraps. The vectors are
 identical under the libsecp256k1 backend and the pure-Python backend.
 
 ## Changes from v1.0
-- **Facilitator paths moved under `/x402/`** (`/x402/verify`, `/x402/settle`, `/x402/supported`), and
-  `kinds` entries carry `x402Version`. v1.0 also answered the bare `/verify`, `/settle`, `/supported`,
-  which shadowed any API route of those names (L6). Breaking for facilitator clients only.
-- **Upstream x402 v2 shapes (proposed, not yet in the reference):** `PAYMENT-RESPONSE` wrapped in a
-  `SettlementResponse` (§7.7); facilitator requests as `{x402Version, paymentPayload,
-  paymentRequirements}` and responses as `VerifyResponse` / `SettlementResponse` (§7.6); upstream-style
-  error codes `invalid_xbt_channel_*` mapped one-to-one from the v1.0 codes (`scheme_xbt-channel.md`,
-  Error Codes). The vectors in `vectors.json` use the v1.0 shapes the reference emits today.
-- **Hash-locked conditional calls marked experimental** and gated on an enforceable close path (M6).
-  v1.0 described them as available.
+Breaking (a v1.1 party refuses a v1.0 one at the 402 or the open, before any funds move):
+- **Payee key commits to the network** (§5.1, §11): new tag `xbt-channel/payee/v2`, preimage
+  `len8(NET) ‖ NET ‖ payTo ‖ A ‖ LE32(expiry)`, advertised as `extra.derivation: "v2"`. Every channel
+  address changes. Fixes the cross-network half of M2.
+- **`PAYMENT-RESPONSE` is an x402 v2 `SettlementResponse`** (§7.4) with the receipt in
+  `extra.receipt` and `extra.chargedAmount`. The receipt keeps its signed fields and signature; its
+  `success` and `network` moved to the envelope, and it names its `scheme`.
+- **Facilitator bodies are x402 v2** (§7.6): `{x402Version, paymentPayload, paymentRequirements}` in,
+  `VerifyResponse` / `SettlementResponse` out, with `invalid_xbt_channel_*` reasons (Appendix B).
+  `kinds` entries carry `x402Version`.
+- **Facilitator paths moved under `/x402/`** (`/x402/verify`, `/x402/settle`, `/x402/supported`). v1.0
+  also answered the bare `/verify`, `/settle`, `/supported`, which shadowed any API route of those
+  names (L6).
+
+Not breaking:
+- **Hash-locked conditional calls are enforceable** (§6.5, M6): the provider closes with the conditional
+  state when it pays more and claims with `k`, refuses a second outstanding increment
+  (`conditional_outstanding`), and the client hands over the fold through `/x402/verify`.
+- **Agent-facing clients return the provider's response as labelled untrusted data** (§9 item 16, L7).
 - **Known weaknesses stated in one place** (§10): M2 and its operating rules, fee and expiry
   assumptions, hot-key custody.
-- **Proposed network commitment in the payee tweak** (§11), with its compatibility cost. Not in effect.
-- **Test vectors** added (§12).
+- **Test vectors** (§12), for all of the above.
 - **Standalone text.** The chain, `SIGHASH_UNIFIED`, BIP-110 and the maturity rule are described here;
-  references to internal documents and deployments are removed. Wire bytes are unchanged apart from the
-  facilitator paths and the `kinds` entry.
+  references to internal documents and deployments are removed.
 
 ## Appendix A: security findings referenced in this document
 Identifiers come from the security review of the reference implementation that preceded v1.0.
@@ -568,16 +616,28 @@ All Critical and High findings are fixed in the reference and have tests.
 | H3 | The payment payload was a bearer token (replay, strangers spending credit, `/verify` leaking `cum`) | §7.3 |
 | H4 | A variable-time signing fallback on a path any client can trigger | §5.3 |
 | H5 | The `0xA3` state left the client's remainder uncommitted | §6.4 |
-| M2 | Non-hardened, network-agnostic payee derivation (open by design) | §10.1, §11 |
+| M2 | Non-hardened, network-agnostic payee derivation (network half fixed in v1.1; non-hardened half open by design) | §10.1, §11 |
 | M3 | A malicious provider could drain a client with 402 loops and price rises | §7.4 |
 | M4 | Header injection, request smuggling and unbounded bodies in the HTTP layer | §7.4, §9 |
 | M5 | Each paid call rewrote every channel's record | §9 |
-| M6 | The hash-locked conditional state had no provider close path (open) | §6.5 |
+| M6 | The hash-locked conditional state had no provider close path (fixed in v1.1) | §6.5 |
 | L6 | Facilitator paths shadowed API routes of the same name | §7.6 |
+| L7 | The agent-facing client filtered the provider body for key material, so a charged call could look failed | §9 |
 
 ## Appendix B: error codes
+Codes in the 402 `error` field and in `400 {"error"}` answers of the control endpoints:
 `payment_required`, `unsupported_scheme_or_network`, `bad_payload`, `unknown_channel`, `bad_auth`,
 `channel_closing`, `unconfirmed`, `stale_amount`, `bad_sig`, `bad_sighash`, `bad_amount`,
-`bad_hashlock`, `insufficient_payment`, `channel_exhausted`, `coinbase_funding`, `bad_funding`,
-`unknown_funding`, `bad_capacity`, `bad_expiry`, `bad_payer_spk`, `wrong_network`,
-`duplicate_channel`, `close_failed` (close and watcher only).
+`bad_hashlock`, `conditional_outstanding`, `insufficient_payment`, `channel_exhausted`,
+`coinbase_funding`, `bad_funding`, `unknown_funding`, `bad_capacity`, `bad_expiry`, `bad_payer_spk`,
+`wrong_network`, `duplicate_channel`, `close_failed` (close and watcher only).
+
+The facilitator answers (§7.6) carry the upstream-style name of the same code in
+`invalidReason` / `errorReason`: `invalid_xbt_channel_<code>`, except `unsupported_scheme_or_network` →
+`invalid_xbt_channel_scheme_or_network`, `bad_payload` → `invalid_xbt_channel_payload`, `bad_auth` →
+`invalid_xbt_channel_auth`, `channel_closing` → `invalid_xbt_channel_closing`, `bad_sig` →
+`invalid_xbt_channel_signature`, `wrong_network` → `invalid_network`, and `close_failed` →
+`unexpected_settle_error` (full table: `scheme_xbt-channel.md`, Error Codes). The 402 `error` field
+keeps the short codes until the scheme name is settled, because the upstream prefix depends on it
+(`invalid_xbt_channel_*` for a new scheme, `invalid_batch_settlement_xbt_*` for a `batch-settlement`
+binding; `PUBLISHING.md`).

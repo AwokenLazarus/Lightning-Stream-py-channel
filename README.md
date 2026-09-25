@@ -2,7 +2,10 @@
 
 x402 v2 scheme **`xbt-channel`**: HTTP 402 payments for AI agents on XBT over Spillman-style
 unidirectional channels. Every channel signature is `SIGHASH_ALL|UNIFIED` (0x21). Spec:
-`~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment channels.md`.
+`docs/x402/xbt402-spec-v1.1-draft.md` (protocol v1.1: payee key committed to the network,
+`extra.derivation: "v2"`; `PAYMENT-RESPONSE` as an x402 `SettlementResponse`; x402 v2 facilitator
+bodies), x402 proposal `docs/x402/scheme_xbt-channel.md`, vectors `docs/x402/check_vectors.py`.
+Earlier design: `~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402 HTTP 402 payment channels.md`.
 
 **No remote. Never push.** Branch `wave2`. Keys for paid calls live in `ChannelSigner` (B2 hooks
 the same method names). `ecc.py` is libsecp256k1 via `coincurve`; `ecc_oracle.py` is the

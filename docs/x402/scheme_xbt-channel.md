@@ -3,8 +3,10 @@
 > **Draft proposal, unpublished.** Written against the x402 v2 specification and the scheme
 > templates in `x402-foundation/x402` (`specs/scheme_template.md`, `specs/scheme_impl_template.md`,
 > `main` at `4fcf836`, 2026-09-25). The full protocol text is `xbt402-spec-v1.1-draft.md` in this
-> directory; this file is the part an x402 reviewer needs. See [Appendix: relationship to
-> `batch-settlement`](#relationship-to-batch-settlement) before deciding where it belongs upstream.
+> directory; this file is the part an x402 reviewer needs. The reference implementation emits exactly
+> the shapes below (xbt402 v1.1). See [Appendix: binding name](#binding-name-xbt-channel-or-the-xbt-binding-of-batch-settlement)
+> before deciding where it belongs upstream: the same text can be filed as the XBT binding of
+> `batch-settlement`.
 
 ## Summary
 `xbt-channel` lets a client pay an HTTP resource per request in XBT through a unidirectional payment
@@ -92,13 +94,16 @@ transaction formats are Bitcoin's. Four chain rules shape this scheme:
 ### Keys
 All keys are 33-byte compressed secp256k1 keys. `tagged_hash` is the BIP340 tagged hash (SHA-256).
 ```
-t = int(tagged_hash("xbt-channel/payee", payTo ‖ A ‖ LE32(expiry))) mod n
+NET = UTF-8 of the `network` string, e.g. "bip122:0000000000000050c1e5f69672f45929"
+t = int(tagged_hash("xbt-channel/payee/v2", len8(NET) ‖ NET ‖ payTo ‖ A ‖ LE32(expiry))) mod n
 P = payTo + t·G                                  (server secret p = payTo_secret + t)
 K = tagged_hash("xbt402/auth-key", x(a·P)) = tagged_hash("xbt402/auth-key", x(p·A))
 ```
-`P` is computable from the 402 alone, so opening needs one round trip, and no two channels share a key.
-`K` (ECDH) is known only to the two parties. See Security Considerations for the cost of this
-derivation.
+`len8(NET)` is one byte, the length of `NET`. `P` is computable from the 402 alone, so opening needs one
+round trip, and no two channels share a key. Because `t` commits to the network, one `payTo` used on
+several networks derives unrelated channel keys. The 402 advertises this derivation as
+`extra.derivation: "v2"`, and a client MUST refuse any other value before funding. `K` (ECDH) is known
+only to the two parties. See Security Considerations for the cost of this derivation.
 
 ### Scripts and transactions
 Funding output: P2WSH of
@@ -139,7 +144,8 @@ The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
     "closeFeeSat": "600",
     "openUrl": "/x402/xbt-channel/open",
     "closeUrl": "/x402/xbt-channel/close",
-    "billing": "postpay"
+    "billing": "postpay",
+    "derivation": "v2"
   }
 }
 ```
@@ -155,6 +161,7 @@ The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
 | `extra.closeFeeSat` | string | yes | Close fee, fixed for the channel's life, paid from the client's side. Clients SHOULD cap it. |
 | `extra.openUrl`, `extra.closeUrl` | string | yes | Channel control endpoints, relative to the resource origin. |
 | `extra.billing` | string | yes | `"postpay"` or `"prepay"`. |
+| `extra.derivation` | string | yes | Payee-key derivation, `"v2"` (Keys). Clients MUST refuse other values before funding. |
 | `extra.conditional` | object | no | Hash-locked deliverable (experimental; see Appendix). |
 
 On a refused request the server returns a new 402 whose `error` is the refusal reason. It adds
@@ -163,7 +170,7 @@ authenticated for that channel.
 
 ## Payment payload
 ### Open request (once per channel)
-`POST extra.openUrl`:
+`POST extra.openUrl` (the server rebuilds `redeemScript` from `network`, `payTo`, `A` and `expiry`):
 ```json
 {"x402Version":2,"network":"bip122:0000000000000050c1e5f69672f45929",
  "channel":{"txid":"<funding txid>","vout":0,"capacity":200000,"expiry":2014,
@@ -254,8 +261,8 @@ close whose funding is unspent again. It SHOULD bump a stuck close by CPFP from 
 MUST be supervised: after `expiry`, a missing close means the client's refund wins.
 
 ### `PAYMENT-RESPONSE`
-Every served request returns a `SettlementResponse` with an empty `transaction` (nothing was broadcast)
-and the channel receipt in `extra`:
+Every served request returns a `SettlementResponse` with an empty `transaction` and `amount` (nothing was
+broadcast) and the channel receipt in `extra`:
 ```json
 {
   "success": true,
@@ -273,16 +280,14 @@ and the channel receipt in `extra`:
 ```
 `receipt.sig` is `P`'s ECDSA signature over
 `tagged_hash("xbt402/receipt", chan ‖ "|" ‖ seq ‖ "|" ‖ cum ‖ "|" ‖ charged ‖ "|" ‖ spentMsat ‖ "|" ‖ req)`.
+Only the receipt is signed. `extra.chargedAmount` MUST equal `receipt.charged`, and `success` is `true`
+when the handler's status is below 400.
 
-> **Conformance note.** The reference implementation (xbt402 v1.0) sends the receipt object itself as
-> the `PAYMENT-RESPONSE` value, with `success`, `scheme` and `network` at top level. The envelope above
-> is the proposed upstream form. The receipt fields and signature are unchanged; see the spec's §13.
-
-**Client checks.** The receipt verifies under `P`; `req` is the digest of its own request; `cum` is not
-above what it signed; `charged ≤ amount`; `spentMsat` grew by at most one request. On a 402 for an
-open channel, the client MUST NOT accept a higher `amount` than it opened the channel with, and MUST
-NOT adopt more than one request's worth of unreceipted charges over the channel's life. Otherwise a
-malicious server could drain the channel with 402 loops.
+**Client checks.** `network` and `payer` are its channel's; the receipt verifies under `P`; `req` is the
+digest of its own request; `cum` is not above what it signed; `charged ≤ amount`; `spentMsat` grew by
+at most one request. On a 402 for an open channel, the client MUST NOT accept a higher `amount` than it
+opened the channel with, and MUST NOT adopt more than one request's worth of unreceipted charges over
+the channel's life. Otherwise a malicious server could drain the channel with 402 loops.
 
 ### Close
 `POST extra.closeUrl` with `{"chan","sig","payload"?}`. `sig` is `A`'s signature over
@@ -295,8 +300,10 @@ serve it under `/x402/` (`/x402/verify`, `/x402/settle`, `/x402/supported`), nev
 could shadow the API's own routes.
 
 ### POST /x402/verify
-Request: `{"x402Version":2,"paymentPayload":{…},"paymentRequirements":{…}}`. It checks a signed state and
-records it if higher. It is unauthenticated, so it:
+Request: `{"x402Version":2,"paymentPayload":{"x402Version":2,"accepted":{…},"payload":{"chan","cum","sig"}},
+"paymentRequirements":{…}}`. Both `paymentRequirements` and `paymentPayload.accepted` MUST name this
+scheme, the server's network and its `payTo`. It checks a signed state and records it if higher. It is
+unauthenticated, so it:
 - MUST require `sig` for exactly the `cum` given;
 - MUST NOT move `seq`, and MUST NOT check `auth` (a stranger could otherwise lock a client out with a
   huge `seq`);
@@ -304,16 +311,18 @@ records it if higher. It is unauthenticated, so it:
 ```json
 {"isValid":true,"payer":"<A hex>","extra":{"chan":"…:0","cum":"600"}}
 ```
-or `{"isValid":false,"invalidReason":"invalid_xbt_channel_signature"}`.
+or `{"isValid":false,"invalidReason":"invalid_xbt_channel_signature"}`, both with HTTP 200. A client
+also uses it to hand over the plain state that folds a hash-locked increment (Appendix).
 
 ### POST /x402/settle
 Request as for `/verify`, with `paymentPayload.payload` = `{"chan","sig","payload"?}` (the close
-request). It closes the channel:
+request). It closes the channel; settling a channel that is already closed returns the same close:
 ```json
 {"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"750",
  "extra":{"chan":"…:0","unpaidMsat":"0"}}
 ```
-`amount` is the sat paid to the server by the close.
+`amount` is the sat paid to the server by the close. A refusal is
+`{"success":false,"errorReason":"invalid_xbt_channel_signature","transaction":"","network":"bip122:…"}`.
 
 ### GET /x402/supported
 ```json
@@ -323,7 +332,12 @@ request). It closes the channel:
 
 ## Error Codes
 
-| Error code | v1.0 code | Meaning |
+`invalidReason` and `errorReason` carry the error code. The 402 `error` field and the `400 {"error"}`
+answers of `openUrl` and `closeUrl` carry the short code in the second column: the reference keeps the
+short codes there until the scheme name is decided, because a `batch-settlement` binding would change
+the prefix (Appendix). The mapping is one to one.
+
+| Error code | Short code | Meaning |
 |---|---|---|
 | `invalid_xbt_channel_scheme_or_network` | `unsupported_scheme_or_network` | Scheme, network or `payTo` differs |
 | `invalid_xbt_channel_payload` | `bad_payload` | Undecodable or malformed payload |
@@ -336,6 +350,7 @@ request). It closes the channel:
 | `invalid_xbt_channel_sighash` | `bad_sighash` | Signature hash type is not `0x21` |
 | `invalid_xbt_channel_amount` | `bad_amount` | `cum` outside `[546, capacity − closeFeeSat]` |
 | `invalid_xbt_channel_hashlock` | `bad_hashlock` | Conditional call with the wrong hash |
+| `invalid_xbt_channel_conditional_outstanding` | `conditional_outstanding` | A hash-locked increment is not folded yet |
 | `invalid_xbt_channel_insufficient_payment` | `insufficient_payment` | `cum` does not cover the billing rule |
 | `invalid_xbt_channel_exhausted` | `channel_exhausted` | The channel cannot cover another request |
 | `invalid_xbt_channel_coinbase_funding` | `coinbase_funding` | Funding is a coinbase output |
@@ -383,11 +398,12 @@ large channels (the reference: 3 above 1,000,000 sat).
 
 ### Key derivation (known weakness)
 `P = payTo + t·G` with public `t` is non-hardened: any single leaked per-channel secret `p` reveals
-`payTo_secret = p − t`, hence every channel's key. `t` also does not commit to the network. Servers
-MUST NOT export per-channel secrets (delegate closing by handing out signed close transactions), MUST
-use a distinct `payTo` per network, and MUST sign in constant time (the server signs a receipt on every
-paid request, which gives any client a signing oracle). The v1.1 draft proposes committing the network
-in `t`.
+`payTo_secret = p − t`, hence every channel's key. Servers MUST NOT export per-channel secrets
+(delegate closing by handing out signed close transactions), and MUST sign in constant time (the
+server signs a receipt on every paid request, which gives any client a signing oracle). `t` commits to
+the network, so a `payTo` reused on a test network does not derive production channel keys; servers
+MUST still use a distinct `payTo` per network, since `payTo_secret` itself is one key. A hardened
+derivation would need a server-chosen key per channel and a second round trip before funding.
 
 ### Fees and timing
 The close fee is fixed at open. A fee spike longer than the close margin can delay the close past
@@ -410,40 +426,65 @@ Funding and close link client and server on-chain, and the close reveals both ke
 avoid reuse across channels. Individual requests never touch the chain.
 
 ## Test Vectors
-`vectors.json` in this directory holds byte-exact vectors: the key derivation, `K` and three `auth`
-values, four state transactions with their sighashes and signatures, a signed close and refund, three
-invalid signatures, and a full exchange (402, open, five paid requests with exact header values, a
-refused replay, cooperative close). `check_vectors.py` recomputes them all from the reference
-implementation. The exchange vectors use the v1.0 `PAYMENT-RESPONSE` shape (see the conformance note).
+`vectors.json` in this directory holds byte-exact vectors: the key derivation on three networks (with
+the v1.0 key for the same inputs, which a v1.1 server refuses), `K` and three `auth` values, four state
+transactions with their sighashes and signatures, a signed close and refund, three invalid signatures,
+and a full exchange (402, open, five paid requests with exact `PAYMENT-SIGNATURE` and `PAYMENT-RESPONSE`
+values, a refused replay, `/x402/supported`, a valid and an invalid `/x402/verify`, the cooperative
+close and `/x402/settle`). `check_vectors.py` recomputes them all from the reference implementation,
+under both libsecp256k1 and a pure-Python backend.
 
 ## Reference Implementation
-Python (`xbt402`, stdlib plus `coincurve`/libsecp256k1): server, client SDK, ASGI middleware, httpx
-transport, watcher, SQLite channel store. Tested against Knots 29.4.2 with BIP-110 enforced: funding,
+Python (`xbt402` v1.1, stdlib plus `coincurve`/libsecp256k1): server, client SDK, ASGI middleware, httpx
+transport, watcher, SQLite channel store, and an MCP tool for AI agents that returns the provider's
+answer as labelled untrusted data. Tested against Knots 29.4.2 with BIP-110 enforced: funding,
 close and refund relay between nodes; a 1,000-request run settles exactly on-chain; the refund wins
 after `expiry` and a late close is rejected. It has been through a security review whose Critical and
 High findings are fixed and covered by tests.
 
 ## Appendix
-### Relationship to `batch-settlement`
-Upstream `batch-settlement` already describes "payment channel streaming" as a capital-backed
-commitment model, with the same commit → accumulate → redeem lifecycle as this scheme. This proposal
-could therefore be submitted as the XBT network binding of `batch-settlement`
-(`scheme_batch_settlement_xbt.md`, `scheme: "batch-settlement"`) instead of a new scheme. The mechanics
-above would not change; the scheme string, the error-code prefix (`invalid_batch_settlement_xbt_*`) and
-the file name would. The seven items `batch-settlement` requires of a network binding map as follows:
-commitment format (Payment payload), verification rules (Verification), storage and commitment id
-(`chan` + `seq`, Settlement), double-spend prevention (cumulative states, `seq`, `auth`), commitment
-expiry (`expiry − closeMarginBlocks`), redemption (close), trust model (capital-backed).
+### Binding name: `xbt-channel` or the XBT binding of `batch-settlement`
+Upstream `batch-settlement` already describes "payment channel streaming" as a capital-backed commitment
+model, with the same commit → accumulate → redeem lifecycle as this scheme. This proposal can therefore
+be filed either as a new scheme or as the XBT network binding of `batch-settlement`. **The wire
+identifier stays `xbt-channel` until that is decided**; the mechanics do not depend on the choice.
+
+**Rename.** Filing it as a binding changes only names:
+
+| Item | New scheme (as written) | `batch-settlement` binding |
+|---|---|---|
+| `scheme` on the wire | `"xbt-channel"` | `"batch-settlement"` |
+| Spec files | `specs/schemes/xbt-channel/scheme_xbt-channel.md` + `scheme_xbt-channel_xbt.md` | `specs/schemes/batch-settlement/scheme_batch_settlement_xbt.md` + a line in the overview |
+| Error prefix | `invalid_xbt_channel_*` | `invalid_batch_settlement_xbt_*` |
+| Control paths | `/x402/xbt-channel/open`, `/x402/xbt-channel/close` | unchanged (they are advertised in `extra`, so any path works) |
+| Key-derivation tag | `xbt-channel/payee/v2` | unchanged: it is a domain separator, not a name clients match on |
+| `network`, `asset`, payloads, receipts, transactions | as above | unchanged |
+
+A server can accept both `scheme` strings during a transition and answer each in kind; the tag stays,
+so channels opened under either name are the same channels.
+
+**Mapping to what `batch-settlement` requires of a network binding:**
+
+| `batch-settlement` requirement | This scheme | Section |
+|---|---|---|
+| Commitment format | A `0x21` signature on the state transaction for `cum`, plus `chan`, `seq`, `auth` | Payment payload |
+| Verification rules | Eight ordered checks, constant cost (one HMAC, at most one ECDSA verification, no node call) | Verification |
+| Storage and commitment id | The channel `chan` (funding outpoint); the best `(cum, sig)`, `seq` and `spentMsat` recorded before serving | Settlement, step 1 |
+| Double-spend prevention | Cumulative states (only the highest pays), a strictly increasing `seq`, and `auth` binding one payload to one request | Verification, steps 3 and 6 |
+| Commitment expiry | The CLTV `expiry`; the server stops serving and closes at `expiry − closeMarginBlocks` | Channel Lifecycle, Settlement |
+| Redemption | The server completes and broadcasts the best state (`closeUrl`, `/x402/settle`, or the watcher) | Settlement, step 2; Close |
+| Trust model | Capital-backed: the client's refund protects the client, its signatures protect the server; each risks at most one request | Security Considerations |
 
 ### Hash-locked conditional requests (experimental)
 A server MAY offer a deliverable that is paid atomically with a secret: `extra.conditional =
 {"hash","amount","csvDelta"}`, and the client signs a state paying `amount` to
 `OP_IF OP_SHA256 <H> OP_EQUALVERIFY <P> OP_CHECKSIG OP_ELSE <csvDelta> OP_CSV OP_DROP <A> OP_CHECKSIG OP_ENDIF`
-(P2WSH). The response body carries the ciphertext and the preimage. The reference server cannot yet
-close with such a state, so today the increment is only postpay credit. A server MUST NOT offer
-conditional requests until it closes with the conditional state whenever it pays more than the best
-plain state (then claims with the preimage before `csvDelta`), or refuses a new conditional request
-until the previous increment is folded into a plain state.
+(P2WSH). The response body carries the ciphertext and the preimage `k`. Once `k` checks, the client signs
+a plain state for the folded total and hands it over (`/x402/verify` or its next request). A server that
+offers conditional requests MUST close with the conditional state whenever it pays more than the best
+plain state and then claim the hash-lock output with `k` before `csvDelta` blocks pass, and MUST refuse
+a new conditional request while one increment is unfolded (`invalid_xbt_channel_conditional_outstanding`).
+The reference server does both.
 
 ### Open questions
 - `asset: "XBT:sat"` is not a CAIP-19 identifier. Is a slip44-style `bip122:…/slip44:0` preferred, or a
@@ -458,3 +499,4 @@ until the previous increment is folded into a plain state.
 | Version | Date | Changes |
 |---|---|---|
 | 0.1-draft | 2026-09-25 | First draft against x402 v2 (`x402-foundation/x402` `main` `4fcf836`), from xbt402 v1.0/v1.1-draft |
+| 0.2-draft | 2026-09-25 | Matches the xbt402 v1.1 reference: network in the key tweak (`extra.derivation: "v2"`), `SettlementResponse` and facilitator shapes implemented, enforceable hash-locked close, binding-name appendix |
