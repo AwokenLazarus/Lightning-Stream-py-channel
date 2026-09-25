@@ -67,8 +67,11 @@ class ChannelSigner:
         if self.policy:
             origin = next((o for o, c in self._origins.items() if c == chan), "")
             self.policy(origin, amount)
-        tx = params.state_tx_a3(amount)
+        if amount < self._signed.get(chan, 0):
+            raise ChannelError("stale_amount", "never sign a lower cumulative amount")
+        tx = params.state_tx_a3(amount)       # output 0 = the payer's change, which 0xA3 commits to
         sig = ecc.sign(self._secret(chan), params.sighash_a3(tx)) + bytes([SIGHASH_SINGLE_ACP_UNIFIED])
+        self._signed[chan] = amount
         return sig.hex()
 
     def sign_close(self, chan: str) -> str:

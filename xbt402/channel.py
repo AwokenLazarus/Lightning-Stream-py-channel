@@ -174,11 +174,19 @@ class ChannelParams:
         return tx
 
     def state_tx_a3(self, amount: int) -> Tx:
-        """Payee-only output: SIGHASH_SINGLE|ANYONECANPAY|UNIFIED (0xA3) lets the payee add fee inputs."""
+        """Fee-input variant, signed SIGHASH_SINGLE|ANYONECANPAY|UNIFIED (0xA3) so the payee can add
+        fee inputs. SINGLE commits to output 0 only, so output 0 is the PAYER's change: that is the
+        output the payer needs fixed, and the payee may rearrange the rest (its `amount` plus the close
+        fee) as it likes. Wave 2 put the payee output first, which left the payer's whole remainder
+        uncommitted (XBT-061 H5). No change output (a full channel) means no 0xA3 state: use 0x21."""
         if not DUST <= amount <= self.max_amount:
             raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
+        change = self.capacity - self.close_fee - amount
+        if change < DUST:
+            raise ChannelError("bad_amount", "no payer change to commit to: sign a 0x21 state instead")
         return Tx(version=2, inputs=[self._funding_in()],
-                  outputs=[TxOut(amount, bytes.fromhex(self.payee_spk))], locktime=0)
+                  outputs=[TxOut(change, bytes.fromhex(self.payer_spk)), TxOut(amount, bytes.fromhex(self.payee_spk))],
+                  locktime=0)
 
     def sighash_a3(self, tx: Tx) -> bytes:
         return unified_sighash(tx, [self.funding_prevout()], 0, ST_WITNESS_V0, self.script,
@@ -227,6 +235,7 @@ class Payer:
     def sign_state_a3(self, amount: int) -> bytes:
         if amount < self.signed:
             raise ChannelError("stale_amount", "never sign a lower cumulative amount")
+        self.params.state_tx_a3(amount)       # refuses a state with no payer change before signing
         if self.backend is not None:
             sig = self.backend.sign_state_a3(self.params.channel_id, amount)
             sig = bytes.fromhex(sig) if isinstance(sig, str) else sig
@@ -275,7 +284,8 @@ class Payee:
 
     def close_tx_with_fee_input(self, extra_prev: TxOut, extra_in: TxIn, extra_secret: int,
                                 extra_change: bytes, extra_fee: int, sig_a3: bytes) -> Tx:
-        """Complete a 0xA3 state by adding a fee input. Output 0 (payee) stays exactly as signed."""
+        """Complete a 0xA3 state by adding a fee input. Output 0 (the payer's change) stays exactly as
+        signed; the payee output and the new change are the payee's own."""
         if not sig_a3 or sig_a3[-1] != SIGHASH_SINGLE_ACP_UNIFIED:
             raise ChannelError("bad_sighash", "fee-input variant needs SIGHASH_SINGLE|ACP|UNIFIED (0xA3)")
         tx = self.params.state_tx_a3(self.best_amount)

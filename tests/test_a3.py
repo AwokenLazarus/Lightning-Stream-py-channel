@@ -25,7 +25,8 @@ class A3Test(unittest.TestCase):
         tx = payee.close_tx_with_fee_input(extra_prev, extra_in, 0x3333,
                                            p2wpkh_spk(ecc.pubkey(0x3333)), 500, sig)
         self.assertEqual(len(tx.inputs), 2)
-        self.assertEqual(tx.outputs[0].value, 2000)
+        self.assertEqual(tx.outputs[0].value, 100_000 - 380 - 2000)       # payer change, committed by 0xA3
+        self.assertEqual(tx.outputs[1].value, 2000)
         prevouts = [p.funding_prevout(), extra_prev]
         h = unified_sighash(tx, prevouts, 0, ST_WITNESS_V0, p.script, SIGHASH_SINGLE_ACP_UNIFIED)
         self.assertTrue(ecc.verify(bytes.fromhex(p.payer_pub), h, sig[:-1]))
