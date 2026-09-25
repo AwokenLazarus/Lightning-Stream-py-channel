@@ -514,6 +514,8 @@ class ClientChannel:
     accepted: dict
     refund_hex: str = ""
     auth_key: bytes = b""        # without a signer; with one, the signer computes payload.auth
+    price: int = 0               # sat per call agreed at open: a 402 may not raise it mid-channel
+    slack_msat: int = 0          # charges adopted from a 402 without a receipt, over the channel's life
     seq: int = 0
     spent_msat: int = 0          # from the last verified receipt
     receipts: list = field(default_factory=list)
@@ -596,6 +598,7 @@ class XbtChannelClient:
                            auth_key=b"" if self.signer else channel_auth_key(secret, bytes.fromhex(p.payee_pub)))
         if self.refunds:
             self.refunds.add(ch.refund_hex, expiry, p.channel_id)
+        ch.price = int(acc["amount"])
         if self.on_refund:
             self.on_refund(ch.refund_hex, expiry)
         if self.on_open:
@@ -657,11 +660,15 @@ class XbtChannelClient:
             if not ch:
                 ch = self._open(origin, acc)
                 self.channels[origin] = ch
+            if ch.price and int(acc["amount"]) > ch.price:
+                raise ChannelError("bad_offer", f"price raised mid-channel: {ch.price} -> {acc['amount']} sat")
             ch.accepted = acc
-            if "channel" in pr:   # provider's view: accept at most one extra call beyond our receipts
+            if "channel" in pr:   # provider's view: at most one unreceipted call over the channel's life
                 claimed = int(pr["channel"]["spentMsat"])
-                if claimed - ch.spent_msat > int(acc["amount"]) * 1000:
+                extra = claimed - ch.spent_msat
+                if extra > 0 and ch.slack_msat + extra > int(acc["amount"]) * 1000:
                     raise ChannelError("bad_offer", "provider claims charges we have no receipts for")
+                ch.slack_msat += max(0, extra)
                 ch.spent_msat = max(ch.spent_msat, claimed)
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc,
                                                   "payload": self._payload(ch, int(acc["amount"]), method, path, body)})}
@@ -736,6 +743,8 @@ class XbtChannelClient:
         if not ch:
             ch = self._open(origin, acc)
             self.channels[origin] = ch
+        if ch.price and int(acc["amount"]) > ch.price:
+            raise ChannelError("bad_offer", f"price raised mid-channel: {ch.price} -> {acc['amount']} sat")
         ch.accepted = acc
         h = bytes.fromhex(extra["hash"])
         cond_amt = int(extra["amount"])
