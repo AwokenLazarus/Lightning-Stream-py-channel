@@ -46,8 +46,11 @@ sub-cent HTTP payments on it today.
 - `asset` MUST be `"XBT:sat"`, and `amount` is in satoshis.
 
 ### The chain, for readers new to it
-XBT is a Bitcoin-derived chain. It shares Bitcoin's history to block 961631, enforces BIP-110 ("RDTS",
-a reduced-data soft fork) from 961632, and uses BLAKE2b proof of work from 961640. The node software is
+XBT is a Bitcoin-derived chain. It shares Bitcoin's history to block 961631; block 961632 is the first
+block of the BIP-110 branch (Bitcoin's 961632 differs), and Knots 29.4.x pins 961632–961640 with
+checkpoints. From block 961640 its proof of work is BLAKE2b, and Knots 29.4.2 enforces BIP-110 ("RDTS",
+a reduced-data soft fork) as consensus until the parent block's median-time-past reaches 2027-09-01
+00:00 UTC. The node software is
 Bitcoin Knots with the BLAKE2b hard fork; this scheme was tested on Knots 29.4.2. Its script and
 transaction formats are Bitcoin's. Four chain rules shape this scheme:
 - **BIP-110** makes an output script longer than 34 bytes (83 for OP_RETURN) consensus-invalid and bans

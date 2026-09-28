@@ -1,0 +1,2 @@
+# scripts/mainnet_provider.py and scripts/sealed_key.py (the sealed payTo key), on top of requirements.txt
+cryptography>=42

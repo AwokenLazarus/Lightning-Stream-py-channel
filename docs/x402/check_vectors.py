@@ -174,7 +174,8 @@ class StubNode:
                 "vout": [{"n": 0, "value": self.p.capacity / 1e8, "scriptPubKey": {"hex": self.p.spk.hex()}}]}
 
     def gettxout(self, txid, vout, include_mempool=True):
-        return {"confirmations": 1, "value": self.p.capacity / 1e8}
+        return {"confirmations": 1, "value": self.p.capacity / 1e8, "scriptPubKey": {"hex": self.p.spk.hex()},
+                "coinbase": False}
 
     def sendrawtransaction(self, hx):
         self.sent.append(hx)

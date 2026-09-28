@@ -47,9 +47,18 @@ class Watcher:
         self._stop.set()
 
 
-def cpfp_from_close(rpc, close_txid: str, payee_spk_hex: str, payee_secret: int, fee: int) -> str:
-    raw = rpc.getrawtransaction(close_txid, True)
-    vout = next(o for o in raw["vout"] if o["scriptPubKey"]["hex"] == payee_spk_hex)
-    value = round(vout["value"] * SAT)
-    tx = cpfp_child(close_txid, vout["n"], value, bytes.fromhex(payee_spk_hex), payee_secret, fee)
+def cpfp_from_close(rpc, close_txid: str, payee_spk_hex: str, payee_secret: int, fee: int,
+                    close_hex: str = None) -> str:
+    """`close_hex` (the provider's own record of the close) needs no node lookup, so this works on a
+    pruned node without txindex even once the close is in a block."""
+    if close_hex:
+        from .tx import Tx
+        outs = Tx.parse(bytes.fromhex(close_hex)).outputs
+        n = next(i for i, o in enumerate(outs) if o.script_pubkey.hex() == payee_spk_hex)
+        value = outs[n].value
+    else:
+        raw = rpc.getrawtransaction(close_txid, True)
+        vout = next(o for o in raw["vout"] if o["scriptPubKey"]["hex"] == payee_spk_hex)
+        n, value = vout["n"], round(vout["value"] * SAT)
+    tx = cpfp_child(close_txid, n, value, bytes.fromhex(payee_spk_hex), payee_secret, fee)
     return rpc.sendrawtransaction(tx.hex())

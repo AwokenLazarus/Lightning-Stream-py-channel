@@ -81,7 +81,11 @@ class FakeNode:
             return None
         if tx["confirmations"] < 1 and not include_mempool:
             return None
-        return {"confirmations": tx["confirmations"], "value": tx["vout"][vout]["value"]}
+        if vout >= len(tx["vout"]):
+            return None
+        o = tx["vout"][vout]
+        return {"confirmations": tx["confirmations"], "value": o["value"], "scriptPubKey": o["scriptPubKey"],
+                "coinbase": any("coinbase" in i for i in tx.get("vin", []))}
 
     def getblockcount(self):
         return self.height

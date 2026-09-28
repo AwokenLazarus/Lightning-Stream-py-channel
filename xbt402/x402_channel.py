@@ -491,7 +491,54 @@ class XbtChannelProvider:
             if not st:
                 raise ChannelError("unknown_channel", "no channel closed with that txid")
             secret = self._chan_secret(st.params)
-        return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee)
+            close_hex = (st.extra or {}).get("close_hex")
+        return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee, close_hex=close_hex)
+
+    def sweep_payee(self, chan: str, dest_spk: bytes, fee: int) -> dict:
+        """Move this channel's payee close output, P2WPKH(P) with p = payTo_secret + t, to
+        `dest_spk` (witness v0 only: P2WPKH or P2WSH), signed SIGHASH_ALL|UNIFIED (0x21). p is used
+        here and never returned or written anywhere. Reads the close from the ledger (the exact close
+        hex this provider sent), so it needs no txindex. Idempotent: a sweep already made is returned."""
+        from .channel import sign_p2wpkh
+        from .tx import Tx, TxIn, TxOut
+        dest_spk = bytes(dest_spk)
+        if not (len(dest_spk) in (22, 34) and dest_spk[0] == 0 and dest_spk[1] == len(dest_spk) - 2):
+            raise ChannelError("bad_dest", "sweep destination must be a witness v0 script (P2WPKH or P2WSH)")
+        with self.ledger.lock:
+            st = self.ledger.channels.get(canonical_chan(chan))
+            if not st:
+                raise ChannelError("unknown_channel")
+            done = (st.extra or {}).get("payee_sweep")
+            if done:
+                return {**done, "already": True}
+            if not st.closed_txid or not (st.extra or {}).get("close_hex"):
+                raise ChannelError("not_closed", "the channel has no recorded close to sweep")
+            close = Tx.parse(bytes.fromhex(st.extra["close_hex"]))
+            payee_spk = bytes.fromhex(st.params.payee_spk)
+            vout = next((n for n, o in enumerate(close.outputs) if o.script_pubkey == payee_spk), None)
+            if vout is None:
+                raise ChannelError("no_payee_output", "the close pays nothing to the payee key")
+            value = close.outputs[vout].value
+            if value - int(fee) < DUST:
+                raise ChannelError("bad_amount", f"fee {fee} leaves dust from {value}")
+            if self.rpc.gettxout(st.closed_txid, vout, True) is None:
+                raise ChannelError("payee_spent", "the payee output is spent or its close is not on this node")
+            tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(st.closed_txid)[::-1], vout, 0xFFFFFFFD)],
+                    outputs=[TxOut(value - int(fee), dest_spk)], locktime=0)
+            sign_p2wpkh(self._chan_secret(st.params), tx, [TxOut(value, payee_spk)])
+            txid = tx.txid()
+            rec = {"txid": txid, "outpoint": f"{st.closed_txid}:{vout}", "value": value, "fee": int(fee),
+                   "swept": value - int(fee), "dest_spk": dest_spk.hex()}
+            st.extra = {**st.extra, "payee_sweep_intent": {**rec, "hex": tx.hex()}}   # write-ahead (M8)
+            self.ledger.save(st)
+            try:
+                self.rpc.sendrawtransaction(tx.hex())
+            except Exception as e:  # noqa: BLE001 - node errors become protocol errors
+                if not self._tx_known(txid, tx):
+                    raise ChannelError("sweep_failed", str(e))
+            st.extra = {**st.extra, "payee_sweep": rec}
+            self.ledger.save(st)
+            return rec
 
     def supported(self) -> dict:
         return {"kinds": [{"x402Version": 2, "scheme": SCHEME, "network": self.network}],

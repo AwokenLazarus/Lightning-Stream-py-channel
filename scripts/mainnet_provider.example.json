@@ -1,0 +1,22 @@
+{
+  "_comment": "AGP-015 runbook §1.3-1.4 / P7: the mainnet test provider. A config file only: serving on mainnet is refused until mainnet_start_approved is true (Mike's hold, 2026-09-28). `~` is expanded. Check with: mainnet_provider.py --config FILE --check",
+  "chain": "main",
+  "rpc_port": 39332,
+  "cookie": "~/xbt-mainnet/knots/.cookie",
+  "payto_key": "~/.config/xbt-mainnet-test/payto.key",
+  "payto_wrap": "~/.config/xbt-mainnet-test/payto.wrap",
+  "admin_token": "~/.config/xbt-mainnet-test/provider-admin.token",
+  "ledger": "~/xbt-mainnet/provider/ledger.sqlite",
+  "host": "127.0.0.1",
+  "port": 39480,
+  "route": {"method": "GET", "path": "/agp015/echo", "price": 500},
+  "policy": {"min_capacity": 10000, "max_capacity": 10000, "min_expiry_blocks": 1008,
+             "max_expiry_blocks": 8640, "min_conf": 1, "zero_conf_max": 0},
+  "close_fee": 600,
+  "close_margin": 144,
+  "claim_fee": 300,
+  "billing": "postpay",
+  "watcher_interval": 30,
+  "cpfp_fee": 0,
+  "mainnet_start_approved": false
+}

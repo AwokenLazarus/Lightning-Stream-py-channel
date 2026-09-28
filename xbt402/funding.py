@@ -28,17 +28,20 @@ def check_funding(rpc, p: ChannelParams, pol: FundingPolicy) -> int:
     Refuses coinbase fundings outright: a channel funded by a coinbase output inherits the
     coinbase maturity (6480 blocks while Knots #419 applies), so neither the close nor the
     refund could be mined in time. Any other funding is an ordinary spend.
+
+    Reads the output with `gettxout` (mempool included), which a pruned node without txindex
+    answers for any unspent output; `getrawtransaction` would need txindex once the
+    funding is in a block. A funding output that is already spent is refused.
     """
     try:
-        raw = rpc.getrawtransaction(p.funding_txid, True)
+        out = rpc.gettxout(p.funding_txid, p.funding_vout, True)
     except Exception as e:  # noqa: BLE001 - node errors become protocol errors
         raise ChannelError("unknown_funding", str(e))
-    if any("coinbase" in vin for vin in raw["vin"]):
+    if not out:
+        raise ChannelError("unknown_funding", "no such unspent output (unknown, or already spent)")
+    if out.get("coinbase"):
         raise ChannelError("coinbase_funding", "coinbase outputs cannot fund a channel (maturity)")
-    if p.funding_vout >= len(raw["vout"]):
-        raise ChannelError("bad_funding", "no such output")
-    out = raw["vout"][p.funding_vout]
-    if out["scriptPubKey"]["hex"] != p.spk.hex():
+    if (out.get("scriptPubKey") or {}).get("hex") != p.spk.hex():
         raise ChannelError("bad_funding", "output is not this channel's script")
     if round(out["value"] * SAT) != p.capacity:
         raise ChannelError("bad_funding", "capacity mismatch")
@@ -48,7 +51,7 @@ def check_funding(rpc, p: ChannelParams, pol: FundingPolicy) -> int:
     if not pol.min_expiry_blocks <= left <= pol.max_expiry_blocks:
         raise ChannelError("bad_expiry", f"{left} blocks to expiry, need "
                                          f"[{pol.min_expiry_blocks}, {pol.max_expiry_blocks}]")
-    confs = raw.get("confirmations", 0)
+    confs = out.get("confirmations", 0)
     need = pol.conf_for(p.capacity)
     if confs < need and p.capacity > pol.zero_conf_max:
         raise ChannelError("unconfirmed", f"{confs} confirmations, need {need}")

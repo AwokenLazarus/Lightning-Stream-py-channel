@@ -62,7 +62,7 @@ XBT is a Bitcoin-derived chain with these properties that matter here:
 
 | Property | Value |
 |---|---|
-| History | Shares Bitcoin's history up to block 961631. From 961632 its nodes enforce BIP-110 (below). From block **961640** its proof of work is BLAKE2b instead of SHA-256d. |
+| History | Shares Bitcoin's history up to block 961631. Block 961632 is the first block of the BIP-110 branch (Bitcoin's 961632 differs); Knots 29.4.x pins 961632–961640 with checkpoints. From block **961640** its proof of work is BLAKE2b instead of SHA-256d, and Knots 29.4.2 enforces the RDTS (BIP-110, below) rules as consensus, until the parent block's median-time-past reaches 2027-09-01 00:00 UTC. |
 | Node software | Bitcoin Knots with the BLAKE2b hard fork. This spec was tested against Knots **29.4.2** (`v29.4.2.knots20260508`). |
 | Script and transactions | Bitcoin's: segwit v0 (P2WPKH, P2WSH), taproot, CLTV, CSV. Amounts in satoshis (`sat`). |
 | **BIP-110 (RDTS)** | A "reduced data" soft fork, enforced as consensus. The rules this protocol depends on: an output's scriptPubKey is at most 34 bytes (83 for OP_RETURN), pushes and witness items are at most 256 bytes, and `OP_IF`/`OP_NOTIF` are invalid in tapscript. Its data limits are temporary by design. |

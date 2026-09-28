@@ -213,16 +213,28 @@ def segwit_address(hrp: str, spk: bytes) -> str:
     return hrp + "1" + "".join(_CHARSET[d] for d in data + [(chk >> 5 * (5 - i)) & 31 for i in range(6)])
 
 
-def address_to_spk(addr: str) -> bytes:
+def address_to_spk(addr: str, hrp: Optional[str] = None) -> bytes:
+    """scriptPubKey of a bech32 witness v0 address. With `hrp`, an address of another network is
+    refused (a `bcrt1` or `tb1` address on mainnet would pay a script nobody there expects)."""
     addr = addr.lower()
-    hrp, _, rest = addr.rpartition("1")
+    got, _, rest = addr.rpartition("1")
+    if not got or not rest or any(c not in _CHARSET for c in rest):
+        raise ValueError("not a bech32 address")
     data = [_CHARSET.index(c) for c in rest]
-    if _polymod(_hrp_expand(hrp) + data) != 1:
+    if _polymod(_hrp_expand(got) + data) != 1:
         raise ValueError("bad bech32 checksum")
+    if hrp is not None and got != hrp:
+        raise ValueError(f"address is for hrp {got!r}, this network uses {hrp!r}")
     ver, prog = data[0], bytes(_convertbits(data[1:-6], 5, 8, False))
     if ver != 0:
         raise ValueError("only witness v0")
+    if len(prog) not in (20, 32):
+        raise ValueError("witness v0 program must be 20 or 32 bytes")
     return b"\x00" + bytes([len(prog)]) + prog
+
+
+# bech32 hrp per chain name (getblockchaininfo "chain")
+HRP = {"main": "bc", "test": "tb", "testnet4": "tb", "signet": "tb", "regtest": "bcrt"}
 
 
 # --- XBT unified signature hash ------------------------------------------------------------
