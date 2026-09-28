@@ -95,6 +95,78 @@ class ChannelSigner:
         sig = ecc.sign(self._secret(chan), cond.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
         return sig.hex()
 
+    # --- adaptor-locked states (AGP-021 hub routing) -----------------------------------------------
+    def sign_state_adaptor(self, chan: str, cum: int, point: str, route: dict = None) -> dict:
+        """Pre-sign state(cum) under T1 = T + r*G for a routed lock (`point` = T, the provider's
+        invoice point; r is fresh here). One pending lock per channel; the lock is recorded before
+        the pre-signature leaves. Returns {adaptor, point: T1, tweak: r, cum}."""
+        from . import adaptor
+        params = self._params[chan]
+        if self.policy:
+            origin = next((o for o, c in self._origins.items() if c == chan), "")
+            self.policy(origin, cum)
+        locks = self.__dict__.setdefault("_locks", {})
+        if locks.get(chan):
+            raise ChannelError("lock_outstanding", "one adaptor lock per channel at a time")
+        if cum <= self._signed.get(chan, 0):
+            raise ChannelError("stale_amount", "a lock must raise the signed amount")
+        T = adaptor.dec(point)
+        r = secrets.randbelow(ecc.N - 1) + 1
+        T1 = adaptor.add(T, adaptor.point_of(r))
+        pre = adaptor.presign(self._secret(chan), params.sighash(params.state_tx(cum)), T1)
+        locks[chan] = {"cum": cum, "pre": pre.to_json(), "r": f"{r:064x}", "T": point,
+                       "T1": adaptor.enc(T1).hex(), "route": route or {}}
+        return {"adaptor": pre.to_json(), "point": adaptor.enc(T1).hex(), "tweak": f"{r:064x}", "cum": cum}
+
+    def pending_lock(self, chan: str) -> dict:
+        return dict(self.__dict__.get("_locks", {}).get(chan) or {})
+
+    def resolve_lock(self, chan: str, secret: str) -> str:
+        """The lock was paid: `secret` is t + r (from the hub) or t (from the provider's receipt).
+        Checks it against T1 or T; the lock's amount becomes the signed amount. Returns t (hex)."""
+        from . import adaptor
+        lk = self.__dict__.get("_locks", {}).get(chan)
+        if not lk:
+            raise ChannelError("no_state", "no pending lock")
+        y, r = int(secret, 16) % ecc.N, int(lk["r"], 16)
+        if adaptor.point_of(y) == adaptor.dec(lk["T1"]):
+            t = (y - r) % ecc.N
+        elif adaptor.point_of(y) == adaptor.dec(lk["T"]):
+            t = y
+        else:
+            raise ChannelError("bad_secret", "secret opens neither T1 nor T")
+        self._signed[chan] = max(self._signed.get(chan, 0), lk["cum"])
+        self._locks.pop(chan)
+        return f"{t:064x}"
+
+    def void_lock(self, chan: str) -> dict:
+        """Give a lock up (the hub refused it, or its invoice expired). The pre-signature stays out
+        there: a later state above it dominates it, and until then it costs at most its own amount."""
+        lk = self.__dict__.get("_locks", {}).pop(chan, None) or {}
+        if lk:
+            self.__dict__.setdefault("_given_up", {}).setdefault(chan, []).append(lk)
+        return lk
+
+    def adopt_lock(self, chan: str, cum: int) -> None:
+        """A lock we gave up was completed after all (the hub read t off a close): its amount is signed.
+        Only the cum of a lock this signer pre-signed can be adopted."""
+        gone = self.__dict__.get("_given_up", {}).get(chan, [])
+        if not any(int(g["cum"]) == int(cum) for g in gone):
+            raise ChannelError("bad_amount", "not a lock this signer pre-signed")
+        self._signed[chan] = max(self._signed.get(chan, 0), int(cum))
+
+    def recover_lock(self, chan: str, close_tx) -> str:
+        """t from the hub's ch1 close, which carries our completed pre-signature (t + r)."""
+        from . import adaptor
+        lk = self.__dict__.get("_locks", {}).get(chan)
+        if not lk:
+            raise ChannelError("no_state", "no pending lock")
+        y = adaptor.secret_from_witness(adaptor.PreSig.from_json(lk["pre"]), close_tx.inputs[0].witness,
+                                        adaptor.dec(lk["T1"]))
+        if y is None:
+            raise ChannelError("bad_secret", "this close does not carry the lock")
+        return self.resolve_lock(chan, f"{y:064x}")
+
     def fund(self, address: str, sats: int):
         if not self.fund_fn:
             raise ChannelError("no_wallet", "signer has no fund() hook")
@@ -143,6 +215,18 @@ class SignerSocketAdapter:
 
     def request_auth(self, chan: str, seq: int, cum, sig, req: str) -> str:
         return self.client.call("xbt402_request_auth", chan=chan, seq=seq, cum=str(cum), sig=sig or "", req=req)["auth"]
+
+    def sign_state_adaptor(self, chan: str, cum: int, point: str, route: dict = None) -> dict:
+        return self.client.call("xbt402_sign_state_adaptor", chan=chan, cum=cum, point=point, route=route or {})
+
+    def resolve_lock(self, chan: str, secret: str) -> str:
+        return self.client.call("xbt402_resolve_lock", chan=chan, secret=secret)["t"]
+
+    def void_lock(self, chan: str) -> dict:
+        return self.client.call("xbt402_void_lock", chan=chan)
+
+    def adopt_lock(self, chan: str, cum: int) -> None:
+        self.client.call("xbt402_adopt_lock", chan=chan, cum=cum)
 
     def fund(self, address: str, sats: int):
         r = self.client.call("xbt402_fund", address=address, sats=sats)

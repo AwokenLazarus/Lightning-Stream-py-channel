@@ -190,7 +190,7 @@ class XbtChannelProvider:
                  price: Callable[[str, str], int], handler: Callable, billing: str = "postpay",
                  close_fee: int = 600, close_margin: int = 144, policy: FundingPolicy = None,
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
-                 max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None):
+                 max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
         if int(max_body) < 1:
@@ -207,6 +207,33 @@ class XbtChannelProvider:
         self._auth_keys: Dict[str, bytes] = {}
         self.max_body = int(max_body)
         self.route_max_body = dict(route_max_body or {})
+        # AGP-021 hub routing: routed paths, their sessions and the adaptor-locked ch2 states
+        from .route import RouteSeller
+        self.settle_multiple = int(settle_multiple)   # settle at >= this x closeFee (cmp settlement policy)
+        self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
+                                  + ".routes.json")
+
+    def offer_route(self, path: str, window: float = 1.0, lock_wait: float = 2.0, invoice_ttl: float = 15.0,
+                    hubs="any", amsat_per_call: int = 0, unit: str = "call", credit_msat: int = 0,
+                    charge: Callable = None):
+        """Sell `path` through hubs (AGP-021). Its 402 carries `extra.route`: the signed price quote and,
+        for a client that names its route key (ROUTE-CLIENT header), a session with a fresh lock point
+        T per window, signed by payTo. Calls carry ROUTE-AUTH and are metered in amsat
+        (`amsat_per_call`, or `charge(method, path, status, body) -> amsat`); each window's accrued
+        amount is paid by one adaptor-locked ch2 state from a hub. A session is served while its
+        unpaid charges are younger than `window + lock_wait` (the lock wait is configurable)."""
+        o = self.routes.offer(path, window=window, lock_wait=lock_wait, invoice_ttl=invoice_ttl, hubs=hubs,
+                              amsat_per_call=amsat_per_call, unit=unit, credit_msat=credit_msat)
+        o.charge = charge
+        return o
+
+    def terms(self) -> dict:
+        """GET /x402/xbt-channel/terms: the requirements a hub needs to open (and roll over) a
+        hub-funded channel to this provider without a paid call first."""
+        req = self.requirements(0)
+        req["extra"]["settleMultiple"] = self.settle_multiple
+        req["extra"]["routes"] = sorted(self.routes.offers)
+        return req
 
     def body_limit(self, path: str, max_body: int = None) -> int:
         """Request-body bound for this path. `max_body` (serve kwarg) wins, then a route option,
@@ -260,11 +287,21 @@ class XbtChannelProvider:
             raise ChannelError("bad_funding", "redeemScript does not match payTo/payerPub/expiry")
         chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
         p.funding_txid, p.funding_vout, p.capacity = chan.split(":")[0], int(c["vout"]), int(c["capacity"])
+        hub = ""
+        if req.get("hub"):
+            # a hub-funded routing channel (AGP-021): the hub's payTo signs the channel id, and only
+            # locks relayed for that hub are completed on this channel
+            from .route import hub_channel_message
+            hub = str(req["hub"].get("payTo", ""))
+            if not ecc.verify(bytes.fromhex(hub), hub_channel_message(p.channel_id), bytes.fromhex(req["hub"]["sig"])):
+                raise ChannelError("bad_sig", "hub binding not signed by the hub's payTo")
         with self.ledger.lock:
             if p.channel_id in self.ledger.channels:
                 raise ChannelError("duplicate_channel")
             confs = check_funding(self.rpc, p, self.policy)
             st = self.ledger.channels[p.channel_id] = ChannelState(p)
+            if hub:
+                st.extra = {"hub": hub}
             self.ledger.save(st)
         return {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
 
@@ -626,6 +663,113 @@ class XbtChannelProvider:
         return {"success": True, "transaction": r["txid"], "network": self.network, "payer": payer,
                 "amount": str(paid), "extra": {"chan": r["chan"], "unpaidMsat": r["unpaidMsat"]}}
 
+    def rollover(self, req: dict) -> dict:
+        """POST /x402/xbt-channel/rollover (AGP-021): co-sign and broadcast the payer's rollover of a
+        channel, one tx that pays this provider `amount` (at least its best state) and funds the next
+        channel with the rest less the close fee (ChannelParams.rollover_tx). The payer's signature
+        over that exact tx is the authorisation. The next channel opens through extra.openUrl once it
+        confirms."""
+        st = self._channel(req["chan"])
+        p = st.params
+        amount, nxt = int(req["amount"]), req["next"]
+        payer_pub = bytes.fromhex(nxt["payerPub"])
+        ecc._decode_pub(payer_pub)
+        expiry = int(nxt["expiry"])
+        h = self.height()
+        if not h + self.policy.min_expiry_blocks <= expiry <= h + self.policy.max_expiry_blocks:
+            raise ChannelError("bad_expiry", "next channel expiry outside this provider's policy")
+        payer_spk = check_payout_spk(nxt["payerSpk"]) if nxt.get("payerSpk") else ""
+        nparams = ChannelParams.derive(self.pay_to, payer_pub.hex(), expiry, p.close_fee, payer_spk,
+                                       network=self.network)
+        next_cap = p.capacity - p.close_fee - amount
+        if next_cap < self.policy.min_capacity:
+            raise ChannelError("bad_amount", "rollover leaves less than the minimum channel capacity")
+        tx = p.rollover_tx(amount, nparams.spk, next_cap)
+        sig = bytes.fromhex(req["sig"])
+        digest = p.sighash(tx)
+        if not sig or sig[-1] != SIGHASH_ALL_UNIFIED or not ecc.verify(bytes.fromhex(p.payer_pub), digest, sig[:-1]):
+            raise ChannelError("bad_sig", "payer signature does not verify for this rollover")
+        tx.inputs[0].witness = [sig, ecc.sign(self._chan_secret(p), digest) + bytes([SIGHASH_ALL_UNIFIED]),
+                                b"\x01", p.script]
+        with self.ledger.lock:
+            if st.closed_txid:
+                raise ChannelError("channel_closing", "already settled")
+            if amount < st.best_cum:
+                raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
+            txid = tx.txid()
+            st.extra = {**(st.extra or {}), "close_intent": {"hex": tx.hex(), "txid": txid, "cond": False}}
+            self.ledger.save(st)
+            try:
+                self.rpc.sendrawtransaction(tx.hex())
+            except Exception as e:  # noqa: BLE001 - node errors become protocol errors
+                if not self._tx_known(txid, tx):
+                    raise ChannelError("close_failed", str(e))
+            self._closed(st, tx.hex(), txid, False)
+            st.extra = {**st.extra, "rollover_to": f"{txid}:1"}
+            self.ledger.save(st)
+        return {"chan": p.channel_id, "txid": txid, "amount": amount, "nextChan": f"{txid}:1",
+                "nextCapacity": next_cap}
+
+    def _route_lock(self, method: str, path: str, headers: dict, body: bytes):
+        """POST /x402/xbt-channel/lock: a hub's adaptor-locked state on its ch2 to us. Authenticated
+        like a paid call (the hub's channel HMAC covers the JSON body with the route terms)."""
+        def err(code, detail="", status=400):
+            return status, {"Content-Type": "application/json"}, json.dumps({"error": code, "detail": detail}).encode()
+        hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
+        try:
+            pl = unb64json(hdr)["payload"]
+            route = json.loads(body)["route"]
+            if not isinstance(pl, dict) or not isinstance(route, dict):
+                raise TypeError("objects expected")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return err("bad_payload")
+        with self.ledger.lock:
+            try:
+                st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
+            except ChannelError:
+                st = None
+            if not st:
+                return err("unknown_channel")
+            if not self._authentic(st, pl, method, path, body):
+                return err("bad_auth", status=401)
+            st.seq = int(pl["seq"])
+            if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
+                return err("channel_closing")
+            if st.suspended:
+                return err("unconfirmed")
+            try:
+                out = self.routes.complete_lock(st, pl, route)
+            except ChannelError as e:
+                self.ledger.save(st)
+                return err(e.code, str(e))
+        return (202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()
+
+    def _routed_call(self, method: str, path: str, path_key: str, hdr: str, body: bytes, url: str):
+        from .route import AMSAT_PER_MSAT  # noqa: F401
+        o = self.routes.offers[path_key]
+        s, error = self.routes.begin_call(path_key, hdr, method, path, body)
+        if error:
+            st, h, b = self._payment_required(url, self.price(method, path), error)
+            doc = json.loads(b)
+            doc["accepts"][0]["extra"]["route"] = self.routes.route_extra(path_key)
+            if s is not None:
+                with self.routes.lock:
+                    doc["routeState"] = self.routes.state(s)
+            h["PAYMENT-REQUIRED"] = b64json(doc)
+            return 402, h, json.dumps(doc).encode()
+        status, hdrs, out = self.handler(method, path, body)
+        if unsafe_headers(hdrs):
+            status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
+        charge = int(o.amsat_per_call)
+        if getattr(o, "charge", None):
+            charge = int(o.charge(method, path, status, out))
+        if status >= 500:
+            charge = 0
+        state = self.routes.end_call(s, max(0, charge))
+        hdrs = dict(hdrs)
+        hdrs["ROUTE-STATE"] = b64json(state)
+        return status, hdrs, out
+
     def offer_conditional(self, path: str, price: int, plaintext: bytes, k: bytes = None):
         """Prepare a hash-locked deliverable for `path`. Returns (H, ciphertext, k). The 402 carries
         H and the ciphertext; each sale reveals k (to the payer, and on-chain if claimed), so after a
@@ -658,8 +802,15 @@ class XbtChannelProvider:
             except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
+        if path == "/x402/xbt-channel/lock":
+            if method != "POST":
+                return 405, {}, b"method not allowed"
+            return self._route_lock(method, path, headers, body)
+        if path == "/x402/xbt-channel/terms" and method == "GET":
+            return 200, {"Content-Type": "application/json"}, json.dumps(self.terms()).encode()
         if path.startswith("/x402/xbt-channel/"):
-            action = {"/x402/xbt-channel/open": self.open, "/x402/xbt-channel/close": self.close}.get(path)
+            action = {"/x402/xbt-channel/open": self.open, "/x402/xbt-channel/close": self.close,
+                      "/x402/xbt-channel/rollover": self.rollover}.get(path)
             if not action or method != "POST":
                 return 404, {}, b"not found"
             try:
@@ -668,10 +819,22 @@ class XbtChannelProvider:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
         url = url or path
-        price = self.price(method, path)
-        hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
-        cond_offers = getattr(self, "_cond", {})
+        uh = {k.upper(): v for k, v in headers.items()}
         path_key = path.split("?", 1)[0]
+        if path_key in self.routes.offers and uh.get("ROUTE-AUTH") and not uh.get("PAYMENT-SIGNATURE"):
+            return self._routed_call(method, path, path_key, uh["ROUTE-AUTH"], body, url)
+        price = self.price(method, path)
+        hdr = uh.get("PAYMENT-SIGNATURE")
+        cond_offers = getattr(self, "_cond", {})
+        if not hdr and path_key in self.routes.offers:
+            status, h, b = self._payment_required(url, price, "payment_required")
+            doc = json.loads(b)
+            try:
+                doc["accepts"][0]["extra"]["route"] = self.routes.route_extra(path_key, uh.get("ROUTE-CLIENT", ""))
+            except (ValueError, TypeError):
+                return 400, {}, b"bad ROUTE-CLIENT key"
+            h["PAYMENT-REQUIRED"] = b64json(doc)
+            return 402, h, json.dumps(doc).encode()
         if not hdr:
             status, h, b = self._payment_required(url, price, "payment_required")
             if path_key in cond_offers:
