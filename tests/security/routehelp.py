@@ -24,7 +24,8 @@ class RouteNode(FakeNode):
 
     def __init__(self, height=1000):
         super().__init__(height)
-        self.spenders, self.raw = {}, {}
+        self.spenders, self.raw, self.mined = {}, {}, set()
+        self.feerate = None               # estimatesmartfee's BTC/kvB (None: no estimate)
 
     def fund_address(self, address, sats, confirmations=6):
         spk = address_to_spk(address, "bcrt")
@@ -35,8 +36,14 @@ class RouteNode(FakeNode):
         return txid, 0
 
     def sendrawtransaction(self, hx):
-        txid = super().sendrawtransaction(hx)
         tx = Tx.parse(bytes.fromhex(hx))
+        if tx.locktime > self.height and tx.locktime < 500_000_000:
+            raise RuntimeError("non-final")
+        for i in tx.inputs:                   # like a node: one spend per outpoint (no replacement)
+            k = (i.txid[::-1].hex(), i.vout)
+            if k in self.spenders and self.spenders[k] != tx.txid():
+                raise RuntimeError("txn-mempool-conflict")
+        txid = super().sendrawtransaction(hx)
         for i in tx.inputs:
             self.spenders[(i.txid[::-1].hex(), i.vout)] = txid
         self.raw[txid] = hx
@@ -55,6 +62,37 @@ class RouteNode(FakeNode):
     def confirm_all(self):
         for t in self.txs.values():
             t["confirmations"] = max(t.get("confirmations", 0), 1)
+        self.mined |= set(self.spenders)
+
+    def mine(self, n=1):
+        """n blocks: every mempool tx and spend confirms."""
+        self.height += n
+        self.confirm_all()
+
+    def evict(self, txid):
+        """A mempool tx leaves the mempool (expired, or replaced by what the caller broadcasts next)."""
+        for k in [k for k, v in self.spenders.items() if v == txid]:
+            del self.spenders[k]
+            self.spent.discard(k)
+        self.txs.pop(txid, None)
+        self.raw.pop(txid, None)
+
+    def gettxout(self, txid, vout, include_mempool=True):
+        if not include_mempool and (txid.lower(), vout) in self.mined:
+            return None
+        return super().gettxout(txid, vout, include_mempool)
+
+    def scantxoutset(self, action, descs):
+        want = {d[4:-1].lower() for d in descs if d.startswith("raw(")}
+        return {"success": True, "unspents": [
+            {"txid": t, "vout": o["n"], "amount": o["value"], "height": self.height}
+            for t, tx in self.txs.items() if tx.get("confirmations", 0) >= 1
+            for o in tx["vout"] if o["scriptPubKey"].get("hex", "").lower() in want and (t, o["n"]) not in self.spent]}
+
+    def estimatesmartfee(self, target):
+        if self.feerate is None:
+            return {"errors": ["Insufficient data or no feerate found"], "blocks": target}
+        return {"feerate": self.feerate, "blocks": target}
 
 
 class Net:

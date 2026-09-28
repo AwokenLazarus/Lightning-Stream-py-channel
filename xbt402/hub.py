@@ -22,12 +22,31 @@ this order, and pre-signs nothing on ch2 until all of them pass:
 Then it writes the ch1 lock to disk, pre-signs ch2 under T, writes that, sends it to the provider,
 checks t*G = T, completes ch1 with t + r and answers the client with t + r.
 
-The watcher (`watch_tick`): posts the opens of hub-funded ch2s once confirmed; retries a pending
+The watcher (`watch_tick`): reconciles every non-final ch2 against the chain first (AGP-037, below);
+posts the opens of hub-funded ch2s once confirmed; retries a pending
 ch2 lock until `revealTimeoutSec`, then writes it off and stops routing to that provider; reads t
 off any ch2 close that spends a funding with a pending or written-off lock and completes the ch1
 lock with t + r; rolls ch2 over (one tx pays the provider and funds the next ch2) once the provider's
 net payout reaches its settleMultiple x closeFee or ch2 nears expiry, never while a lock is pending;
 and closes ch1s at their margin.
+
+Money safety (AGP-037):
+  * write-ahead funding: a ch2's payer key and params are on disk (state `funding`) before the `fund`
+    hook runs, and a rollover's next ch2 (`next`) before the rollover request leaves. A fund hook that
+    fails after it broadcast leaves a record the watcher reconciles against the chain (scantxoutset:
+    found -> funded, the open goes on; not found within funding_timeout_blocks -> archived as
+    `dropped`, key kept);
+  * every non-final ch2 (funded, open, refunded, closed but unconfirmed) is checked each tick: a spent
+    funding is read (find_spend) and the ch2 marked closed with the real spender, its locks' secrets
+    recovered (_from_close); the hub's own refund is final once it confirms, rebroadcast while it is
+    not; a provider close that beats the refund reverts the refund fee;
+  * refunds: an unsigned ch2 at expiry, a signed one at expiry + refund_grace_blocks (the provider had
+    its close margin to settle), at a hub-chosen fee (estimatesmartfee x vsize, floor
+    refund_min_feerate), never the provider's closeFee;
+  * close_ch2 checks the provider's reply against the ledger (txid, cum, payeeFee/payeeNet) and a bad
+    reply is an error, never a state change; the watcher's reconcile finds what really happened;
+  * a provider's /terms are bounded before the hub funds anything (HubConfig ch2_max_*); refills go
+    through the `refill` hook (default: connect, the same terms, lock and cap path).
 
 Close fees (xbt402 v1.2 closeFeePayer, AGP-023): ch2 is payee-pays by default (Mike, 2026-09-28): the
 provider pays its own settlement's close fee out of its output, so the hub's fees price only liquidity
@@ -36,6 +55,7 @@ client pays, as on any plain channel) unless the operator configures otherwise. 
 advertises both.
 """
 import json
+import math
 import os
 import secrets
 import sys
@@ -45,11 +65,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
 from . import adaptor, ecc
-from .channel import (FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, canonical_chan, settle_due)
+from .channel import (DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, canonical_chan,
+                      settle_due)
 from .funding import FundingPolicy
 from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, fee_due,
                     find_spend, hub_channel_message, next_cum, route_ok)
-from .tx import segwit_address
+from .tx import address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, request_auth, request_digest,
                            unb64json)
 from .channel import channel_auth_key
@@ -62,7 +83,7 @@ class OutChannel:
     pay_to: str                  # the provider operator's payTo (one key may serve many devices)
     params: dict
     secret: str                  # payer key (regtest: stored here; production: the B2 signer)
-    state: str = "funded"        # funded -> open -> closed | rolled
+    state: str = "funded"        # funding -> funded -> open -> closed | rolled | refunded; funding -> dropped
     signed: int = 0              # highest cumulative state the provider can close with
     routed: int = 0              # sum of completed routed amounts (the provider keeps the same total)
     seq: int = 0
@@ -76,9 +97,18 @@ class OutChannel:
     rolled_to: str = ""
     opened_at: int = 0
     scanned_to: int = 0
+    refund_txid: str = ""        # the hub's broadcast refund (AGP-037)
+    refund_fee: int = 0          # its fee; 0 again if a provider close won instead
+    final: bool = False          # the funding's spend is confirmed: nothing left to watch
+    next: dict = field(default_factory=dict)       # write-ahead: the rollover's next ch2 (asdict)
+    fund_error: str = ""         # the fund hook raised: reconciled against the chain
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
+
+
+LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
+NONFINAL = ("funded", "open", "refunded", "closed")         # the watcher reconciles these until final
 
 
 class OutBook:
@@ -120,7 +150,15 @@ class HubConfig:
     ch2_close_fee_payer: "payee" (default, v1.2): the hub opens ch2s only to providers whose /terms offer
     payee-pays, and each provider pays its own ch2 settlement fee; "payer": the hub pays ch2 closes
     (v1.1 providers) and should price them into its fees. ch1_close_fee_payer: ch1's terms (default
-    "payer": the client pays its own channel's close, as on any plain channel)."""
+    "payer": the client pays its own channel's close, as on any plain channel).
+
+    A provider's /terms are bounded before the hub funds a ch2 (AGP-037), or it is refused bad_terms:
+    minExpiryBlocks + 6 <= ch2_max_expiry_blocks (0: 2 x ch2_expiry_blocks; the expiry is clamped to it
+    too), closeFeeSat <= ch2_max_close_fee_sat and ch2_close_fee_multiple x closeFeeSat <= capacity,
+    minConf <= ch2_max_min_conf, minCapacity <= ch2_max_min_capacity (0: ch2_capacity), settleMultiple
+    <= ch2_max_settle_multiple. Refunds: refund_grace_blocks past expiry for a signed ch2, fee
+    estimatesmartfee(refund_conf_target) x vsize, at least refund_min_feerate sat/vB. A `funding`
+    record the chain never shows is dropped after funding_timeout_blocks."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -139,6 +177,16 @@ class HubConfig:
     rollover_margin: int = 36
     hrp: str = "bcrt"
     policy: dict = field(default_factory=lambda: {"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640})
+    ch2_max_expiry_blocks: int = 0
+    ch2_max_close_fee_sat: int = 5_000
+    ch2_close_fee_multiple: int = 20
+    ch2_max_min_conf: int = 6
+    ch2_max_min_capacity: int = 0
+    ch2_max_settle_multiple: int = 100
+    refund_grace_blocks: int = 6
+    refund_conf_target: int = 6
+    refund_min_feerate: float = 1.0
+    funding_timeout_blocks: int = 6
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -158,10 +206,13 @@ class HubConfig:
 class RouteHub:
     def __init__(self, rpc, pay_to_secret: int, network: str, datadir: str, fund: Callable[[str, int], tuple],
                  config: HubConfig = None, *, http: Callable = None, policy: FundingPolicy = None,
-                 fee_strategy: Callable = None, **overrides):
+                 fee_strategy: Callable = None, refill: Callable[[str], "OutChannel"] = None,
+                 refund_to: Callable[[], str] = None, **overrides):
         """`config` (a HubConfig) holds the operator's choices; keyword `overrides` set single fields
         (fee_ppm=..., liquidity_cap_sat=...). `fee_strategy`, if given, is a callable(hub) ->
-        (fee_base_msat, fee_ppm) that replaces the configured one."""
+        (fee_base_msat, fee_ppm) that replaces the configured one. `refill(origin)` funds the ch2 that
+        replaces a closed one (default `connect`: an embedder passes its own path, with its lock and
+        cap). `refund_to()` gives the address a ch2 refund pays (default: the ch2's payer key)."""
         cfg = config or HubConfig()
         if isinstance(fee_strategy, dict):              # a configured strategy, not a callable
             overrides["fee_strategy"], fee_strategy = fee_strategy, None
@@ -183,6 +234,8 @@ class RouteHub:
         self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap_sat
         self.fee_strategy = fee_strategy or self._configured_fees
         self.http = http or XbtChannelClient.http
+        self.refill = refill or self.connect
+        self.refund_to = refund_to
         self._quote: Optional[FeeQuote] = None
         self._quote_seq = int(time.time())
         self.withhold = ""           # tests/demo: "" | "receipt" (keep t + r from the client) | "all"
@@ -191,9 +244,15 @@ class RouteHub:
 
     # ---------------------------------------------------------------------------------------------
     def committed_sat(self) -> int:
-        """The hub's own coins in live ch2s (funded or open)."""
+        """The hub's own coins in live ch2s (funding, funded or open)."""
         with self.out.lock:
-            return sum(c.p().capacity for c in self.out.chans.values() if c.state in ("funded", "open"))
+            return sum(c.p().capacity for c in self.out.chans.values() if c.state in LIVE)
+
+    def refund_fees_sat(self) -> int:
+        """Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings."""
+        with self.out.lock:
+            recs = [asdict(c) for c in self.out.chans.values()] + list(self.out.archived)
+        return sum(int(r.get("refund_fee") or 0) for r in recs if r.get("state") == "refunded")
 
     def _configured_fees(self, hub) -> tuple:
         st = self.config.fee_strategy or {"kind": "flat"}
@@ -531,51 +590,132 @@ class RouteHub:
                             "blocked": bool(block)})
 
     # --- hub-funded ch2 -----------------------------------------------------------------------------
+    def ch2_terms(self, terms: dict, capacity: int = None, expiry_blocks: int = None) -> tuple:
+        """Bound a provider's /terms before the hub funds anything (AGP-037): (capacity, blocks) or
+        ChannelError bad_terms. A provider must not be able to set a ch2 the hub can never use or get
+        back: an expiry decades away, a close fee that eats the capacity, a minConf never reached."""
+        c = self.config
+        try:
+            ex = terms["extra"]
+            if not isinstance(terms["payTo"], str) or len(bytes.fromhex(terms["payTo"])) != 33:
+                raise ValueError("payTo")
+            close_fee, min_cap = int(ex["closeFeeSat"]), int(ex["minCapacity"])
+            lo, hi = int(ex["minExpiryBlocks"]) + 6, int(ex["maxExpiryBlocks"]) - 1
+            min_conf, mult = int(ex.get("minConf", 1)), int(ex.get("settleMultiple", 20))
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise ChannelError("bad_terms", f"malformed /terms: {type(e).__name__} {e}") from None
+        max_blocks = c.ch2_max_expiry_blocks or 2 * c.ch2_expiry_blocks
+        cap = max(capacity or self.ch2_capacity, min_cap)
+        why = ""
+        if not 0 <= close_fee <= c.ch2_max_close_fee_sat:
+            why = f"closeFeeSat {close_fee} > ch2_max_close_fee_sat {c.ch2_max_close_fee_sat}"
+        elif close_fee * c.ch2_close_fee_multiple > cap:
+            why = f"{c.ch2_close_fee_multiple} x closeFeeSat {close_fee} > capacity {cap}"
+        elif not 0 <= min_cap <= (c.ch2_max_min_capacity or self.ch2_capacity):
+            why = f"minCapacity {min_cap} > ch2_max_min_capacity {c.ch2_max_min_capacity or self.ch2_capacity}"
+        elif lo > max_blocks or lo > hi:
+            why = f"minExpiryBlocks + 6 = {lo} > max expiry {min(max_blocks, hi)}"
+        elif not 0 <= min_conf <= c.ch2_max_min_conf:
+            why = f"minConf {min_conf} > ch2_max_min_conf {c.ch2_max_min_conf}"
+        elif not 1 <= mult <= c.ch2_max_settle_multiple:
+            why = f"settleMultiple {mult} outside [1, {c.ch2_max_settle_multiple}]"
+        if why:
+            raise ChannelError("bad_terms", why)
+        return cap, min(max(expiry_blocks or self.ch2_expiry_blocks, lo), hi, max_blocks)
+
     def connect(self, origin: str, capacity: int = None, expiry_blocks: int = None) -> OutChannel:
         """Fund a ch2 to `origin` from the hub's own wallet. It opens (watch_tick / open_pending) once
         the funding has the provider's minConf."""
         origin = origin.rstrip("/")
+        cur = self.out.chans.get(origin)
+        if cur is not None and cur.state == "funding":
+            raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
         st, _, raw = self.http("GET", origin + TERMS_PATH)
         if st != 200:
             raise ChannelError("provider_error", f"terms: HTTP {st}")
-        terms = json.loads(raw)
-        ex = terms["extra"]
-        offered = ex.get("closeFeePayer", "payer")
+        try:
+            terms = json.loads(raw)
+            offered = terms["extra"].get("closeFeePayer", "payer")
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise ChannelError("bad_terms", "terms are not a JSON object with extra") from None
         if self.config.ch2_close_fee_payer == "payee" and offered != "payee":
             raise ChannelError("bad_fee_payer", f"{origin} does not offer payee-pays routed channels "
                                                 f"(closeFeePayer {offered!r}); set ch2_close_fee_payer payer to fund it")
-        cap = max(capacity or self.ch2_capacity, int(ex["minCapacity"]))
-        blocks = min(max(expiry_blocks or self.ch2_expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
-                     int(ex["maxExpiryBlocks"]) - 1)
+        cap, blocks = self.ch2_terms(terms, capacity, expiry_blocks)
         return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks)
 
-    def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int, funding=None) -> OutChannel:
-        if funding is None and self.liquidity_cap_sat:
-            old = self.out.chans.get(origin)
-            freed = old.p().capacity if old is not None and old.state in ("funded", "open") else 0
-            if self.committed_sat() - freed + cap > self.liquidity_cap_sat:
-                raise ChannelError("liquidity_cap", f"{self.committed_sat()} + {cap} sat > liquidity_cap_sat "
-                                                    f"{self.liquidity_cap_sat}")
+    def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int) -> OutChannel:
+        """Write-ahead (AGP-037): the ch2's key and params are on disk, state `funding`, before the fund
+        hook runs, and the cap check and that record are one step under the book's lock."""
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
         p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), network=self.network,
                                  close_fee_payer=self.config.ch2_close_fee_payer)
-        if funding is None:
-            txid, vout = self.fund(segwit_address(self.hrp, p.spk), cap)
-        else:
-            txid, vout = funding
-        p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
-        oc = OutChannel(origin, terms["payTo"], p.to_dict(), f"{secret:064x}", "funded",
+        p.capacity = cap
+        tip = self.rpc.getblockcount()
+        oc = OutChannel(origin, terms["payTo"], p.to_dict(), f"{secret:064x}", "funding",
                         settle_multiple=int(terms["extra"].get("settleMultiple", 20)), terms=terms,
-                        refund_hex=p.refund_tx(secret).hex(), opened_at=self.rpc.getblockcount(),
-                        scanned_to=self.rpc.getblockcount())
+                        opened_at=tip, scanned_to=tip)
         with self.out.lock:
             old = self.out.chans.get(origin)
+            if old is not None and old.state == "funding":
+                raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded")
+            if self.liquidity_cap_sat:
+                freed = old.p().capacity if old is not None and old.state in LIVE else 0
+                if self.committed_sat() - freed + cap > self.liquidity_cap_sat:
+                    raise ChannelError("liquidity_cap", f"{self.committed_sat()} + {cap} sat > liquidity_cap_sat "
+                                                        f"{self.liquidity_cap_sat}")
             if old is not None:
                 self.out.archived.append(asdict(old))
             self.out.chans[origin] = oc
             self.out.save()
+        try:
+            txid, vout = self.fund(segwit_address(self.hrp, p.spk), cap)
+        except Exception as e:  # noqa: BLE001 - it may have broadcast: the record stays for the watcher
+            with self.out.lock:
+                oc.fund_error = f"{type(e).__name__}: {e}"[:200]
+                self.out.save()
+            self.events.append({"event": "ch2_fund_failed", "provider": origin, "error": oc.fund_error})
+            raise ChannelError("fund_failed", f"fund hook: {oc.fund_error} (the watcher reconciles the record)") from e
+        self._funded(oc, txid, vout, cap)
         return oc
+
+    def _funded(self, oc: OutChannel, txid: str, vout: int, cap: int):
+        p = oc.p()
+        p.funding_txid, p.funding_vout, p.capacity = txid, int(vout), int(cap)
+        with self.out.lock:
+            oc.params, oc.state = p.to_dict(), "funded"
+            oc.refund_hex = p.refund_tx(int(oc.secret, 16)).hex()   # fallback; the watcher refunds at its own fee
+            self.out.save()
+
+    def _reconcile_funding(self, oc: OutChannel, tip: int) -> list:
+        """A `funding` record (the fund hook raised, or the hub stopped mid-fund): the funding on chain
+        -> funded, and the open goes on; none within funding_timeout_blocks -> dropped (archived with
+        its key, so a late confirmation can still be refunded by hand)."""
+        p = oc.p()
+        try:
+            r = self.rpc.scantxoutset("start", [f"raw({p.spk.hex()})"]) or {}
+        except Exception as e:  # noqa: BLE001 - a node without scantxoutset: wait, then drop
+            sys.stderr.write(f"hub: scantxoutset for {oc.origin}: {e}\n")
+            r = {}
+        hits = [u for u in r.get("unspents", []) if round(float(u.get("amount", 0)) * 1e8) >= DUST]
+        if hits:
+            u = hits[0]
+            self._funded(oc, u["txid"], int(u["vout"]), round(float(u["amount"]) * 1e8))
+            ev = {"event": "ch2_funding_recovered", "provider": oc.origin, "chan": oc.p().channel_id}
+            self.events.append(ev)
+            return [ev]
+        if tip - oc.opened_at < self.config.funding_timeout_blocks:
+            return []
+        with self.out.lock:
+            oc.state = "dropped"
+            self.out.archived.append(asdict(oc))
+            if self.out.chans.get(oc.origin) is oc:
+                del self.out.chans[oc.origin]
+            self.out.save()
+        ev = {"event": "ch2_funding_dropped", "provider": oc.origin, "error": oc.fund_error}
+        self.events.append(ev)
+        return [ev]
 
     def _open(self, oc: OutChannel) -> bool:
         p = oc.p()
@@ -606,14 +746,16 @@ class RouteHub:
         return True
 
     def rollover(self, oc: OutChannel) -> dict:
-        """One tx pays the provider its balance and funds the next ch2 (rollover instead of close)."""
+        """One tx pays the provider its balance and funds the next ch2 (rollover instead of close). The
+        next ch2's key is written ahead (`oc.next`), and its funding txid is known before the request
+        leaves, so a lost answer is finished by the watcher when that tx spends the funding."""
         p = oc.p()
         amount = oc.signed
         next_cap = p.rollover_next_capacity(amount)      # payee-pays: capacity - amount, the fee is the provider's
         min_cap = int(oc.terms["extra"]["minCapacity"])
         tip = self.rpc.getblockcount()
-        ex = oc.terms["extra"]
-        expiry = tip + min(max(self.ch2_expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
+        _, blocks = self.ch2_terms(oc.terms)
+        expiry = tip + blocks
         if next_cap < max(min_cap, p.min_amount):
             return self.close_ch2(oc, refill=True)
         secret = secrets.randbelow(adaptor.N - 1) + 1
@@ -621,56 +763,157 @@ class RouteHub:
         nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, network=self.network,
                                    close_fee_payer=p.close_fee_payer)
         tx = p.rollover_tx(amount, nxt.spk, next_cap)
-        sig = ecc.sign(int(oc.secret, 16), p.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
-        req = {"chan": p.channel_id, "amount": amount, "sig": sig.hex(),
-               "next": {"payerPub": pub, "payerSpk": nxt.payer_spk, "expiry": expiry}}
-        st, _, raw = self.http("POST", oc.origin + ROLLOVER_PATH, json.dumps(req).encode(),
-                               {"Content-Type": "application/json"})
-        doc = json.loads(raw)
-        if st != 200:
-            raise ChannelError(doc.get("error", "provider_error") if isinstance(doc, dict) else "provider_error",
-                               str(doc))
-        txid = doc["txid"]
-        with self.out.lock:
-            oc.state, oc.rolled_to, oc.close_txid = "rolled", f"{txid}:1", txid
-            self.out.save()
+        txid = tx.txid()
         nxt.funding_txid, nxt.funding_vout, nxt.capacity = txid, 1, next_cap
         new = OutChannel(oc.origin, oc.pay_to, nxt.to_dict(), f"{secret:064x}", "funded",
                          settle_multiple=oc.settle_multiple, terms=oc.terms, refund_hex=nxt.refund_tx(secret).hex(),
                          opened_at=tip, scanned_to=tip)
         with self.out.lock:
+            oc.next = asdict(new)                     # write-ahead: the next ch2's key before the request
+            self.out.save()
+        sig = ecc.sign(int(oc.secret, 16), p.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
+        req = {"chan": p.channel_id, "amount": amount, "sig": sig.hex(),
+               "next": {"payerPub": pub, "payerSpk": nxt.payer_spk, "expiry": expiry}}
+        try:
+            st, _, raw = self.http("POST", oc.origin + ROLLOVER_PATH, json.dumps(req).encode(),
+                                   {"Content-Type": "application/json"})
+            doc = json.loads(raw)
+        except (OSError, ValueError) as e:
+            raise ChannelError("provider_error", f"rollover: {type(e).__name__}: {e}") from None
+        if st != 200:
+            if st in (400, 401, 403):                  # refused: nothing was broadcast
+                with self.out.lock:
+                    oc.next = {}
+                    self.out.save()
+            raise ChannelError(doc.get("error", "provider_error") if isinstance(doc, dict) else "provider_error",
+                               str(doc)[:200])
+        if not isinstance(doc, dict) or str(doc.get("txid", "")).lower() != txid:
+            raise ChannelError("bad_rollover_reply", f"rollover reply {str(doc)[:120]} is not tx {txid}")
+        return self._finish_rollover(oc, amount)
+
+    def _finish_rollover(self, oc: OutChannel, amount: int) -> dict:
+        new = OutChannel(**oc.next)
+        txid = new.p().funding_txid
+        with self.out.lock:
+            oc.state, oc.rolled_to, oc.close_txid, oc.next = "rolled", f"{txid}:1", txid, {}
             self.out.archived.append(asdict(oc))
-            self.out.chans[oc.origin] = new
+            if self.out.chans.get(oc.origin) is oc:
+                self.out.chans[oc.origin] = new
+            else:
+                self.out.archived.append(asdict(new))
             self.out.save()
         ev = {"event": "ch2_rollover", "provider": oc.origin, "txid": txid, "amount": amount,
-              "next": new.p().channel_id, "nextCapacity": next_cap}
+              "next": new.p().channel_id, "nextCapacity": new.p().capacity}
         self.events.append(ev)
         return ev
 
     def close_ch2(self, oc: OutChannel, refill: bool = False) -> dict:
-        """Ask the provider to close ch2 (payer-signed close request); with `refill`, fund a new one."""
+        """Ask the provider to close ch2 (payer-signed close request); with `refill`, fund a new one
+        through the `refill` hook. The provider's reply must match the ledger (AGP-037): a 64-hex txid,
+        cum = a state the hub signed (its best, or a pending or written-off lock's), and on a payee-pays
+        ch2 payeeFee = the channel's close fee, payeeNet = cum - payeeFee. Anything else raises
+        bad_close_reply and changes nothing: the watcher reads the real close off the chain."""
         from .x402_channel import close_message
         p = oc.p()
         if not oc.signed:
             # nothing signed on this ch2 (e.g. a fresh rollover): nothing to close; the hub's refund
-            # (refund_hex, valid at expiry) returns the coins, or the next routed lock uses it
+            # (at expiry, by the watcher) returns the coins, or the next routed lock uses it
             ev = {"event": "ch2_idle", "provider": oc.origin, "chan": p.channel_id, "capacity": p.capacity}
             self.events.append(ev)
             return ev
         req = {"chan": p.channel_id, "sig": ecc.sign(int(oc.secret, 16), close_message(p.channel_id)).hex()}
-        st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["closeUrl"], json.dumps(req).encode(),
-                               {"Content-Type": "application/json"})
-        doc = json.loads(raw)
+        try:
+            st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["closeUrl"], json.dumps(req).encode(),
+                                   {"Content-Type": "application/json"})
+            doc = json.loads(raw)
+        except (OSError, ValueError) as e:
+            raise ChannelError("provider_error", f"close: {type(e).__name__}: {e}") from None
         if st != 200:
-            raise ChannelError("provider_error", str(doc))
+            raise ChannelError("provider_error", str(doc)[:200])
+        txid, cum = self._check_close_reply(oc, doc)
         with self.out.lock:
-            oc.state, oc.close_txid = "closed", doc["txid"]
+            oc.state, oc.close_txid = "closed", txid
             self.out.save()
-        ev = {"event": "ch2_close", "provider": oc.origin, "txid": doc["txid"], "amount": int(doc["cum"])}
+        ev = {"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "amount": cum,
+              "payeeFee": p.payee_fee, "payeeNet": max(0, cum - p.payee_fee)}
         self.events.append(ev)
         if refill:
-            self.connect(oc.origin)
+            try:
+                self.refill(oc.origin)
+            except Exception as e:  # noqa: BLE001 - the close stands; the refill is reported
+                ev["refillError"] = f"{type(e).__name__}: {e}"[:200]
+                self.events.append({"event": "ch2_refill_failed", "provider": oc.origin, "error": ev["refillError"]})
         return ev
+
+    def _check_close_reply(self, oc: OutChannel, doc) -> tuple:
+        p = oc.p()
+
+        def bad(why):
+            self.events.append({"event": "ch2_close_bad_reply", "provider": oc.origin, "chan": p.channel_id,
+                                "why": why})
+            return ChannelError("bad_close_reply", why)
+        if not isinstance(doc, dict):
+            raise bad("not a JSON object")
+        txid = doc.get("txid")
+        if not isinstance(txid, str) or len(txid) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in txid):
+            raise bad(f"txid {str(txid)[:70]!r}")
+        try:
+            cum = int(str(doc["cum"]), 10)
+        except (KeyError, ValueError):
+            raise bad(f"cum {str(doc.get('cum'))[:40]!r}") from None
+        allowed = {oc.signed} | {int(lk["cum"]) for lk in ([oc.pending] if oc.pending else []) + list(oc.stale)}
+        if cum not in allowed:
+            raise bad(f"cum {cum} is no state the hub signed (best {oc.signed})")
+        if "chan" in doc and doc["chan"] != p.channel_id:
+            raise bad(f"chan {str(doc['chan'])[:80]!r}")
+        for k, want in (("payeeFee", p.payee_fee), ("payeeNet", max(0, cum - p.payee_fee))):
+            if p.payee_fee and k in doc and str(doc[k]) != str(want):
+                raise bad(f"{k} {str(doc[k])[:30]!r} != {want}")
+        return txid.lower(), cum
+
+    # --- refunds -----------------------------------------------------------------------------------
+    def refund_fee(self, p: ChannelParams, dest: bytes = None) -> int:
+        """The hub's fee for a ch2 refund: estimatesmartfee(refund_conf_target) x vsize, at least
+        refund_min_feerate sat/vB; never the provider's closeFee, and never below dust left over."""
+        vsize = p.refund_tx(1, dest, 0).vsize() + 1        # +1: a 73-byte signature at worst
+        rate = float(self.config.refund_min_feerate)
+        try:
+            est = self.rpc.estimatesmartfee(int(self.config.refund_conf_target)) or {}
+            if est.get("feerate"):
+                rate = max(rate, float(est["feerate"]) * 1e8 / 1000)
+        except Exception:  # noqa: BLE001 - no estimate (regtest, a fresh node): the floor
+            pass
+        return max(0, min(math.ceil(rate * vsize), p.capacity - DUST))
+
+    def _refund_due(self, oc: OutChannel, tip: int) -> bool:
+        if oc.state not in ("funded", "open", "closed") or oc.pending or not oc.p().funding_txid:
+            return False
+        p = oc.p()
+        grace = self.config.refund_grace_blocks if oc.signed >= p.min_amount else 0
+        return tip >= p.expiry + grace
+
+    def _refund(self, oc: OutChannel, again: bool = False) -> list:
+        p = oc.p()
+        if not (again and oc.refund_txid):
+            dest = address_to_spk(self.refund_to(), self.hrp) if self.refund_to else None
+            tx = p.refund_tx(int(oc.secret, 16), dest, self.refund_fee(p, dest))
+            with self.out.lock:                             # write-ahead: the refund we will look for
+                oc.refund_hex, oc.refund_txid, oc.refund_fee = tx.serialize().hex(), tx.txid(), p.capacity - tx.outputs[0].value
+                self.out.save()
+        try:
+            self.rpc.sendrawtransaction(oc.refund_hex)
+        except Exception as e:  # noqa: BLE001 - e.g. the provider's close got there first: reconcile sees it
+            ev = {"event": "ch2_refund_failed", "provider": oc.origin, "chan": p.channel_id,
+                  "error": f"{type(e).__name__}: {e}"[:200]}
+            self.events.append(ev)
+            return [ev]
+        with self.out.lock:
+            oc.state = "refunded"
+            self.out.save()
+        ev = {"event": "ch2_refund_rebroadcast" if again else "ch2_refund", "provider": oc.origin,
+              "chan": p.channel_id, "txid": oc.refund_txid, "fee": oc.refund_fee, "signed": oc.signed}
+        self.events.append(ev)
+        return [ev]
 
     # --- watcher -----------------------------------------------------------------------------------
     def watch_tick(self) -> list:
@@ -680,15 +923,30 @@ class RouteHub:
             try:
                 actions += self._watch_out(oc, tip)
             except Exception as e:  # noqa: BLE001 - one channel never stops the rest
-                sys.stderr.write(f"hub watcher {origin}: {type(e).__name__}: {e}\n")
-        for rec in list(self.out.archived):
-            if rec.get("stale") and rec.get("state") in ("rolled", "closed"):
-                pass                                          # their closes were read when they happened
+                self._watch_error(origin, "watch", e)
+        with self.out.lock:
+            archived = [(i, r) for i, r in enumerate(self.out.archived)
+                        if r.get("state") in NONFINAL and not r.get("final")]
+        for i, rec in archived:                             # replaced ch2s are still the hub's coins
+            try:
+                oc = OutChannel(**rec)
+                acts = self._reconcile(oc, tip)
+                with self.out.lock:
+                    self.out.archived[i] = asdict(oc)
+                    self.out.save()
+                actions += acts
+            except Exception as e:  # noqa: BLE001
+                self._watch_error(rec.get("origin", "?"), "archived", e)
         try:
             actions += [{"event": "ch1_close", "txid": t} for t in self.inbound.close_due()]
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"hub watcher ch1: {e}\n")
         return actions
+
+    def _watch_error(self, origin: str, step: str, e: Exception):
+        msg = f"{type(e).__name__}: {e}"[:200]
+        sys.stderr.write(f"hub watcher {origin} ({step}): {msg}\n")
+        self.events.append({"event": "ch2_watch_error", "provider": origin, "step": step, "error": msg})
 
     def _watch_out(self, oc: OutChannel, tip: int) -> list:
         # a route request in flight owns this ch2 (its mutex): never race it for the same lock
@@ -702,6 +960,14 @@ class RouteHub:
 
     def _watch_out_locked(self, oc: OutChannel, tip: int) -> list:
         out = []
+        if oc.state == "funding":
+            return self._reconcile_funding(oc, tip)
+        try:                                                # its own step: a failure here never skips the rest
+            out += self._reconcile(oc, tip)
+        except Exception as e:  # noqa: BLE001
+            self._watch_error(oc.origin, "reconcile", e)
+        if self.out.chans.get(oc.origin) is not oc:
+            return out                                      # finished a rollover: the next ch2 is watched next tick
         p = oc.p()
         if oc.state == "funded":
             utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
@@ -711,15 +977,6 @@ class RouteHub:
             return out
         if oc.state != "open":
             return out
-        # a spent funding with a pending or written-off lock: read t off the close
-        if (oc.pending or oc.stale) and self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
-            tx = find_spend(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
-            if tx is not None:
-                out += self._from_close(oc, tx)
-                with self.out.lock:
-                    oc.state, oc.close_txid = "closed", tx.txid()
-                    self.out.save()
-                return out
         if oc.pending:
             if time.time() - oc.pending["at"] < self.reveal_timeout:
                 ans = self._send_lock(oc)
@@ -739,14 +996,79 @@ class RouteHub:
             return out
         # settlement: the provider's net payout >= its settleMultiple x closeFee (on a payee-pays ch2 the
         # close fee is the provider's, so it counts against the payout), or near ch2's close margin as
-        # the provider counts it (it co-signs only then): roll over
+        # the provider counts it (it co-signs only then): roll over. Past expiry the refund took over.
         ex = oc.terms.get("extra", {})
         due = settle_due(p, oc.signed, oc.settle_multiple)
         margin = int(ex.get("closeMarginBlocks", self.close_margin))
         grace = min(self.rollover_margin, int(ex.get("rolloverGraceBlocks", self.rollover_margin)))
         near = tip >= p.expiry - margin - grace
-        if (due or near) and oc.signed >= p.min_amount and not oc.pending:
+        if (due or near) and oc.signed >= p.min_amount and not oc.pending and tip < p.expiry:
             out.append(self.rollover(oc))
+        return out
+
+    def _reconcile(self, oc: OutChannel, tip: int) -> list:
+        """Check one non-final ch2's funding against the chain (AGP-037).
+        unspent: refund it when due; rebroadcast our refund if it left the mempool.
+        spent by the rollover we wrote ahead: finish it. spent by our refund: final once confirmed.
+        spent by anything else (the provider's close): read the locks' secrets off it, mark it closed
+        with the real txid, and take back the refund fee if our refund lost. Spent, spender not found:
+        with locks outstanding leave it (their secrets are on that tx); without, closed, txid unknown."""
+        if oc.final or oc.state not in NONFINAL:
+            return []
+        p = oc.p()
+        if not p.funding_txid:
+            return []
+        out = []
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+            if oc.state == "refunded":                      # our refund left the mempool: send it again
+                return self._refund(oc, again=True)
+            if self._refund_due(oc, tip):
+                return self._refund(oc)
+            return out
+        confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
+        if oc.state == "closed" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid:
+            if confirmed:                                   # the provider's close as it told us: done
+                with self.out.lock:
+                    oc.final = True
+                    self.out.save()
+            return out
+        tx = find_spend(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
+        if tx is None:
+            if oc.state == "open" and not (oc.pending or oc.stale):     # a funded one may not be visible yet
+                with self.out.lock:
+                    oc.state, oc.close_txid = "closed", ""
+                    self.out.save()
+                ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": "", "by": "unknown"}
+                self.events.append(ev)
+                out.append(ev)
+            return out
+        spender = tx.txid()
+        if oc.next and spender == OutChannel(**oc.next).p().funding_txid:
+            return [self._finish_rollover(oc, oc.signed)]
+        if spender == oc.refund_txid:
+            with self.out.lock:
+                oc.state, oc.final = "refunded", confirmed
+                self.out.save()
+            if confirmed:
+                ev = {"event": "ch2_refund_confirmed", "provider": oc.origin, "chan": p.channel_id,
+                      "txid": spender, "fee": oc.refund_fee}
+                self.events.append(ev)
+                out.append(ev)
+            return out
+        if oc.pending or oc.stale:
+            out += self._from_close(oc, tx)
+        lost = oc.refund_fee if oc.refund_txid else 0
+        changed = oc.state != "closed" or oc.close_txid != spender
+        with self.out.lock:
+            oc.state, oc.close_txid, oc.final, oc.next = "closed", spender, confirmed, {}
+            if lost:
+                oc.refund_fee = 0
+            self.out.save()
+        if changed:
+            ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": spender, "by": "provider",
+                  **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
+            self.events.append(ev)
+            out.append(ev)
         return out
 
     def _from_close(self, oc: OutChannel, tx) -> list:
@@ -814,7 +1136,8 @@ def main(argv=None, serve: bool = True):
         txid = wallet.sendtoaddress(address, sats / 1e8)
         raw = wallet.gettransaction(txid, False, True)["decoded"]
         return txid, next(o["n"] for o in raw["vout"] if o["scriptPubKey"].get("address") == address)
-    hub = RouteHub(rpc, secret, conf["network"], os.path.expanduser(conf["datadir"]), fund, cfg)
+    hub = RouteHub(rpc, secret, conf["network"], os.path.expanduser(conf["datadir"]), fund, cfg,
+                   refund_to=lambda: wallet.getnewaddress())
     for origin in conf.get("connect", []):
         if origin.rstrip("/") not in hub.out.chans:
             try:
