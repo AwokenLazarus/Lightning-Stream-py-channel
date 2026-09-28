@@ -55,7 +55,7 @@ from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
 SCHEME = "xbt-channel"
-MAX_BODY = 1 << 20                                          # bytes per request body
+MAX_BODY = 1 << 20                                          # default bytes per request body (overridable)
 XBT_MAINNET = "bip122:0000000000000050c1e5f69672f45929"   # block 961640, the first BLAKE2b block
 FACILITATOR_VERIFY, FACILITATOR_SETTLE, FACILITATOR_SUPPORTED = "/x402/verify", "/x402/settle", "/x402/supported"
 
@@ -189,9 +189,12 @@ class XbtChannelProvider:
     def __init__(self, rpc, pay_to_secret: int, network: str, ledger_path: str,
                  price: Callable[[str, str], int], handler: Callable, billing: str = "postpay",
                  close_fee: int = 600, close_margin: int = 144, policy: FundingPolicy = None,
-                 charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300):
+                 charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
+                 max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
+        if int(max_body) < 1:
+            raise ValueError("max_body must be >= 1")
         self.rpc, self.secret, self.network = rpc, pay_to_secret, network
         self.pay_to = ecc.pubkey(pay_to_secret).hex()
         self._pay_to_bytes = bytes.fromhex(self.pay_to)
@@ -202,6 +205,21 @@ class XbtChannelProvider:
         self.policy = policy or FundingPolicy(min_expiry_blocks=1_008, close_margin=close_margin)
         self._height, self._height_at, self.height_ttl = 0, 0.0, height_ttl
         self._auth_keys: Dict[str, bytes] = {}
+        self.max_body = int(max_body)
+        self.route_max_body = dict(route_max_body or {})
+
+    def body_limit(self, path: str, max_body: int = None) -> int:
+        """Request-body bound for this path. `max_body` (serve kwarg) wins, then a route option,
+        then the provider default (MAX_BODY = 1 MiB). ASGI and http.server both call this."""
+        if max_body is not None:
+            n = int(max_body)
+            if n < 1:
+                raise ValueError("max_body must be >= 1")
+            return n
+        key = path.split("?", 1)[0]
+        if key in self.route_max_body:
+            return int(self.route_max_body[key])
+        return self.max_body
 
     def height(self) -> int:
         """Chain tip, cached for height_ttl seconds so a paid call costs no RPC."""
@@ -622,7 +640,10 @@ class XbtChannelProvider:
         return h, self._cond[path]["cipher"], k
 
     # paid requests ----------------------------------------------------------------------
-    def serve(self, method: str, path: str, headers: dict, body: bytes, url: str = ""):
+    def serve(self, method: str, path: str, headers: dict, body: bytes, url: str = "", max_body: int = None):
+        # body bound before any billing: a too-large body is an unbilled 400 on every transport
+        if len(body or b"") > self.body_limit(path, max_body):
+            return 400, {}, b"bad request framing or body over MAX_BODY"
         # facilitator endpoints live under /x402/ only: bare /verify, /settle and /supported shadowed
         # a paid API's own routes of those names (XBT-061 L6)
         control = {("GET", FACILITATOR_SUPPORTED): lambda: self.supported(),
@@ -782,7 +803,8 @@ class XbtChannelProvider:
                 if self.headers.get("Transfer-Encoding"):
                     return self._refuse(501, b"transfer-encoding not supported")
                 cl = self.headers.get_all("Content-Length") or ["0"]
-                if len(cl) != 1 or not cl[0].isdigit() or int(cl[0]) > MAX_BODY:
+                limit = app.body_limit(self.path)
+                if len(cl) != 1 or not cl[0].isdigit() or int(cl[0]) > limit:
                     return self._refuse(413 if cl[0].isdigit() else 400, b"bad content-length")
                 if len(self.headers.get_all("PAYMENT-SIGNATURE") or []) > 1:
                     return self._refuse(400, b"duplicate PAYMENT-SIGNATURE")

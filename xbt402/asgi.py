@@ -15,27 +15,30 @@ def _raw_path(scope) -> str:
     return (raw + (b"?" + q if q else b"")).decode("latin-1")
 
 
-async def _bounded_body(request: Request):
-    """The body, or None if it is over MAX_BODY or its framing is ambiguous (duplicate
-    PAYMENT-SIGNATURE headers: which one would the provider read?)."""
+async def _bounded_body(request: Request, limit: int = MAX_BODY):
+    """The body, or None if it is over `limit` (provider/route max_body, default MAX_BODY)
+    or its framing is ambiguous (duplicate PAYMENT-SIGNATURE headers: which one would the
+    provider read?)."""
     if len(request.headers.getlist("payment-signature")) > 1:
         return None
     cl = request.headers.get("content-length")
-    if cl is not None and (not cl.isdigit() or int(cl) > MAX_BODY):
+    if cl is not None and (not cl.isdigit() or int(cl) > limit):
         return None
     body = b""
     async for chunk in request.stream():
         body += chunk
-        if len(body) > MAX_BODY:
+        if len(body) > limit:
             return None
     return body
 
 
 async def _serve(provider, request: Request) -> Response:
-    body = await _bounded_body(request)
+    path = _raw_path(request.scope)
+    limit = provider.body_limit(path) if hasattr(provider, "body_limit") else MAX_BODY
+    body = await _bounded_body(request, limit)
     if body is None:
         return Response(b"bad request framing or body over MAX_BODY", status_code=400)
-    status, hdrs, out = provider.serve(request.method, _raw_path(request.scope),
+    status, hdrs, out = provider.serve(request.method, path,
                                        {k: v for k, v in request.headers.items()}, body, str(request.url))
     if unsafe_headers(hdrs):
         return Response(b"handler returned a header with CR/LF", status_code=500)
