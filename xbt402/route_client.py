@@ -56,6 +56,7 @@ class Shard:
     locked_sat: int = 0           # what our completed locks paid it
     calls: int = 0
     last_lock: dict = field(default_factory=dict)
+    last_locked: str = ""       # lockId of the last lock we completed: an invoice is paid once
     stopped: str = ""
     call_ms: list = field(default_factory=list)
     lock_ms: list = field(default_factory=list)
@@ -201,6 +202,7 @@ class RoutePayer:
         self.signed = max(self.signed, p["cum"])
         with sh.lock:
             sh.locked_sat += p["d"]
+            sh.last_locked = p["lockId"]
             sh.lock_ms.append((time.perf_counter() - p["t0"]) * 1000)
         self.stats["locks"] += 1
         if p["floor"]:
@@ -274,8 +276,14 @@ class RoutePayer:
                 return None
             d = sh.due_sat()
             inv = dict(sh.invoice)
-            # the hub may wait revealTimeoutSec for the provider: lock only with that much invoice left
-            if d < 1 or float(inv["validUntil"]) < time.time() + 1.0 + self.quote.revealTimeoutSec:
+            # the hub may wait revealTimeoutSec for the provider: lock only with that much invoice left;
+            # and never an invoice already paid (wait for the fresh one in the next ROUTE-STATE). A
+            # ROUTE-STATE produced before that lock completed can still carry its invoice; locking it
+            # again would be answered with the hub's saved answer, which a floor lock (no T1 to check)
+            # would count twice (AGP-026 / AGP-033).
+            paid_already = inv.get("lockId") and inv["lockId"] == sh.last_locked
+            if (d < 1 or float(inv["validUntil"]) < time.time() + 1.0 + self.quote.revealTimeoutSec
+                    or paid_already):
                 return None
             d = min(d, self.max_lock_sat, self.quote.maxLockSat)
             if not self.quote.live(time.time() + 30):
