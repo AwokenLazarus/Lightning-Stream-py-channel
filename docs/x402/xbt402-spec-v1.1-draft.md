@@ -419,8 +419,11 @@ life** (M3).
 `POST extra.closeUrl` with `{"chan","sig","payload"?}`. `sig` is `A`'s signature over
 `tagged_hash("xbt402/close", chan)`. `payload` is an optional final state (as in §7.3) paying what is
 owed. The provider completes the best state with its own signature and broadcasts it. Reply:
-`{"chan","txid","cum","unpaidMsat"}`, where `cum` is what the recorded close pays the provider (for a
-conditional close, `uncond + condAmount`) and every repeat of the close reports that same close: once a
+`{"chan","txid","cum","unpaidMsat"}`, where `cum` is the gross state of the recorded close, what the
+client paid (for a conditional close, `uncond + condAmount`), and `unpaidMsat` is `spentMsat − cum × 1000`
+(at least 0). A payee-pays channel (§12) adds `"payeeFee"` (sat, the provider's own close fee) and
+`"payeeNet"` (`cum − payeeFee`, what the provider's outputs hold); the fee is never counted as unpaid.
+Every repeat of the close reports that same close: once a
 channel is closed, a `payload` changes nothing (L10). Replaying a close request only closes the same channel with the
 best state, which the provider may do at any time anyway.
 
@@ -451,8 +454,9 @@ upstream-style names of Appendix B.
   over a folded conditional state (§6.5).
 - `POST /x402/settle`, `payload` = the close request of §7.5 (`{"chan","sig","payload"?}`): closes the
   channel under the same rules. Answer: a `SettlementResponse`,
-  `{"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"<sat paid
-  to the provider by the recorded close>","extra":{"chan","unpaidMsat"}}`, or
+  `{"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"<the
+  gross cum of the recorded close, as §7.5>","extra":{"chan","unpaidMsat"}}` (a payee-pays channel adds
+  `payeeFee` and `payeeNet` to `extra`), or
   `{"success":false,"errorReason":"<code>","transaction":"","network":"bip122:…"}`. Settling a channel
   that is already closed returns the same close.
 
@@ -696,6 +700,12 @@ and both sides build every later transaction from it.
    floor stays what it was in v1.1: v1.1 floored at 546 and the hub paid the 600-sat close fee on top,
    v1.2 floors at 1,146 and the provider pays the fee out of it, so both lose the hub
    `1,146 − routed` sat per channel.
+8. *Close report.* The close answer (§7.5) and `/x402/settle` (§7.6) report `cum` / `amount` as the
+   gross state the client paid, with `payeeFee` and `payeeNet` alongside; `unpaidMsat` is
+   `spentMsat − cum × 1000`. A fully paid payee-pays channel reports `unpaidMsat: "0"`, never the
+   provider's close fee: a client that trusts `unpaidMsat` must not think it owes the fee. (The
+   reference before AGP-029 reported the provider's net output as `cum` and the fee as unpaid; the
+   on-chain amounts were right.) A payer-pays answer carries neither field and is unchanged.
 
 Everything else (scripts, keys, sighash, auth, envelopes) is unchanged.
 
@@ -719,8 +729,10 @@ Everything else (scripts, keys, sighash, auth, envelopes) is unchanged.
 - v1.2, `payeePays`: a payee-pays channel's five states from `minCum` to `capacity` (one with the client's
   change at exactly 546, one where it is dropped), a close, the `0xA3` state, a rollover, a conditional
   state at `uncond = minCum`, the v1.1 signature for the same `cum` refused (`bad_sig`), a state below
-  `minCum` refused (`bad_amount`), and the provider's `/terms` and a hub-bound open echoing
-  `closeFeePayer` and `minCum`.
+  `minCum` refused (`bad_amount`), the provider's `/terms` and a hub-bound open echoing
+  `closeFeePayer` and `minCum`, and (`payeePays.close`) ten 150-sat calls closed at `cum` 1,500: the
+  close transaction, the close answer `{cum:"1500", unpaidMsat:"0", payeeFee:"600", payeeNet:"900"}` and
+  the same close through `/x402/settle` (`amount` 1500, the fee fields in `extra`).
 
 The v1.1 sections are byte-identical to the v1.1 vectors: v1.2 changed no v1.1 value.
 
@@ -738,6 +750,8 @@ Not breaking (absent `closeFeePayer` is v1.1):
   the state, `0xA3`, rollover and conditional formats under `"payee"`; `minCum`; the settlement
   threshold on the provider's net payout; `settle_early`; `bad_fee_payer`; the hub's
   `extra.routing.ch1CloseFeePayer` / `ch2CloseFeePayer`. Hub-funded routed channels default to `"payee"`.
+- **Payee-pays close report** (§7.5, §7.6, §12 item 8): `cum` / `amount` are the gross state, with
+  `payeeFee` and `payeeNet`; `unpaidMsat` = spent − gross. Payer-pays answers are unchanged.
 - **Test vectors** (§13): the `payeePays` section; every v1.1 section unchanged.
 
 ## Changes from v1.0

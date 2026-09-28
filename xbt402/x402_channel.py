@@ -408,9 +408,8 @@ class XbtChannelProvider:
             if req.get("payload") and not st.closed_txid:   # after the close a state changes nothing (L10)
                 self._apply(st, req["payload"])
             txid = self._close_locked(st)
-            paid = self._close_paid(st)
-            owed = st.spent_msat - paid * 1000
-        return {"chan": st.params.channel_id, "txid": txid, "cum": str(paid), "unpaidMsat": str(max(0, owed))}
+            report = self._close_report(st)
+        return {"chan": st.params.channel_id, "txid": txid, **report}
 
     # hash-locked conditional state (XBT-061 M6) ---------------------------------------------
     def _cond_state(self, st: ChannelState):
@@ -676,11 +675,23 @@ class XbtChannelProvider:
         return {"isValid": True, "payer": st.params.payer_pub, "extra": {"chan": st.params.channel_id, "cum": str(cum)}}
 
     def _close_paid(self, st: ChannelState) -> int:
-        """Sat the recorded close pays the provider (a conditional close: before the claim fee)."""
-        if "close_paid" in (st.extra or {}):
-            return int(st.extra["close_paid"])
+        """Sat the payer paid by the recorded close: its gross state (a conditional close: uncond +
+        condAmount, before the claim fee). Under v1.2 payee-pays the provider's outputs hold this less
+        payeeFee (AGP-029): the fee is the provider's cost, never an amount the payer still owes."""
+        if "close_paid" in (st.extra or {}):      # the provider's outputs of the close actually sent
+            return int(st.extra["close_paid"]) + st.params.payee_fee
         cond = self._cond_state(st) if (st.extra or {}).get("cond_close") else None
         return cond[1] + cond[0].cond_amount if cond else st.best_cum
+
+    def _close_report(self, st: ChannelState) -> dict:
+        """The close answer's amounts: `cum` gross and `unpaidMsat` = spent - gross. A payee-pays
+        channel adds `payeeFee` and `payeeNet` (what the provider's outputs hold); a payer-pays (v1.1)
+        answer is unchanged byte for byte."""
+        paid = self._close_paid(st)
+        out = {"cum": str(paid), "unpaidMsat": str(max(0, st.spent_msat - paid * 1000))}
+        if st.params.payee_fee:
+            out.update(payeeFee=str(st.params.payee_fee), payeeNet=str(paid - st.params.payee_fee))
+        return out
 
     def facilitator_settle(self, req: dict) -> dict:
         """x402 SettlementResponse for a close request ({chan, sig, payload?}, as extra.closeUrl takes)."""
@@ -688,12 +699,15 @@ class XbtChannelProvider:
             r = self.close(self._facilitator_payload(req))
             with self.ledger.lock:
                 st = self.ledger.channels[r["chan"]]
-                paid, payer = self._close_paid(st), st.params.payer_pub
+                payer = st.params.payer_pub
         except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
             return {"success": False, "errorReason": upstream_code(getattr(e, "code", "bad_payload")),
                     "transaction": "", "network": self.network}
+        extra = {"chan": r["chan"], "unpaidMsat": r["unpaidMsat"]}
+        if "payeeFee" in r:
+            extra.update(payeeFee=r["payeeFee"], payeeNet=r["payeeNet"])
         return {"success": True, "transaction": r["txid"], "network": self.network, "payer": payer,
-                "amount": str(paid), "extra": {"chan": r["chan"], "unpaidMsat": r["unpaidMsat"]}}
+                "amount": r["cum"], "extra": extra}
 
     def rollover(self, req: dict) -> dict:
         """POST /x402/xbt-channel/rollover (AGP-021): co-sign and broadcast the payer's rollover of a

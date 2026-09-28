@@ -304,7 +304,10 @@ the channel's life. Otherwise a malicious server could drain the channel with 40
 ### Close
 `POST extra.closeUrl` with `{"chan","sig","payload"?}`. `sig` is `A`'s signature over
 `tagged_hash("xbt402/close", chan)`; `payload` is an optional final state (as in `PAYMENT-SIGNATURE`).
-Reply `{"chan","txid","cum","unpaidMsat"}`.
+Reply `{"chan","txid","cum","unpaidMsat"}`: `cum` is the gross state the client paid and `unpaidMsat`
+= `spentMsat − cum × 1000` (at least 0). Under `closeFeePayer: "payee"` the reply adds `"payeeFee"` (sat)
+and `"payeeNet"` (`cum − payeeFee`, the server's output); the server's close fee is never reported as
+unpaid.
 
 ## Facilitator Interface
 Optional. The reference server needs no facilitator. A server that exposes the standard interface MUST
@@ -336,7 +339,8 @@ request). It closes the channel; settling a channel that is already closed retur
 {"success":true,"transaction":"<close txid>","network":"bip122:…","payer":"<A hex>","amount":"750",
  "extra":{"chan":"…:0","unpaidMsat":"0"}}
 ```
-`amount` is the sat paid to the server by the recorded close; repeats report that same close, and a
+`amount` is the gross `cum` of the recorded close (under `"payee"`, `extra` adds `payeeFee` and
+`payeeNet`); repeats report that same close, and a
 `payload` sent after the close changes nothing. A refusal is
 `{"success":false,"errorReason":"invalid_xbt_channel_signature","transaction":"","network":"bip122:…"}`.
 

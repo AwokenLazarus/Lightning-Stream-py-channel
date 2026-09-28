@@ -118,6 +118,8 @@ def xbt_close(client, origin: str) -> dict:
     out = {"chan": ch.payer.params.channel_id if ch else None,
            "txid": txid if isinstance(txid, str) and len(txid) == 64 and _hex(txid) else None,
            "cum": _int(res, "cum"), "unpaidMsat": _int(res, "unpaidMsat")}
+    if isinstance(res, dict) and "payeeFee" in res:      # v1.2 payee-pays: the provider's own close fee
+        out.update(payeeFee=_int(res, "payeeFee"), payeeNet=_int(res, "payeeNet"))
     assert_no_key_material(out)
     out = sanitize(out)
     out[UNTRUSTED] = untrusted(json.dumps(res).encode())

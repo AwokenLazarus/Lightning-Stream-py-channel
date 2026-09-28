@@ -155,7 +155,9 @@ def admin_close(prov, chan: str) -> dict:
         if not st:
             raise LaunchError("unknown channel")
         txid = prov._close_locked(st)
-        return {"chan": st.params.channel_id, "txid": txid, "cum": str(prov._close_paid(st))}
+        report = prov._close_report(st)
+        report.pop("unpaidMsat")
+        return {"chan": st.params.channel_id, "txid": txid, **report}
 
 
 def admin_sweep(prov, cfg, chan: str, to: str, fee: int) -> dict:

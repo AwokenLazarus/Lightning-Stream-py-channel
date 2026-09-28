@@ -399,8 +399,39 @@ def gen_payee_pays():
             "payerPub": p.payer_pub, "payerSpk": p.payer_spk, "redeemScript": p.script.hex(), "closeFeePayer": "payee"},
             "hub": {"payTo": _pub(HUB_SECRET), "sig": ecc.sign(HUB_SECRET, hub_channel_message(p.channel_id)).hex()}}
         status, _, resp = prov.serve("POST", terms["extra"]["openUrl"], {}, json.dumps(req).encode())
-    out["terms"] = terms
-    out["open"] = {"request": req, "status": status, "response": json.loads(resp)}
+        out["terms"] = terms
+        out["open"] = {"request": req, "status": status, "response": json.loads(resp)}
+        out["close"] = _payee_pays_close(prov, node, p, a)
+    return out
+
+
+def _payee_pays_close(prov, node, p, a):
+    """AGP-029: ten 150-sat postpay calls, a close whose final state pays the 1,500 owed, and the same
+    close through /x402/settle. Both report the gross cum (what the payer paid) with payeeFee and
+    payeeNet; unpaidMsat is spent - gross (0), never the provider's own close fee."""
+    acc = prov.requirements(PRICE)
+    payer = Payer(p, a)
+    k = channel_auth_key(a, bytes.fromhex(p.payee_pub))
+    spent_msat = seq = 0
+    for _ in range(10):                     # postpay: each call pays for the calls before it
+        need = -(-spent_msat // 1000)
+        cum = max(need, payer.signed, p.min_amount if need else 0)
+        seq += 1
+        pl = {"chan": p.channel_id, "seq": seq, "cum": str(cum)}
+        if cum > payer.signed:
+            pl["sig"] = payer.sign_state(cum).hex()
+        pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest("GET", "/v1/x", b""))
+        _, h, _ = prov.serve("GET", "/v1/x", {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": pl})}, b"")
+        spent_msat = int(receipt_of(unb64json(h["PAYMENT-RESPONSE"]))["spentMsat"])
+    final = max(-(-spent_msat // 1000), payer.signed)
+    pl = {"chan": p.channel_id, "cum": str(final), "sig": payer.sign_state(final).hex()}
+    req = {"chan": p.channel_id, "sig": ecc.sign(a, close_message(p.channel_id)).hex(), "payload": pl}
+    status, _, resp = prov.serve("POST", acc["extra"]["closeUrl"], {}, json.dumps(req).encode())
+    out = {"calls": 10, "price": PRICE, "spentMsat": spent_msat,
+           "request": req, "status": status, "response": json.loads(resp), "closeTx": node.sent[-1]}
+    sreq = facilitator_request(acc, req)
+    status, _, resp = prov.serve("POST", FACILITATOR_SETTLE, {}, json.dumps(sreq).encode())
+    out["settle"] = {"request": sreq, "status": status, "response": json.loads(resp)}
     return out
 
 
@@ -567,6 +598,24 @@ def payee_pays_checks(v) -> list:
          and o["response"].get("minCum") == str(DUST + fee) and o["response"]["chan"] == p.channel_id
          and o["request"]["channel"]["closeFeePayer"] == "payee",
          "open: a hub-bound payee-pays open must echo closeFeePayer and minCum")
+    c = pp.get("close")
+    if not c:
+        return errs + ["payeePays: close missing"]
+    cum = int(c["request"]["payload"]["cum"])
+    r, sr = c["response"], c["settle"]["response"]
+    ctx = Tx.parse(bytes.fromhex(c["closeTx"]))
+    need(cum == -(-c["spentMsat"] // 1000) == c["calls"] * c["price"], "close: the final state is not what is owed")
+    need([(o.value, o.script_pubkey.hex()) for o in ctx.outputs] == [(cum - fee, p.payee_spk), (cap - cum, p.payer_spk)]
+         and ctx.txid() == r["txid"] and ctx.inputs[0].witness[0].hex() == c["request"]["payload"]["sig"],
+         "close: the tx is not the final state [cum - closeFee to P, capacity - cum to A]")
+    need(c["status"] == 200 and r == {"chan": p.channel_id, "txid": ctx.txid(), "cum": str(cum),
+                                      "unpaidMsat": str(c["spentMsat"] - cum * 1000),
+                                      "payeeFee": str(fee), "payeeNet": str(cum - fee)},
+         "close: the answer must report the gross cum, payeeFee, payeeNet and unpaidMsat = spent - gross")
+    need(c["settle"]["status"] == 200 and sr.get("success") is True and sr.get("transaction") == ctx.txid()
+         and sr.get("amount") == str(cum) and sr.get("payer") == p.payer_pub
+         and sr.get("extra") == {k: r[k] for k in ("chan", "unpaidMsat", "payeeFee", "payeeNet")},
+         "settle: amount must be the gross cum, extra must carry unpaidMsat, payeeFee and payeeNet")
     return errs
 
 
@@ -666,7 +715,7 @@ def main() -> int:
     n = (len(want["derivation"]) + len(want["auth"]["cases"]) + len(want["state"]["states"])
          + len(want["state"]["invalid"]) + 2 + len(want["roundtrip"]["steps"])
          + 1 + len(want.get("conditional", {}).get("steps", []))
-         + len(want.get("payeePays", {}).get("states", [])) + len(want.get("payeePays", {}).get("invalid", [])) + 6)
+         + len(want.get("payeePays", {}).get("states", [])) + len(want.get("payeePays", {}).get("invalid", [])) + 6 + ("close" in want.get("payeePays", {})))
     for e in errs:
         print("MISMATCH", e)
     print(f"{'FAIL' if errs else 'OK'}: {n} vectors, backend {ecc.BACKEND}, {len(errs)} mismatches")
