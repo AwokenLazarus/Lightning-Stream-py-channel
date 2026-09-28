@@ -825,9 +825,12 @@ class RouteHub:
         try:
             st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["closeUrl"], json.dumps(req).encode(),
                                    {"Content-Type": "application/json"})
-            doc = json.loads(raw)
-        except (OSError, ValueError) as e:
+        except OSError as e:
             raise ChannelError("provider_error", f"close: {type(e).__name__}: {e}") from None
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            doc = None
         if st != 200:
             raise ChannelError("provider_error", str(doc)[:200])
         txid, cum = self._check_close_reply(oc, doc)

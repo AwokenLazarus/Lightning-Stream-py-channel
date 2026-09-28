@@ -403,7 +403,7 @@ class CloseReply(_World):
         self.net.apps[self.origin] = Wrap(self.prov, lambda m, p, st, doc: (200, b"ok") if p.endswith("/close") else None)
         with self.assertRaises(ChannelError) as cm:
             self.hub.close_ch2(self.oc())
-        self.assertEqual(cm.exception.code, "provider_error")
+        self.assertEqual(cm.exception.code, "bad_close_reply")
 
     def test_a_good_reply_reports_gross_cum_payee_fee_and_net(self):
         oc = self.oc()
