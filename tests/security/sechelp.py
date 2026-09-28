@@ -229,7 +229,8 @@ def load(name):
 # Every port a test binds is XBT402_TEST_PORT_BASE + one of these offsets (a block of 100), so
 # parallel runs on one machine use disjoint ranges. Without the variable, a free block is picked
 # at runtime (logged to stderr).
-PORT_OFFSETS = {"m6_rpc": 0, "m6_p2p": 1, "l6": 10, "m4": 20, "m3": 30, "l13": 40}
+PORT_OFFSETS = {"m6_rpc": 0, "m6_p2p": 1, "l6": 10, "m4": 20, "m3": 30, "l13": 40,
+                "agp019_rpc": 50, "agp019_p2p": 51}
 PORT_BLOCK = 100
 _port_base = []
 
