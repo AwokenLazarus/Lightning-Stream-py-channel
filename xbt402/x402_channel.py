@@ -11,8 +11,8 @@ v2 facilitator shapes.
       amount: "<sats per call, max>", asset: "XBT:sat", payTo: "<33-byte compressed pubkey hex>",
       maxTimeoutSeconds, extra: {minCapacity, maxCapacity, minExpiryBlocks, maxExpiryBlocks,
       closeMarginBlocks, minConf, closeFeeSat, openUrl, closeUrl, billing: "postpay"|"prepay",
-      derivation: "v2"}}   payee key P = payTo + t*G, t = H("xbt-channel/payee/v2", len8(network) network
-      payTo A LE32(expiry))
+      derivation: "v2", closeFeePayer?: "payer"|"payee" (v1.2, absent = payer)}}
+      payee key P = payTo + t*G, t = H("xbt-channel/payee/v2", len8(network) network payTo A LE32(expiry))
 
   open:   POST extra.openUrl {x402Version, network, channel: {txid, vout, capacity, expiry, payerPub,
           payerSpk?, redeemScript}}  -> {chan, expiry, maxCum, confirmations}
@@ -47,8 +47,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
 from . import ecc
-from .channel import (DERIVATION, DUST, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
-                      canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk)
+from .channel import (DERIVATION, DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
+                      canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, settle_due)
 from .conditional import CSV_DELTA
 from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
@@ -190,9 +190,12 @@ class XbtChannelProvider:
                  price: Callable[[str, str], int], handler: Callable, billing: str = "postpay",
                  close_fee: int = 600, close_margin: int = 144, policy: FundingPolicy = None,
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
-                 max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20):
+                 max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
+                 close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
+        if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
+            raise ValueError("close fee payer is payer or payee")
         if int(max_body) < 1:
             raise ValueError("max_body must be >= 1")
         self.rpc, self.secret, self.network = rpc, pay_to_secret, network
@@ -201,6 +204,11 @@ class XbtChannelProvider:
         self._payees: Dict[str, Payee] = {}     # per channel: its secret and params, derived once (L13)
         self.ledger, self.price, self.handler, self.charge = Ledger(ledger_path), price, handler, charge
         self.billing, self.close_fee, self.close_margin, self.hrp = billing, close_fee, close_margin, hrp
+        # v1.2 closeFeePayer: plain channels keep payer-pays (v1.1) unless configured; channels a hub
+        # funds to this provider (routed ch2) default to payee-pays (Mike, 2026-09-28): the provider
+        # pays its own settlement, so settle_due counts it against the net payout
+        self.close_fee_payer, self.route_close_fee_payer = close_fee_payer, route_close_fee_payer
+        self.rollover_grace = int(rollover_grace)   # blocks before the close margin a rollover is due anyway
         self.claim_fee = claim_fee      # sats the hash-lock claim pays out of condAmount (M6)
         self.policy = policy or FundingPolicy(min_expiry_blocks=1_008, close_margin=close_margin)
         self._height, self._height_at, self.height_ttl = 0, 0.0, height_ttl
@@ -209,7 +217,7 @@ class XbtChannelProvider:
         self.route_max_body = dict(route_max_body or {})
         # AGP-021 hub routing: routed paths, their sessions and the adaptor-locked ch2 states
         from .route import RouteSeller
-        self.settle_multiple = int(settle_multiple)   # settle at >= this x closeFee (cmp settlement policy)
+        self.settle_multiple = int(settle_multiple)   # settle once the net payout >= this x closeFee (settle_due)
         self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
                                   + ".routes.json")
 
@@ -232,6 +240,8 @@ class XbtChannelProvider:
         hub-funded channel to this provider without a paid call first."""
         req = self.requirements(0)
         req["extra"]["settleMultiple"] = self.settle_multiple
+        req["extra"]["closeFeePayer"] = self.route_close_fee_payer    # for hub-funded channels (v1.2)
+        req["extra"]["rolloverGraceBlocks"] = self.rollover_grace
         req["extra"]["routes"] = sorted(self.routes.offers)
         return req
 
@@ -263,7 +273,9 @@ class XbtChannelProvider:
                           "closeMarginBlocks": self.close_margin, "minConf": p.min_conf,
                           "closeFeeSat": str(self.close_fee), "openUrl": "/x402/xbt-channel/open",
                           "closeUrl": "/x402/xbt-channel/close", "billing": self.billing,
-                          "derivation": DERIVATION}}
+                          "derivation": DERIVATION,
+                          # v1.2: absent means payer-pays, so a v1.1 payer's 402 is unchanged
+                          **({"closeFeePayer": self.close_fee_payer} if self.close_fee_payer != "payer" else {})}}
 
     def _payment_required(self, url: str, price: int, error: str, st: ChannelState = None):
         body = {"x402Version": 2, "error": error, "resource": {"url": url}, "accepts": [self.requirements(price)]}
@@ -280,9 +292,17 @@ class XbtChannelProvider:
         payer_pub = bytes.fromhex(c["payerPub"])
         ecc._decode_pub(payer_pub)
         payer_spk = check_payout_spk(c["payerSpk"]) if c.get("payerSpk") else ""
+        # v1.2 closeFeePayer: payer-pays (v1.1, the default) is always accepted, since it only costs the
+        # payer; payee-pays only where this provider offered it (hub-bound channels: /terms; plain
+        # channels: its 402). The funding script does not depend on it, so it is fixed here, at open,
+        # and every state both sides build from these params carries it.
+        fee_payer = c.get("closeFeePayer", "payer")
+        offered = self.route_close_fee_payer if req.get("hub") else self.close_fee_payer
+        if fee_payer not in ("payer", offered):
+            raise ChannelError("bad_fee_payer", f"closeFeePayer {fee_payer!r} not offered for this channel")
         # v1.1 derivation only: a redeemScript built with the v1.0 tweak (no network) fails here
         p = ChannelParams.derive(self.pay_to, payer_pub.hex(), int(c["expiry"]), self.close_fee, payer_spk,
-                                 network=self.network)
+                                 network=self.network, close_fee_payer=fee_payer)
         if c["redeemScript"].lower() != p.script.hex():
             raise ChannelError("bad_funding", "redeemScript does not match payTo/payerPub/expiry")
         chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
@@ -303,7 +323,19 @@ class XbtChannelProvider:
             if hub:
                 st.extra = {"hub": hub}
             self.ledger.save(st)
-        return {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
+        out = {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
+        if p.close_fee_payer != "payer":
+            out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
+        return out
+
+    def settle_due(self, p: ChannelParams, cum: int, tip: int = None, margin: int = 0) -> bool:
+        """This provider's settlement policy (cmp CONTRACT "Settlement policy", AGP-023): settle once
+        the net payout of the state for `cum` (what the payee's output holds after any close fee it
+        pays) is at least settle_multiple x closeFee, so fees stay <= 1/settle_multiple of the payout;
+        or when the channel is within `margin` blocks of its close margin (at tip)."""
+        if settle_due(p, cum, self.settle_multiple):
+            return True
+        return tip is not None and tip >= p.expiry - self.close_margin - margin
 
     def _chan_secret(self, p: ChannelParams) -> int:
         """The channel payee secret p = payTo_secret + t, t committing to this provider's network (M2).
@@ -680,10 +712,16 @@ class XbtChannelProvider:
             raise ChannelError("bad_expiry", "next channel expiry outside this provider's policy")
         payer_spk = check_payout_spk(nxt["payerSpk"]) if nxt.get("payerSpk") else ""
         nparams = ChannelParams.derive(self.pay_to, payer_pub.hex(), expiry, p.close_fee, payer_spk,
-                                       network=self.network)
-        next_cap = p.capacity - p.close_fee - amount
+                                       network=self.network, close_fee_payer=p.close_fee_payer)
+        next_cap = p.rollover_next_capacity(amount)
         if next_cap < self.policy.min_capacity:
             raise ChannelError("bad_amount", "rollover leaves less than the minimum channel capacity")
+        # payee-pays: this settlement's fee is ours, so we co-sign only when our policy says it is worth
+        # it (net payout >= settleMultiple x closeFee) or the channel nears its close margin. A payer
+        # rolling early and often would otherwise make us pay a close fee per small payout.
+        if p.payee_fee and not self.settle_due(p, amount, h, margin=self.rollover_grace):
+            raise ChannelError("settle_early", f"net payout {p.payee_value(amount)} < {self.settle_multiple} x "
+                                               f"closeFee {p.close_fee}, and the channel is not near its margin")
         tx = p.rollover_tx(amount, nparams.spk, next_cap)
         sig = bytes.fromhex(req["sig"])
         digest = p.sighash(tx)
@@ -1056,6 +1094,8 @@ class XbtChannelClient:
                     raise ChannelError("too_expensive", f"{acc['amount']} sat > max {self.max_price}")
                 if int(acc["extra"]["closeFeeSat"]) > self.max_close_fee:
                     raise ChannelError("bad_offer", "closeFeeSat above our cap")
+                if acc["extra"].get("closeFeePayer", "payer") not in FEE_PAYERS:
+                    raise ChannelError("bad_offer", "unknown closeFeePayer")
                 if acc["extra"].get("derivation") != DERIVATION:   # before funding: never strand coins
                     raise ChannelError("bad_offer", f"payee key derivation {acc['extra'].get('derivation')!r}, "
                                                     f"this client speaks {DERIVATION!r} (xbt402 v1.1)")
@@ -1064,6 +1104,7 @@ class XbtChannelClient:
 
     def _open(self, origin: str, acc: dict) -> ClientChannel:
         ex = acc["extra"]
+        fee_payer = ex.get("closeFeePayer", "payer")
         cap = max(self.capacity, int(ex["minCapacity"]))
         if cap > int(ex.get("maxCapacity", cap)) or self.opened_sats + cap > self.budget_sats:
             raise ChannelError("budget", "channel capacity outside provider range or our budget")
@@ -1075,7 +1116,8 @@ class XbtChannelClient:
             pub = ecc.pubkey(secret).hex()
         blocks = min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
         expiry = self.height() + blocks
-        p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network)
+        p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
+                                 close_fee_payer=fee_payer)
         fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
         txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
@@ -1096,9 +1138,14 @@ class XbtChannelClient:
             self.on_refund(ch.refund_hex, expiry)
         if self.on_open:
             self.on_open(ch)
-        self._post(origin + ex["openUrl"], {"x402Version": 2, "network": self.network, "channel": {
-            "txid": txid, "vout": vout, "capacity": cap, "expiry": expiry, "payerPub": p.payer_pub,
-            "payerSpk": p.payer_spk, "redeemScript": p.script.hex()}})
+        c = {"txid": txid, "vout": vout, "capacity": cap, "expiry": expiry, "payerPub": p.payer_pub,
+             "payerSpk": p.payer_spk, "redeemScript": p.script.hex()}
+        if fee_payer != "payer":
+            c["closeFeePayer"] = fee_payer
+        r = self._post(origin + ex["openUrl"], {"x402Version": 2, "network": self.network, "channel": c})
+        if isinstance(r, dict) and r.get("closeFeePayer", "payer") != fee_payer:
+            # a provider that did not take our terms would refuse every state we sign: stop before paying
+            raise ChannelError("bad_fee_payer", "the provider opened the channel with another closeFeePayer")
         return ch
 
     def hrp_for(self) -> str:
@@ -1117,8 +1164,8 @@ class XbtChannelClient:
         billing = ch.accepted["extra"].get("billing", "postpay")
         need_msat = ch.spent_msat + (price * 1000 if billing == "prepay" else 0)
         cum = max(-(-need_msat // 1000), ch.payer.signed)
-        if 0 < cum < DUST:
-            cum = DUST
+        if 0 < cum < ch.payer.params.min_amount:
+            cum = ch.payer.params.min_amount
         self._check_daily(cum - ch.payer.signed)
         remaining = ch.payer.params.max_amount - max(ch.payer.signed, ch.spent_msat // 1000)
         if remaining < price and ch.payer.signed:
@@ -1211,8 +1258,8 @@ class XbtChannelClient:
         """Close whose payer output is the next channel's funding. Needs a live signer or secret."""
         origin, acc, ex = ch.origin, ch.accepted, ch.accepted["extra"]
         owed = max(ch.spent_msat // 1000, ch.payer.signed)
-        if owed < DUST:
-            owed = DUST
+        if owed < ch.payer.params.min_amount:
+            owed = ch.payer.params.min_amount
         if self.signer:
             pub = self.signer.new_key(origin + "/next")
         else:
@@ -1220,8 +1267,9 @@ class XbtChannelClient:
             pub = ecc.pubkey(secret2).hex()
         expiry = self.height() + min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
                                      int(ex["maxExpiryBlocks"]) - 1)
-        nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network)
-        next_cap = min(self.capacity, ch.payer.params.capacity - owed - ch.payer.params.close_fee)
+        nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
+                                   close_fee_payer=ch.payer.params.close_fee_payer)
+        next_cap = min(self.capacity, ch.payer.params.rollover_next_capacity(owed))
         if next_cap < int(ex["minCapacity"]):
             raise ChannelError("exhausted", "not enough leftover to roll into a new channel")
         tx = ch.payer.params.rollover_tx(owed, nxt.spk, next_cap)
@@ -1304,7 +1352,7 @@ class XbtChannelClient:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, cond_amt)
         # upgrade: fold the increment into an unconditional state and hand it over now, so the
         # provider can close with a plain state (until then it closes with the hash lock, M6)
-        new_cum = max(uncond + cond_amt, DUST)
+        new_cum = max(uncond + cond_amt, ch.payer.params.min_amount)
         if new_cum > ch.payer.signed:
             ch.last_sig = ch.payer.sign_state(new_cum).hex()
         self._hand_over(ch, acc, new_cum, ch.last_sig)

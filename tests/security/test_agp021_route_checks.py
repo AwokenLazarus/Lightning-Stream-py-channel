@@ -67,7 +67,9 @@ class HubChecksInOrder(_World):
     def test_0_a_valid_lock_goes_through_and_a_retry_gets_the_same_answer(self):
         st, doc = R.route_request(self.pay, self.sh)
         self.assertEqual(st, 200, doc)
-        self.assertEqual(self.st2().best_cum, DUST)                  # first ch2 lock: the dust floor
+        # first ch2 lock: the channel's floor (dust + closeFee on a payee-pays ch2, AGP-023)
+        self.assertEqual(self.st2().best_cum, self.st2().params.min_amount)
+        self.assertEqual(self.st2().params.close_fee_payer, "payee")
         done = self.st1().extra["route_done"][doc["lockId"]]
         self.assertEqual(done["secret"], doc["secret"])
 
@@ -196,7 +198,7 @@ class ProviderLockChecks(_World):
         p2 = oc.p()
         inv = self.sh.invoice
         d = 3
-        cum = next_cum(oc.routed, d)
+        cum = next_cum(oc.routed, d, p2.min_amount)
         pre = adaptor.presign(int(oc.secret, 16), p2.sighash(p2.state_tx(cum)), adaptor.dec(inv["point"]))
         route = {"session": self.sh.session, "lockId": inv["lockId"], "amount": d, "hub": self.hub.pay_to,
                  "lockAuth": lock_auth(self.sh.key, self.sh.session, inv["lockId"], d, inv["point"], self.hub.pay_to)}
@@ -237,11 +239,11 @@ class ProviderLockChecks(_World):
         self.assertEqual(doc["error"], "bad_invoice")
 
     def test_amount_and_adaptor(self):
-        st, doc = self._hub_lock(pl_over={"cum": str(DUST + 1)})
-        self.assertEqual(doc["error"], "bad_amount")
         oc = self.hub.out.chans[self.origin]
         p2 = oc.p()
-        bad = adaptor.presign(int(oc.secret, 16), p2.sighash(p2.state_tx(DUST)), adaptor.point_of(7)).to_json()
+        st, doc = self._hub_lock(pl_over={"cum": str(p2.min_amount + 1)})
+        self.assertEqual(doc["error"], "bad_amount")
+        bad = adaptor.presign(int(oc.secret, 16), p2.sighash(p2.state_tx(p2.min_amount)), adaptor.point_of(7)).to_json()
         st, doc = self._hub_lock(pl_over={"adaptor": bad})
         self.assertEqual(doc["error"], "bad_adaptor")
 
@@ -251,7 +253,7 @@ class ProviderLockChecks(_World):
         st, first = self._hub_lock()
         st2 = self.st2()
         rec = st2.extra["route_locks"][first["lockId"]]
-        self.assertEqual((st2.best_cum, rec["secret"]), (DUST, first["secret"]))
+        self.assertEqual((st2.best_cum, rec["secret"]), (st2.params.min_amount, first["secret"]))
         from xbt402.ledger import Ledger
         reloaded = Ledger(self.prov.ledger.path).channels[st2.params.channel_id]     # on disk
         self.assertEqual(reloaded.extra["route_locks"][first["lockId"]]["secret"], first["secret"])
@@ -462,7 +464,7 @@ class WatcherAndRestart(_World):
         pend_client = self.pay.signer.pending_lock(self.pay.chan)
         self.assertTrue(pend_client)
         st2 = self.st2()
-        self.assertEqual(st2.best_cum, DUST)                     # the provider did complete it
+        self.assertEqual(st2.best_cum, st2.params.min_amount)    # the provider did complete it
         from xbt402.hub import RouteHub
         hub2 = RouteHub(self.node, 0x4B4B, R.NET, os.path.dirname(self.hub.out.path), self.node.fund_address,
                         http=self.net.http, close_margin=36, delta=36)
@@ -543,13 +545,17 @@ class Rollover(_World):
         first = oc.p().channel_id
         R.stream(self.pay, self.sh, 40)                           # 1,600 sat accrued
         self.assertEqual(self.pay.lock(self.sh)["status"], "paid")
-        self.assertGreaterEqual(oc.signed, 2 * oc.p().close_fee)
+        # the provider's threshold counts its own close fee (payee-pays ch2, AGP-023): net >= 2 x fee
+        self.assertGreaterEqual(oc.signed - oc.p().close_fee, 2 * oc.p().close_fee)
         acts = self.hub.watch_tick()
         roll = next(a for a in acts if a.get("event") == "ch2_rollover")
         self.assertEqual(roll["amount"], oc.signed)
         from xbt402.tx import Tx
         tx = Tx.parse(bytes.fromhex(self.node.raw[roll["txid"]]))
-        self.assertEqual(tx.outputs[0].value, oc.signed)            # pays the provider its balance
+        p = oc.p()
+        # pays the provider its balance less its own close fee; the next ch2 takes all the hub's rest
+        self.assertEqual(tx.outputs[0].value, oc.signed - p.close_fee)
+        self.assertEqual(tx.outputs[1].value, p.capacity - oc.signed)
         self.assertEqual(tx.inputs[0].txid[::-1].hex() + f":{tx.inputs[0].vout}", first)
         new = self.hub.out.chans[self.origin]
         self.assertEqual((new.state, new.p().funding_txid), ("funded", roll["txid"]))

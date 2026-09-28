@@ -1,12 +1,13 @@
 {
  "title": "x402 xbt-channel test vectors",
- "version": "1.1-draft (payee derivation v2, x402 v2 SettlementResponse and facilitator shapes)",
- "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.1",
+ "version": "1.2-draft (payee derivation v2, x402 v2 SettlementResponse and facilitator shapes, closeFeePayer)",
+ "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
  "notes": [
   "All keys are test keys derived from sha256 of fixed strings. Never fund them.",
   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
-  "Fields starting with '_' are cross-checks, not wire values."
+  "Fields starting with '_' are cross-checks, not wire values.",
+  "Sections derivation..conditional are v1.1 and unchanged in v1.2 (payer-pays, closeFeePayer absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format."
  ],
  "constants": {
   "network": "bip122:0000000000000050c1e5f69672f45929",
@@ -961,5 +962,196 @@
     "recoveredPlaintextHex": "7468652064656c6976657261626c653a2061207265706f727420736f6c6420756e64657220612068617368206c6f636b0a"
    }
   ]
+ },
+ "payeePays": {
+  "payerSecret": "8f70faea24445d3d2c404bdb8e56f5c0807a6d78040ff7e27d3a0028a9b6c0c0",
+  "payeeSecret": "a87c66a495fb0083c03f62dd68cc509642f4c123619c280f035bad4e414065d8",
+  "params": {
+   "payer_pub": "033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfe",
+   "payee_pub": "03c71471249f74aa0663dffabd5a60a7cccf3eda8101917719b86208c4986fc9ef",
+   "expiry": 2014,
+   "payer_spk": "0014ed3aef46c951f2db84d5672d34002b471c0f8765",
+   "payee_spk": "001490ea9528fed9a831489e4ce6e6a04daf56d44d95",
+   "close_fee": 600,
+   "funding_txid": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969",
+   "funding_vout": 0,
+   "capacity": 200000,
+   "close_fee_payer": "payee"
+  },
+  "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+  "minCum": 1146,
+  "maxCum": 200000,
+  "states": [
+   {
+    "cum": 1146,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02220200000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d95c608030000000000160014ed3aef46c951f2db84d5672d34002b471c0f876500000000",
+    "outputs": [
+     [
+      546,
+      "001490ea9528fed9a831489e4ce6e6a04daf56d44d95"
+     ],
+     [
+      198854,
+      "0014ed3aef46c951f2db84d5672d34002b471c0f8765"
+     ]
+    ],
+    "sighash": "51ecf50cac60cf6aa534fdf61cfa3b46f7897eebdf5dfb05b4223fe721d90d8b",
+    "payerSig": "304402200c5b274f4c5a2cb4c27a7ae340bf357689c0e6ceef3a05368dc04e184fb01393022069d0f0b7e6bf69cb0caaad1db7e9a1f427f64f9714f5670f08de980843796a7821"
+   },
+   {
+    "cum": 150000,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02984702000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9550c3000000000000160014ed3aef46c951f2db84d5672d34002b471c0f876500000000",
+    "outputs": [
+     [
+      149400,
+      "001490ea9528fed9a831489e4ce6e6a04daf56d44d95"
+     ],
+     [
+      50000,
+      "0014ed3aef46c951f2db84d5672d34002b471c0f8765"
+     ]
+    ],
+    "sighash": "a81f098adea50cbc0e379bc48d16a91866bf92782fee0acf367e5c979c0e1407",
+    "payerSig": "304402204b4fd25be5d8800c09b7ee9d895bb93ed5c5cf6882b69f1c5b54265254840583022016edbb181627fca5154efa773f501309f67d321d917f1cf33f8bfb5726f7389021"
+   },
+   {
+    "cum": 199454,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02c60803000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d952202000000000000160014ed3aef46c951f2db84d5672d34002b471c0f876500000000",
+    "outputs": [
+     [
+      198854,
+      "001490ea9528fed9a831489e4ce6e6a04daf56d44d95"
+     ],
+     [
+      546,
+      "0014ed3aef46c951f2db84d5672d34002b471c0f8765"
+     ]
+    ],
+    "sighash": "b44787193014bffd47748d4906cd5721596348b01f08d9c49b08ae7c9a4634ff",
+    "payerSig": "3045022100f490baaadd30cc433a1dbb4872a63590b373455aa74e83447b68edfad8261d300220473a44226d48a4c253fff2ccabed2dd9fd86bc30534527e2b6fd32a2ee396a1f21"
+   },
+   {
+    "cum": 199455,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff01c70803000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9500000000",
+    "outputs": [
+     [
+      198855,
+      "001490ea9528fed9a831489e4ce6e6a04daf56d44d95"
+     ]
+    ],
+    "sighash": "b07bd77302100e0a5de7dcfa9f4805d7781885ded676bf51799b30ef3b82d9ae",
+    "payerSig": "304402200b4671db834882c82db15aa8b2b417880e3603b01c67203d123df45bcc034438022054ec2e25f72b9f5df4c3ab587e0951ae8d9307678302d57706e556cd0328f4cd21"
+   },
+   {
+    "cum": 200000,
+    "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff01e80a03000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9500000000",
+    "outputs": [
+     [
+      199400,
+      "001490ea9528fed9a831489e4ce6e6a04daf56d44d95"
+     ]
+    ],
+    "sighash": "f4b77cd63b68ffdcd310ca01fad30ddd1f9a3183294eaacd676f9a2e859f6574",
+    "payerSig": "3044022031a80c73310a3508f4b35f78786a0357b1eb2dfb28e40161ffbfbd45789afbbc022024a47273cecea37a970dd7157feab103d4718f4854e1d7c311b9df2b50945ff021"
+   }
+  ],
+  "closeTx": {
+   "cum": 150000,
+   "hex": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02984702000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9550c3000000000000160014ed3aef46c951f2db84d5672d34002b471c0f87650447304402204b4fd25be5d8800c09b7ee9d895bb93ed5c5cf6882b69f1c5b54265254840583022016edbb181627fca5154efa773f501309f67d321d917f1cf33f8bfb5726f738902147304402204bd66f5c0cf5fb807f7603f7ec426b925ebe5e848f24f3d5bd59c6e558d2cddd022021ad5a6546947812c057b3a585b33319abac72f87a8ef0f2bd91f3f4e882063e2101014e632103c71471249f74aa0663dffabd5a60a7cccf3eda8101917719b86208c4986fc9efad6702de07b1756821033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfeac00000000",
+   "txid": "77b028cf48b54b1402f58772ac13e8b534e7bc24e8db968ddb9993226107be46"
+  },
+  "a3State": {
+   "cum": 150000,
+   "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff0250c3000000000000160014ed3aef46c951f2db84d5672d34002b471c0f8765984702000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9500000000",
+   "sighash": "d9acb65ba37ca1f9d68a567ddd36b89ca22f11c3739e23a746683c6b6d0e430c",
+   "payerSig": "30440220093e3abcbb00d2ada2338e2416d0287acb3833fac2641f1a627366019d1e750002205f76626117f3239e7255190beaf96e6749fc16456a17b0a2afe96c79bcf391a6a3"
+  },
+  "rollover": {
+   "amount": 150000,
+   "nextExpiry": 3014,
+   "nextSpk": "0020a15782da7cabdd72ae8b4de2ef095e4e9f9e5c1b30385431700cd511fd89f46b",
+   "nextCapacity": 50000,
+   "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02984702000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d9550c3000000000000220020a15782da7cabdd72ae8b4de2ef095e4e9f9e5c1b30385431700cd511fd89f46b00000000",
+   "sighash": "f84d224529fc6b4cbf80df16925b65ef341a0988bd1f00000a25482cc19b45b1",
+   "payerSig": "3045022100dc98c43a9354541fce141de92c698fc8b95fa9d383f7cba1f471116240990c1e02203c649287586553f1055ded030c7c4bb9381a1f5a5c9e279143a0348c9e8c269621"
+  },
+  "conditional": {
+   "H": "6f9668a3bc2ac0743388570763f17cd2c96eb289b26e7bcd1b9f6ab9dd76a75b",
+   "condAmount": 1000,
+   "csvDelta": 10,
+   "uncond": 1146,
+   "hashlockSpk": "002065225911984c7e1f6ff90e6ca09554c67ade2687ea43aff01884107358120e6f",
+   "unsignedTx": "020000000169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff03220200000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d95e80300000000000022002065225911984c7e1f6ff90e6ca09554c67ade2687ea43aff01884107358120e6fde04030000000000160014ed3aef46c951f2db84d5672d34002b471c0f876500000000",
+   "sighash": "c0a68188dbbd6be9835fc272ffd63648b3229e5436f37f6f8fe0de3539bbf63d",
+   "payerSig": "304402202d94982c51030b8758a1d4c37fba6628685e6325371c140663983ba03d8749f902200c508e69a7987b72e1a37d22ddeaecb016612965c807ee96d8ca42b035d56f2121"
+  },
+  "invalid": [
+   {
+    "why": "a payer-pays (v1.1) signature for the same cum: the signature commits to who pays the fee",
+    "cum": 150000,
+    "payerSig": "3045022100d429ccfab950c020c648c2d851608247e8ff4bfcc9e6bec3e45c1cd0ee3cb611022071b65676e478253512589e6212c53237dc78d7928f3d9e8283cf7937b6e6814121",
+    "error": "bad_sig"
+   },
+   {
+    "why": "below the least state: the payee output would be dust after its close fee",
+    "cum": 1145,
+    "payerSig": "304402200c5b274f4c5a2cb4c27a7ae340bf357689c0e6ceef3a05368dc04e184fb01393022069d0f0b7e6bf69cb0caaad1db7e9a1f427f64f9714f5670f08de980843796a7821",
+    "error": "bad_amount"
+   }
+  ],
+  "terms": {
+   "scheme": "xbt-channel",
+   "network": "bip122:0000000000000050c1e5f69672f45929",
+   "amount": "0",
+   "asset": "XBT:sat",
+   "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+   "maxTimeoutSeconds": 30,
+   "extra": {
+    "minCapacity": "20000",
+    "maxCapacity": "10000000",
+    "minExpiryBlocks": 1008,
+    "maxExpiryBlocks": 8640,
+    "closeMarginBlocks": 144,
+    "minConf": 1,
+    "closeFeeSat": "600",
+    "openUrl": "/x402/xbt-channel/open",
+    "closeUrl": "/x402/xbt-channel/close",
+    "billing": "postpay",
+    "derivation": "v2",
+    "settleMultiple": 20,
+    "closeFeePayer": "payee",
+    "rolloverGraceBlocks": 36,
+    "routes": []
+   }
+  },
+  "open": {
+   "request": {
+    "x402Version": 2,
+    "network": "bip122:0000000000000050c1e5f69672f45929",
+    "channel": {
+     "txid": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969",
+     "vout": 0,
+     "capacity": 200000,
+     "expiry": 2014,
+     "payerPub": "033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfe",
+     "payerSpk": "0014ed3aef46c951f2db84d5672d34002b471c0f8765",
+     "redeemScript": "632103c71471249f74aa0663dffabd5a60a7cccf3eda8101917719b86208c4986fc9efad6702de07b1756821033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfeac",
+     "closeFeePayer": "payee"
+    },
+    "hub": {
+     "payTo": "034bc624d9423e0781a9ea8309a0a781a9574468d72b7f831bd3616d0d030d5f0b",
+     "sig": "3045022100f3c919c72e888d087040fffd23f16367aad7b6ff6196c45a0a3ef397e56404a2022069cef946d79e553101fbf4906a95fd31879263f1183aff8658f283f0619dfd90"
+    }
+   },
+   "status": 200,
+   "response": {
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "expiry": 2014,
+    "maxCum": "200000",
+    "confirmations": 1,
+    "closeFeePayer": "payee",
+    "minCum": "1146"
+   }
+  }
  }
 }

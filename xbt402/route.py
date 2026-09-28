@@ -416,8 +416,9 @@ class RouteSeller:
         Checks the lock, completes it with the window's t, saves the plain state write-ahead, and
         only then credits the session and returns t.
 
-        ch2's cumulative amount is `next_cum(routed, d)`: the routed total with the 546-sat dust
-        floor, which the hub pre-pays once per channel and later locks use up. A lock the floor
+        ch2's cumulative amount is `next_cum(routed, d, min_amount)`: the routed total with the
+        channel's floor (546-sat dust, plus closeFee when the provider pays its own close, v1.2),
+        which the hub pre-pays once per channel and later locks use up. A lock the floor
         already covers needs no new state (and carries no adaptor). A lockId completed before is
         answered again with the same t, so the hub can retry after a lost answer or a crash."""
         try:
@@ -453,7 +454,7 @@ class RouteSeller:
                 self.held.append({"lockId": lock_id, "cum": cum, "pre": pl.get("adaptor"), "chan": st.params.channel_id})
                 return {"held": lock_id}
             routed = int((st.extra or {}).get("routed_sat", 0))
-            need = next_cum(routed, amount)
+            need = next_cum(routed, amount, st.params.min_amount)
             if need <= st.best_cum:
                 if cum != st.best_cum or pl.get("adaptor"):
                     raise ChannelError("bad_amount", f"the dust floor covers this lock: cum {st.best_cum}, no adaptor")
@@ -497,9 +498,11 @@ class RouteSeller:
                                                       "paidSat": s.paid_sat if s else None})}
 
 
-def next_cum(routed: int, amount: int) -> int:
-    """A routed channel's next cumulative state: the routed total plus this lock, floored at dust."""
-    return max(int(routed) + int(amount), DUST)
+def next_cum(routed: int, amount: int, floor: int = DUST) -> int:
+    """A routed channel's next cumulative state: the routed total plus this lock, floored at the
+    channel's least state (`ChannelParams.min_amount`: dust, plus the close fee on a payee-pays
+    channel, v1.2)."""
+    return max(int(routed) + int(amount), int(floor))
 
 
 def find_spend(rpc, txid: str, vout: int, from_height: int):

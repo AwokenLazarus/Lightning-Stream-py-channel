@@ -1,8 +1,8 @@
-"""AGP-021 on a real chain (Knots 29.4.2 regtest, RDTS + #419; ports XBT402_TEST_PORT_BASE + 60/61,
+"""AGP-021 on a real chain (Knots 29.4.2 regtest, RDTS + #419; ports XBT402_TEST_PORT_BASE + 12/13,
 datadir run/agp021-<pid>, wiped after). Hub, provider and client run in process over a fake HTTP
 transport (tests/security/routehelp.py) against the real node:
-  1. routed locks settle; the hub rolls ch2 over at the provider's threshold (confirmed, pays the
-     provider exactly its balance), opens the next ch2, routes on; every close pays its ledger.
+  1. routed locks settle; the hub rolls ch2 over at the provider's net threshold (confirmed, pays the
+     provider exactly its balance less its own close fee: ch2 is payee-pays, AGP-023), opens the next ch2, routes on; every close pays its ledger.
   2. the provider's answers never reach the hub: the hub writes the lock off; the provider closes ch2
      with the completed state; the hub's watcher finds that close in a block (no txindex, no mempool),
      reads t and completes ch1; the hub closes ch1; the client reads t + r off that close.
@@ -84,12 +84,18 @@ class RoutedRegtest(unittest.TestCase):
 
     def test_1_locks_rollover_and_closes_on_chain(self):
         net, h, prov, pay, sh = self.world(settle_multiple=2, amsat_per_call=40 * AMSAT_PER_SAT)
-        R.stream(pay, sh, 40)
+        R.stream(pay, sh, 30)
         self.assertEqual(pay.lock(sh)["status"], "paid")
         oc = h.out.chans["http://p.test"]
+        # ch2 is payee-pays (AGP-023): 1,200 sat routed nets the provider 600, under its 2 x 600 threshold
+        self.assertFalse(any(a.get("event") == "ch2_rollover" for a in h.watch_tick()))
+        R.stream(pay, sh, 20)                                       # 2,000 routed: net 1,400 >= 1,200
+        self.assertEqual(pay.lock(sh)["status"], "paid")
         roll = next(a for a in h.watch_tick() if a.get("event") == "ch2_rollover")
         self.node.mine()
-        self.assertEqual(self.node.paid(roll["txid"], oc.params["payee_spk"]), roll["amount"])
+        # the provider pays its own close fee; the next ch2 carries every sat the hub did not route
+        self.assertEqual(self.node.paid(roll["txid"], oc.params["payee_spk"]), roll["amount"] - oc.p().close_fee)
+        self.assertEqual(roll["nextCapacity"], oc.p().capacity - roll["amount"])
         h.watch_tick()
         new = h.out.chans["http://p.test"]
         self.assertEqual(new.state, "open")
@@ -101,7 +107,7 @@ class RoutedRegtest(unittest.TestCase):
         st1 = h.inbound.ledger.channels[pay.chan]
         st2 = next(s for s in prov.ledger.channels.values() if s.closed_txid == c2["txid"])
         self.assertEqual(self.node.paid(c1["txid"], st1.params.payee_spk), st1.best_cum)
-        self.assertEqual(self.node.paid(c2["txid"], st2.params.payee_spk), st2.best_cum)
+        self.assertEqual(self.node.paid(c2["txid"], st2.params.payee_spk), st2.best_cum - st2.params.close_fee)
         self.assertEqual(st1.best_cum, max(546, pay.routed))
 
     def test_2_secret_read_off_a_mined_ch2_close_after_a_write_off(self):

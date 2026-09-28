@@ -5,6 +5,11 @@ payee key commits to the network (§5.1, §11) and the payment response and faci
 x402 v2 shapes (§7.4, §7.6). [Changes from v1.0](#changes-from-v10) lists every difference. The
 reference implementation (`xbt402`) implements this text, and `vectors.json` is generated from it.
 
+**v1.2-draft additions**, 2026-09-28: who pays a state's close fee is a channel term,
+`closeFeePayer` (§12). Absent means `"payer"`, the v1.1 format, so v1.2 is wire-compatible with v1.1:
+a v1.1 party never sees the field and every v1.1 byte (states, vectors, 402s) is unchanged. Hub-funded
+routed channels use `"payee"`: the provider pays its own settlement. [Changes in v1.2](#changes-in-v12).
+
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT and MAY are to be interpreted as described
 in RFC 2119 and RFC 8174 when, and only when, they appear in all capitals.
 
@@ -24,8 +29,10 @@ Companion documents in this directory:
 9. [Security requirements](#9-security-requirements)
 10. [Known weaknesses](#10-known-weaknesses)
 11. [v1.1: network in the payee tweak](#11-v11-network-in-the-payee-tweak)
-12. [Test vectors](#12-test-vectors)
-13. [Changes from v1.0](#changes-from-v10)
+12. [v1.2: who pays the close fee (`closeFeePayer`)](#12-v12-who-pays-the-close-fee-closefeepayer)
+13. [Test vectors](#13-test-vectors)
+14. [Changes in v1.2](#changes-in-v12)
+15. [Changes from v1.0](#changes-from-v10)
 - [Appendix A: security findings referenced in this document](#appendix-a-security-findings-referenced-in-this-document)
 - [Appendix B: error codes](#appendix-b-error-codes)
 
@@ -110,12 +117,13 @@ being served). Under **prepay** the client risks one call. Neither can take more
 | `asset` | `XBT:sat` | wire | Not a CAIP-19 identifier; see [open questions](scheme_xbt-channel.md#open-questions). |
 | `derivation` | `v2` | `extra` | The payee-key derivation of §5.1. v1.0 had no such field (its derivation omitted the network). A client MUST refuse any other value **before funding**. |
 | `DUST` | 546 sat | protocol | Smallest output either side creates, and smallest signed `cum`. Above the node's own floors (Knots 29.4.2, default `dustrelayfee`): 294 sat for P2WPKH, 330 for P2WSH and P2TR. |
-| `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the client's side. A close is 170–171 vB with P2WPKH client change, so about 3.5 sat/vB (183 vB, 3.3 sat/vB, with P2WSH or P2TR change; 139–140 vB without change; a conditional close, §6.5, is 214 vB, 2.8 sat/vB). Clients SHOULD refuse offers above a cap (reference: 2,000). |
+| `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the side `closeFeePayer` names (the client's by default). A close is 170–171 vB with P2WPKH client change, so about 3.5 sat/vB (183 vB, 3.3 sat/vB, with P2WSH or P2TR change; 139–140 vB without change; a conditional close, §6.5, is 214 vB, 2.8 sat/vB). Clients SHOULD refuse offers above a cap (reference: 2,000). |
+| `closeFeePayer` | `"payer"` (default) or `"payee"` | `extra`, open | v1.2 (§12). Fixed at open. Absent means `"payer"`. Hub-funded routed channels: `"payee"`. |
 | `minCapacity`, `maxCapacity` | 20,000 / 10,000,000 sat (reference) | `extra` | Provider policy. |
 | `minExpiryBlocks`, `maxExpiryBlocks` | 1,008 / 8,640 (reference) | `extra` | Blocks from the tip at open (about 7 and 60 days). |
 | `closeMarginBlocks` | 144 (reference) | `extra` | The provider stops serving and MUST close at `expiry − closeMarginBlocks`. |
 | `minConf` | 1 (reference) | `extra` | Confirmations before a channel is credited. |
-| Large-channel confirmations | 3 above 1,000,000 sat (reference) | provider policy | Reorg defence (H2). Not advertised in v1.0; see §13. |
+| Large-channel confirmations | 3 above 1,000,000 sat (reference) | provider policy | Reorg defence (H2). Not advertised in v1.0; see [Changes from v1.0](#changes-from-v10). |
 | Zero-conf tier | 0 = off (reference) | provider policy | Capacity up to which an unconfirmed funding is accepted, at the provider's risk. |
 | `expiry` | absolute block height, `0 < expiry < 500,000,000` | open | |
 | `maxTimeoutSeconds` | 30 | wire | |
@@ -185,10 +193,14 @@ The state for cumulative amount `cum` is deterministic. Both sides build it byte
 channel terms; neither ever parses it from the other.
 - version 2, locktime 0;
 - one input: the funding outpoint, sequence `0xfffffffd` (signals replaceability);
-- output 0: `cum` to the provider script;
-- output 1: `capacity − closeFeeSat − cum` to the client script, **omitted** (added to the fee) when
+- output 0: `cum − payeeFee` to the provider script;
+- output 1: `capacity − payerFee − cum` to the client script, **omitted** (added to the fee) when
   below 546;
-- `546 ≤ cum ≤ capacity − closeFeeSat` (`maxCum`).
+- `minCum ≤ cum ≤ maxCum`, with `minCum = 546 + payeeFee` and `maxCum = capacity − payerFee`.
+
+`payerFee = closeFeeSat, payeeFee = 0` under `closeFeePayer: "payer"` (v1.1: output 0 is `cum`,
+output 1 `capacity − closeFeeSat − cum`, `546 ≤ cum ≤ capacity − closeFeeSat`), and `payerFee = 0,
+payeeFee = closeFeeSat` under `"payee"` (§12). `cum` is always what the client has paid.
 
 The client signs it with `0x21`. The signature MUST be BIP66 strict DER with low S, and a verifier
 MUST reject any other encoding **before** verifying the signature (C1): segwit v0 consensus rejects
@@ -197,8 +209,8 @@ non-strict DER, so a loosely encoded state can never be closed.
 ### 6.4 Fee-input state (`0xA3`, optional)
 For fee spikes a client MAY also sign `SINGLE|ANYONECANPAY|UNIFIED` (`0xA3`) states, so the provider
 can attach fee inputs:
-- output 0: `capacity − closeFeeSat − cum` to the **client** script (the output SINGLE commits to);
-- output 1: `cum` to the provider script;
+- output 0: `capacity − payerFee − cum` to the **client** script (the output SINGLE commits to);
+- output 1: `cum − payeeFee` to the provider script;
 - a state without client change ≥ 546 has no `0xA3` variant.
 
 The provider adds inputs and outputs freely. Output 0 MUST be the client's change: if the provider's
@@ -216,7 +228,10 @@ OP_IF   OP_SHA256 <H> OP_EQUALVERIFY <P> OP_CHECKSIG
 OP_ELSE <csvDelta> OP_CHECKSEQUENCEVERIFY OP_DROP <A> OP_CHECKSIG
 OP_ENDIF
 ```
-and the rest, minus `closeFeeSat`, to the client. Signed `0x21`. Once the client has the preimage `k`
+and the rest to the client, the close fee out of the `closeFeePayer` side: under `"payer"` the client
+gets `capacity − uncond − condAmount − closeFeeSat`; under `"payee"` the provider output is
+`uncond − closeFeeSat`, which MUST be present and at least 546 (`uncond ≥ minCum`), the hash-lock output
+stays exactly `condAmount`, and the client gets `capacity − uncond − condAmount`. Signed `0x21`. Once the client has the preimage `k`
 (`SHA256(k) = H`), it SHOULD fold the increment into an ordinary state paying `uncond + condAmount`.
 
 **Ciphertext first** (M7). The 402 carries the encrypted deliverable, `extra.conditional.cipher`,
@@ -285,6 +300,8 @@ input; implementations emit lowercase.
 - `derivation` names the payee-key derivation, `"v2"` (§5.1). A client MUST refuse an offer with any
   other value, or none, before it funds anything: a script built with another derivation fails the open
   (`bad_funding`) and strands the funding until `expiry`.
+- `closeFeePayer` (v1.2, §12) is present only when it is not `"payer"`. A client MUST refuse a value
+  other than `"payer"` or `"payee"` before funding.
 - `extra.conditional = {"hash","amount","csvDelta","cipher"}` appears only on a path offering a
   hash-locked deliverable (§6.5). `cipher` is the encrypted deliverable (hex); the header can get large,
   so a provider SHOULD offer conditional calls only for small deliverables (the last chunk of a stream,
@@ -298,11 +315,14 @@ input; implementations emit lowercase.
 ```json
 {"x402Version":2,"network":"bip122:…",
  "channel":{"txid":"<hex>","vout":0,"capacity":200000,"expiry":2014,
-            "payerPub":"<A hex>","payerSpk":"<hex, optional>","redeemScript":"<hex>"}}
+            "payerPub":"<A hex>","payerSpk":"<hex, optional>","redeemScript":"<hex>",
+            "closeFeePayer":"payee (v1.2, optional)"}}
 ```
 The provider MUST check, in this order, refusing with the code shown:
 1. `network` is its own, else `wrong_network`;
 2. `payerPub` is a valid compressed key; `payerSpk`, if present, is P2WPKH, P2WSH or P2TR, else `bad_payer_spk`;
+   `closeFeePayer` (absent: `"payer"`) is `"payer"` or the value this provider offered for this kind of
+   channel (§12), else `bad_fee_payer`;
 3. `redeemScript` equals the script it builds from `(network, payTo, A, expiry)` with the §5.1
    derivation, else `bad_funding` (a v1.0-derived script, or one derived for another network, fails here);
 4. canonicalize the channel id (below); if already known, `duplicate_channel`;
@@ -311,7 +331,9 @@ The provider MUST check, in this order, refusing with the code shown:
    `bad_capacity`; blocks to expiry outside `[minExpiryBlocks, maxExpiryBlocks]` → `bad_expiry`;
    fewer confirmations than required and capacity above the zero-conf tier → `unconfirmed`.
 
-Success: `200 {"chan":"<txid>:<vout>","expiry":2014,"maxCum":"199400","confirmations":1}`.
+Success: `200 {"chan":"<txid>:<vout>","expiry":2014,"maxCum":"199400","confirmations":1}`. A
+payee-pays open also returns `"closeFeePayer":"payee"` and `"minCum"`; a client MUST check that the
+echoed `closeFeePayer` (absent: `"payer"`) is the one it asked for before it signs any state.
 Failure: `400 {"error":"<code>","detail":"<text>"}`.
 
 **Channel id.** `chan = <txid, 64 lowercase hex> ":" <vout, decimal, no leading zeros>`. Nodes parse
@@ -462,6 +484,7 @@ Watcher rules (run at least every block):
   mempool (M8).
 - For a conditional close, rebroadcast the claim until it confirms and raise its fee as `csvDelta` nears (L8).
 - SHOULD bump a close by CPFP from the provider output when the feerate is above what `closeFeeSat` pays.
+  (Under `closeFeePayer: "payee"` the base fee comes out of that output too: the provider pays all of it.)
 - MUST run supervised, so that it cannot silently die: after `expiry` a missing close means the refund wins.
 
 Client view: `unfunded → funded (refund signed and stored) → open → closed | refunded`. A client that
@@ -602,7 +625,81 @@ Other candidates for a later version: advertise the large-channel confirmation r
 without `OP_IF`, smaller and more private closes); hash-locked outputs inside states so a hub can route
 payments without custody.
 
-## 12. Test vectors
+## 12. v1.2: who pays the close fee (`closeFeePayer`)
+A channel's terms name who pays `closeFeeSat`, fixed at open:
+
+| `closeFeePayer` | provider output | client output | `minCum` | `maxCum` |
+|---|---|---|---|---|
+| `"payer"` (default; v1.1) | `cum` | `capacity − closeFeeSat − cum` | 546 | `capacity − closeFeeSat` |
+| `"payee"` | `cum − closeFeeSat` | `capacity − cum` | `546 + closeFeeSat` | `capacity` |
+
+A client output below 546 is omitted (added to the fee) in both. `cum` keeps its meaning: the
+cumulative amount the client has paid. Only the split of the fee moves.
+
+**Why.** On a routed path (hub routing, AGP-019/021) the hub funds and pays the hub → provider channel.
+Under payer-pays it paid every provider settlement's close fee, 5% of each payout at a 20× settle
+threshold, and had to price that into its routing fee. Under payee-pays each provider pays its own
+settlement, decides when a settlement is worth it, and hub fees price only liquidity and routing.
+
+**Negotiation.** The funding script does not depend on `closeFeePayer`, so it is agreed at the open
+and both sides build every later transaction from it.
+- A provider advertises it in its 402 `extra` for plain channels (absent: `"payer"`), and in its
+  `GET /x402/xbt-channel/terms` for hub-funded channels (the reference: `"payee"`).
+- The client (or hub) sends `channel.closeFeePayer` in the open (§7.2). A provider MUST accept `"payer"`,
+  which only costs the client, and MUST refuse `"payee"` (`bad_fee_payer`) unless it offered it for that
+  kind of channel.
+- The provider echoes a non-default value, with `minCum`, and the client MUST check the echo before
+  signing: a v1.1 provider ignores the field, opens a payer-pays channel, and would refuse every state
+  a payee-pays client signs. The reference client stops there; its refund returns the funds at `expiry`.
+- A hub advertises both hops in `extra.routing`: `ch1CloseFeePayer` (client → hub, the reference:
+  `"payer"`, as for any plain channel) and `ch2CloseFeePayer` (hub → provider, `"payee"`). A hub
+  configured for payee-pays refuses to fund a channel to a provider whose `/terms` do not offer it.
+
+**Security.**
+1. *The payee cannot lower the client's output.* Under `"payee"` the client's output is
+   `capacity − cum`: it depends on `cum` alone, not on `closeFeeSat` or anything else the provider
+   chooses. The client's `0x21` signature commits to every output, so it commits to the fee payer: the
+   signature for `cum` under one value does not verify under the other (a vector checks this), and
+   neither side can relabel a channel after the open. A provider that advertised a large `closeFeeSat`
+   only shrinks its own output. The client SHOULD still cap `closeFeeSat` (the reference cap is
+   unchanged), because it raises `minCum`, the smallest state the client can sign.
+2. *Dust.* A state MUST leave the provider output ≥ 546 after its fee, so `minCum = 546 + closeFeeSat`
+   and a client's first state is floored there (the reference client and B2 wallet floor at `minCum`).
+   The client's change below 546 is dropped into the fee as in v1.1, costing the client at most 545 sat.
+3. *CPFP and `0xA3`.* The provider bumps its own close, by CPFP from its output (`cum − closeFeeSat`
+   must leave room for the child's fee and 546) or with a `0xA3` state. In a `0xA3` state output 0 is
+   the client's `capacity − cum` and SINGLE commits to it; the provider rearranges only its own
+   `cum − closeFeeSat` and its fee inputs. The client's refund is its own settlement and still pays
+   its own fee (§6.6).
+4. *Rollover.* A rollover (one transaction paying the provider and funding the next channel, reference
+   `POST /x402/xbt-channel/rollover`) pays the provider `amount − closeFeeSat`; the next channel MAY take
+   at most `capacity − amount`, the client's whole remainder. More would come out of the fee the
+   provider's output pays, and a verifier MUST refuse it. The next channel inherits `closeFeePayer`.
+5. *Settlement policy.* The provider's threshold counts its own fee: it settles once its **net** payout
+   `cum − closeFeeSat` is at least `settleMultiple × closeFeeSat` (fees at most 1/settleMultiple of the
+   payout; reference 20), or near its close margin. Because the fee is now the provider's, a client or
+   hub could make it pay many fees on small payouts by rolling over early and often: a provider MUST NOT
+   co-sign a payee-pays rollover below its threshold unless the channel is within
+   `rolloverGraceBlocks` (advertised in `/terms`, reference 36) of its close margin, and answers
+   `settle_early`. A cooperative close the client asks for is still honoured (the client would
+   otherwise wait for `expiry`), and each such grief costs the client a funding transaction for the
+   provider's one close fee.
+6. *Hash-locked conditional states (§6.5).* The fee comes out of the provider's unconditional output,
+   never the hash-lock output. So a conditional state needs `uncond ≥ minCum`. A client that reclaims
+   `condAmount` through the CSV branch (the provider never revealed `k`) gets all of it and pays none
+   of the provider's close fee. The claim fee still comes out of `condAmount` as in v1.1.
+7. *Adaptor-locked states (routing).* A routed lock is an adaptor pre-signature over an ordinary `0x21`
+   state, so it is over the payee-pays state of that channel: the provider pre-verifies it against
+   `state_tx(cum)` built from its own terms, and a pre-signature made for the other fee payer fails
+   pre-verify (`bad_adaptor`). A routed channel's cumulative state is `max(routed + d, minCum)`, and
+   the hub pre-pays that floor once per channel. The hub's worst case for a provider that closes at the
+   floor stays what it was in v1.1: v1.1 floored at 546 and the hub paid the 600-sat close fee on top,
+   v1.2 floors at 1,146 and the provider pays the fee out of it, so both lose the hub
+   `1,146 − routed` sat per channel.
+
+Everything else (scripts, keys, sighash, auth, envelopes) is unchanged.
+
+## 13. Test vectors
 `vectors.json` holds, for fixed test keys:
 - the payee derivation (`network`, the tweak preimage, `t`, `P`, redeem script, funding scriptPubKey and
   address) for three channels on mainnet and for the first of them on two other networks, each with the
@@ -618,14 +715,30 @@ payments without custody.
   script and output, the conditional state with the client's signature, the 402 carrying
   `extra.conditional` with `cipher`, the paid call and its response, the provider's close with the
   conditional state (the client never folded it), and the claim, whose witness reveals `k`, which
-  opens the offered ciphertext.
+  opens the offered ciphertext;
+- v1.2, `payeePays`: a payee-pays channel's five states from `minCum` to `capacity` (one with the client's
+  change at exactly 546, one where it is dropped), a close, the `0xA3` state, a rollover, a conditional
+  state at `uncond = minCum`, the v1.1 signature for the same `cum` refused (`bad_sig`), a state below
+  `minCum` refused (`bad_amount`), and the provider's `/terms` and a hub-bound open echoing
+  `closeFeePayer` and `minCum`.
+
+The v1.1 sections are byte-identical to the v1.1 vectors: v1.2 changed no v1.1 value.
 
 `check_vectors.py` recomputes every value with the reference implementation and exits non-zero on any
 difference. It also checks what does not depend on the generator: the preimage layout, `t` against
 the tagged hash, `p·G = P`, one key per network and none equal to v1.0's, every signature under the key
 that should have made it, every `PAYMENT-RESPONSE` against the receipt it wraps, and, for the conditional
-call, `H = SHA256(k)`, the keystream, the hash-lock script byte by byte, and `k` in the claim. The vectors are
-identical under the libsecp256k1 backend and the pure-Python backend.
+call, `H = SHA256(k)`, the keystream, the hash-lock script byte by byte, and `k` in the claim, and, for
+v1.2, every output against the table in §12. The vectors are identical under the libsecp256k1 backend
+and the pure-Python backend.
+
+## Changes in v1.2
+Not breaking (absent `closeFeePayer` is v1.1):
+- **`closeFeePayer`** (§12): `"payer"` or `"payee"`, in `extra`, `/terms`, the open and its answer;
+  the state, `0xA3`, rollover and conditional formats under `"payee"`; `minCum`; the settlement
+  threshold on the provider's net payout; `settle_early`; `bad_fee_payer`; the hub's
+  `extra.routing.ch1CloseFeePayer` / `ch2CloseFeePayer`. Hub-funded routed channels default to `"payee"`.
+- **Test vectors** (§13): the `payeePays` section; every v1.1 section unchanged.
 
 ## Changes from v1.0
 Breaking (a v1.1 party refuses a v1.0 one at the 402 or the open, before any funds move):
@@ -656,7 +769,7 @@ Not breaking:
 - **Agent-facing clients return the provider's response as labelled untrusted data** (§9 item 16, L7).
 - **Known weaknesses stated in one place** (§10): M2 and its operating rules, fee and expiry
   assumptions, hot-key custody.
-- **Test vectors** (§12), for all of the above.
+- **Test vectors** (§13), for all of the above.
 - **Standalone text.** The chain, `SIGHASH_UNIFIED`, BIP-110 and the maturity rule are described here;
   references to internal documents and deployments are removed.
 
@@ -697,7 +810,8 @@ Codes in the 402 `error` field and in `400 {"error"}` answers of the control end
 `channel_closing`, `unconfirmed`, `stale_amount`, `bad_sig`, `bad_sighash`, `bad_amount`,
 `bad_hashlock`, `conditional_outstanding`, `insufficient_payment`, `channel_exhausted`,
 `coinbase_funding`, `bad_funding`, `unknown_funding`, `bad_capacity`, `bad_expiry`, `bad_payer_spk`,
-`wrong_network`, `duplicate_channel`, `close_failed` (close and watcher only).
+`wrong_network`, `duplicate_channel`, `close_failed` (close and watcher only); v1.2: `bad_fee_payer`
+(open), `settle_early` (a routed channel's rollover, §12).
 
 The facilitator answers (§7.6) carry the upstream-style name of the same code in
 `invalidReason` / `errorReason`: `invalid_xbt_channel_<code>`, except `unsupported_scheme_or_network` →

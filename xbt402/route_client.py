@@ -282,7 +282,7 @@ class RoutePayer:
                 self.refresh_hub()
             q = self.quote
             f, units = fee_due(q, d, self.fee_units, self.fee_paid)
-            cum = next_cum(self.routed, d + f)
+            cum = next_cum(self.routed, d + f, self.ch.payer.params.min_amount)
             floor = cum <= self.signed
             p = {"shard": sh, "lockId": inv["lockId"], "d": d, "f": f, "units": units, "cum": max(cum, self.signed),
                  "floor": floor, "T": inv["point"], "until": float(inv["validUntil"]) + self.void_grace,

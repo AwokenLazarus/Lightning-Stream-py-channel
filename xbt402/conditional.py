@@ -77,16 +77,20 @@ class ConditionalParams:
         self.spk = p2wsh_spk(self.script)
 
     def state_tx(self, uncond: int) -> Tx:
-        """uncond to payee, cond to hashlock, remainder to payer (minus close fee)."""
+        """uncond to payee, cond to hashlock, remainder to payer, the close fee out of
+        close_fee_payer's side. Under payee-pays (v1.2) the fee comes out of the payee's
+        unconditional output, which must then exist and clear dust after it (uncond >= min_amount):
+        the hash-lock output stays exactly cond_amount, so a payer that reclaims it through the CSV
+        branch never pays the payee's close fee, and the payer's change is capacity - uncond - cond."""
         p = self.channel
-        if uncond and not DUST <= uncond <= p.max_amount:
-            raise ChannelError("bad_amount", f"uncond {uncond} out of range")
-        total = uncond + self.cond_amount + p.close_fee
+        if (uncond or p.payee_fee) and not p.min_amount <= uncond <= p.max_amount:
+            raise ChannelError("bad_amount", f"uncond {uncond} out of range [{p.min_amount}, {p.max_amount}]")
+        total = uncond + self.cond_amount + p.payer_fee
         if total > p.capacity:
             raise ChannelError("channel_exhausted", "conditional increment does not fit")
         outs = []
-        if uncond >= DUST:
-            outs.append(TxOut(uncond, bytes.fromhex(p.payee_spk)))
+        if uncond:
+            outs.append(TxOut(p.payee_value(uncond), bytes.fromhex(p.payee_spk)))
         outs.append(TxOut(self.cond_amount, self.spk))
         change = p.capacity - total
         if change >= DUST:

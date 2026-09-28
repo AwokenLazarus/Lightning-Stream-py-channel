@@ -121,10 +121,15 @@ OP_ENDIF <A> OP_CHECKSIG
 **State transaction for `cum`.** Both sides build it deterministically and never parse it from the peer:
 - version 2, locktime 0;
 - one input, the funding outpoint, sequence `0xfffffffd`;
-- output 0: `cum` → `P2WPKH(P)`;
-- output 1: `capacity − closeFeeSat − cum` → the client's payout script (`P2WPKH(A)` or `payerSpk`),
+- output 0: `cum − payeeFee` → `P2WPKH(P)`;
+- output 1: `capacity − payerFee − cum` → the client's payout script (`P2WPKH(A)` or `payerSpk`),
   omitted when below 546;
-- `546 ≤ cum ≤ capacity − closeFeeSat`.
+- `546 + payeeFee ≤ cum ≤ capacity − payerFee`.
+
+`closeFeePayer` (fixed at open, absent = `"payer"`) splits the close fee: `"payer"` gives
+`payerFee = closeFeeSat, payeeFee = 0` (the client pays, as on any plain channel); `"payee"` gives
+`payerFee = 0, payeeFee = closeFeeSat` (the server pays its own settlement; used on hub-funded routed
+channels). `cum` is always what the client has paid.
 
 The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
 
@@ -161,7 +166,8 @@ The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
 | `extra.minExpiryBlocks`, `extra.maxExpiryBlocks` | number | yes | Accepted `expiry − tip` at open, in blocks. |
 | `extra.closeMarginBlocks` | number | yes | The server stops serving and closes at `expiry − closeMarginBlocks`. |
 | `extra.minConf` | number | yes | Funding confirmations before the channel is credited. Servers MAY require more for large channels. |
-| `extra.closeFeeSat` | string | yes | Close fee, fixed for the channel's life, paid from the client's side. Clients SHOULD cap it. |
+| `extra.closeFeeSat` | string | yes | Close fee, fixed for the channel's life. Clients SHOULD cap it. |
+| `extra.closeFeePayer` | string | no | `"payer"` (default: the client's side pays the close fee) or `"payee"` (the server's output does). Clients MUST refuse other values before funding. |
 | `extra.openUrl`, `extra.closeUrl` | string | yes | Channel control endpoints, relative to the resource origin. |
 | `extra.billing` | string | yes | `"postpay"` or `"prepay"`. |
 | `extra.derivation` | string | yes | Payee-key derivation, `"v2"` (Keys). Clients MUST refuse other values before funding. |
@@ -177,10 +183,13 @@ authenticated for that channel.
 ```json
 {"x402Version":2,"network":"bip122:0000000000000050c1e5f69672f45929",
  "channel":{"txid":"<funding txid>","vout":0,"capacity":200000,"expiry":2014,
-            "payerPub":"<A>","payerSpk":"<optional payout script>","redeemScript":"<script hex>"}}
+            "payerPub":"<A>","payerSpk":"<optional payout script>","redeemScript":"<script hex>",
+            "closeFeePayer":"<optional: payer | payee>"}}
 ```
-Reply `200 {"chan":"<txid>:<vout>","expiry":2014,"maxCum":"199400","confirmations":1}`, or
-`400 {"error","detail"}`.
+Reply `200 {"chan":"<txid>:<vout>","expiry":2014,"maxCum":"199400","confirmations":1}` (a payee-pays
+open adds `"closeFeePayer":"payee","minCum":"1146"`), or `400 {"error","detail"}`. A server MUST accept
+`closeFeePayer: "payer"` and MUST refuse `"payee"` it did not offer (`invalid_xbt_channel_fee_payer`).
+A client MUST check the echoed `closeFeePayer` (absent = `"payer"`) before signing a state.
 
 `chan` is canonical: the txid in 64 lowercase hex, `:`, the output index in decimal with no leading zeros.
 
@@ -355,7 +364,8 @@ the prefix (Appendix). The mapping is one to one.
 | `invalid_xbt_channel_stale_amount` | `stale_amount` | `cum` below the stored state |
 | `invalid_xbt_channel_signature` | `bad_sig` | State signature invalid, not strict DER, or differs for the same `cum` |
 | `invalid_xbt_channel_sighash` | `bad_sighash` | Signature hash type is not `0x21` |
-| `invalid_xbt_channel_amount` | `bad_amount` | `cum` outside `[546, capacity − closeFeeSat]` |
+| `invalid_xbt_channel_amount` | `bad_amount` | `cum` outside `[minCum, maxCum]` (`[546, capacity − closeFeeSat]` under payer-pays) |
+| `invalid_xbt_channel_fee_payer` | `bad_fee_payer` | `closeFeePayer` not offered for this channel |
 | `invalid_xbt_channel_hashlock` | `bad_hashlock` | Conditional call with the wrong hash |
 | `invalid_xbt_channel_conditional_outstanding` | `conditional_outstanding` | A hash-locked increment is not folded yet |
 | `invalid_xbt_channel_insufficient_payment` | `insufficient_payment` | `cum` does not cover the billing rule |
@@ -412,6 +422,17 @@ the network, so a `payTo` reused on a test network does not derive production ch
 MUST still use a distinct `payTo` per network, since `payTo_secret` itself is one key. A hardened
 derivation would need a server-chosen key per channel and a second round trip before funding.
 
+### Who pays the close fee
+Under `closeFeePayer: "payee"` the client's output is `capacity − cum`: it depends on `cum` alone, so no
+choice of the server's, `closeFeeSat` included, can lower it, and the client's `0x21` signature (over
+every output) commits to the fee payer, so a state signed under one value does not verify under the
+other. The server's output must clear 546 after the fee, so the least state is `546 + closeFeeSat`. The
+server bumps its own close (CPFP from its output, or a `0xA3` state whose output 0 stays the client's
+`capacity − cum`). In a hash-locked state the fee comes out of the server's unconditional output, never
+the hash-lock output. A server settles once its **net** payout `cum − closeFeeSat` reaches its settle
+threshold, and refuses a payee-pays rollover below it except near its close margin, so a client cannot
+make it pay many close fees on small payouts.
+
 ### Fees and timing
 The close fee is fixed at open. A fee spike longer than the close margin can delay the close past
 `expiry`, when the client's refund can win. Mitigations: CPFP from the server's output, an optional
@@ -438,8 +459,10 @@ the v1.0 key for the same inputs, which a v1.1 server refuses), `K` and three `a
 transactions with their sighashes and signatures, a signed close and refund, three invalid signatures,
 and a full exchange (402, open, five paid requests with exact `PAYMENT-SIGNATURE` and `PAYMENT-RESPONSE`
 values, a refused replay, `/x402/supported`, a valid and an invalid `/x402/verify`, the cooperative
-close and `/x402/settle`). `check_vectors.py` recomputes them all from the reference implementation,
-under both libsecp256k1 and a pure-Python backend.
+close and `/x402/settle`), a hash-locked conditional request, and a payee-pays (`closeFeePayer`)
+channel's states, close, `0xA3` state, rollover and conditional state with its refusals and its open.
+`check_vectors.py` recomputes them all from the reference implementation, under both libsecp256k1 and
+a pure-Python backend.
 
 ## Reference Implementation
 Python (`xbt402` v1.1, stdlib plus `coincurve`/libsecp256k1): server, client SDK, ASGI middleware, httpx
@@ -512,3 +535,4 @@ The reference server does all of this.
 |---|---|---|
 | 0.1-draft | 2026-09-25 | First draft against x402 v2 (`x402-foundation/x402` `main` `4fcf836`), from xbt402 v1.0/v1.1-draft |
 | 0.2-draft | 2026-09-25 | Matches the xbt402 v1.1 reference: network in the key tweak (`extra.derivation: "v2"`), `SettlementResponse` and facilitator shapes implemented, enforceable hash-locked close, binding-name appendix |
+| 0.3-draft | 2026-09-28 | xbt402 v1.2: optional `closeFeePayer` (`"payer"` default, `"payee"`), `minCum`, `invalid_xbt_channel_fee_payer`, payee-pays vectors; wire-compatible with 0.2 |

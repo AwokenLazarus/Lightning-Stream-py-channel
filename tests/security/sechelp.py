@@ -229,10 +229,12 @@ def load(name):
 # Every port a test binds is XBT402_TEST_PORT_BASE + one of these offsets (a block of 100), so
 # parallel runs on one machine use disjoint ranges. Without the variable, a free block is picked
 # at runtime (logged to stderr).
-PORT_OFFSETS = {"m6_rpc": 0, "m6_p2p": 1, "l6": 10, "m4": 20, "m3": 30, "l13": 40, "agp020": 50,
-                "agp019_rpc": 52, "agp019_p2p": 53, "agp021_rpc": 60, "agp021_p2p": 61,
-                "agp021_hub": 62}
-PORT_BLOCK = 100
+# Every offset fits one 50-port block (AGP-023: workers get 50-port ranges). m4 binds 4 ports,
+# agp020 2; the regtest demo (scripts/demo_route.sh) uses base + 1/2 and 10..14, so run it alone.
+PORT_OFFSETS = {"m6_rpc": 0, "m6_p2p": 1, "agp020": 2, "agp019_rpc": 4, "agp019_p2p": 5, "l6": 10,
+                "agp021_rpc": 12, "agp021_p2p": 13, "agp021_hub": 14, "agp023_rpc": 15, "agp023_p2p": 16,
+                "m4": 20, "m3": 30, "l13": 40}
+PORT_BLOCK = 50
 _port_base = []
 
 

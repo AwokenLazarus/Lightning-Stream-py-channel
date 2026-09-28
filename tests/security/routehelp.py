@@ -142,7 +142,7 @@ def route_request(pay, sh, *, tamper=None):
     inv = dict(sh.invoice)
     d = max(1, sh.due_sat())
     f, _ = fee_due(pay.quote, d, pay.fee_units, pay.fee_paid)
-    cum = next_cum(pay.routed, d + f)
+    cum = next_cum(pay.routed, d + f, pay.ch.payer.params.min_amount)
     sa = pay.signer.sign_state_adaptor(pay.chan, cum, inv["point"])
     route = {"provider": sh.origin, "payTo": sh.pay_to, "network": NET, "amount": d, "point": inv["point"],
              "fee": f, "feeQuote": asdict(pay.quote), "invoice": inv, "session": sh.session, "lockId": inv["lockId"],

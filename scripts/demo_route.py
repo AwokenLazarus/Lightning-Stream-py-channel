@@ -1,13 +1,17 @@
 """AGP-021 demo: xbt402 hub routing on regtest (scripts/demo_route.sh runs this on its own node).
+AGP-023: every ch2 is payee-pays (xbt402 v1.2 closeFeePayer), so each provider pays its own settlement
+close fee, D's threshold counts that fee (net payout >= 2x the fee), and every ch2 close and rollover is
+checked to pay the provider its state less its own fee, and the hub its whole remainder.
 
-1 client (B2 wallet signer when ~/xbt-rnd/b2-agp-021 is there, else B1's ChannelSigner), 1 hub,
+1 client (B2 wallet signer when ~/xbt-rnd/b2-agp-023 is there, else B1's ChannelSigner), 1 hub,
 4 providers. Operator 1 runs providers A and B under ONE payTo key; C and D are separate operators.
 The client has ONE channel (to the hub); the hub funds one channel to each provider itself.
 
   phase 1 (~10 s): the client streams chunks to all 4 providers at >= 12 calls/s each; per-window
                    adaptor locks pay each provider's accrued amount through the hub. A and B are
-                   priced below a sat per call (amsat metering, carry at each hop). D settles at 2x
-                   its close fee, so the hub rolls D's channel over (one tx pays D and funds the next).
+                   priced below a sat per call (amsat metering, carry at each hop). D settles once its
+                   net payout is 2x its own close fee, so the hub rolls D's channel over (one tx pays D
+                   less D's fee and funds the next channel with all the rest).
                    At 5 s provider C stops revealing: the hub writes the lock off after its reveal
                    timeout, stops routing to C, and neither channel pays the lock.
   phase 2 (~2 s):  the hub withholds receipts (keeps t + r): the client takes its receipts from the
@@ -38,7 +42,7 @@ from xbt402.route import AMSAT_PER_SAT, ceil_div  # noqa: E402
 from xbt402.route_client import RoutePayer  # noqa: E402
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.tx import Tx  # noqa: E402
-from xbt402.x402_channel import XbtChannelProvider, network_id  # noqa: E402
+from xbt402.x402_channel import XbtChannelProvider, network_id, unb64json  # noqa: E402
 
 SAT = 100_000_000
 PB = int(os.environ.get("XBT402_TEST_PORT_BASE", "34800"))
@@ -96,8 +100,8 @@ class Chain:
 
 
 def make_signer(chain):
-    """The client's signer: B2's policy-checked RouteSigner if b2-agp-021 is next to us."""
-    b2 = os.environ.get("B2_ROOT", os.path.expanduser("~/xbt-rnd/b2-agp-021"))
+    """The client's signer: B2's policy-checked RouteSigner if b2-agp-023 is next to us."""
+    b2 = os.environ.get("B2_ROOT", os.path.expanduser("~/xbt-rnd/b2-agp-023"))
     if os.path.exists(os.path.join(b2, "agentwallet", "routing.py")) and os.environ.get("DEMO_SIGNER", "b2") == "b2":
         os.environ["B1_ROOT"] = ROOT
         sys.path.insert(1, b2)
@@ -157,6 +161,14 @@ def main():
     hub.watch_tick()
     opened = [n for n in "ABCD" if hub.out.chans[urls[n]].state == "open"]
     check("hub-funded ch2 open to all 4 providers", len(opened) == 4, ",".join(opened))
+    _, h402, _ = hub.serve("GET", "/x402/route", {}, b"", f"http://127.0.0.1:{HUB_PORT}/x402/route")
+    routing = unb64json(h402["PAYMENT-REQUIRED"])["accepts"][0]["extra"]["routing"]
+    payers = {n: hub.out.chans[urls[n]].p().close_fee_payer for n in "ABCD"}
+    check("v1.2: the hub advertises payee-pays ch2 (ch1 payer-pays) and every ch2 is payee-pays",
+          (routing.get("ch1CloseFeePayer"), routing.get("ch2CloseFeePayer")) == ("payer", "payee")
+          and set(payers.values()) == {"payee"},
+          f"extra.routing ch1 {routing.get('ch1CloseFeePayer')}, ch2 {routing.get('ch2CloseFeePayer')}; "
+          f"ch2 minCum {hub.out.chans[urls['A']].p().min_amount}")
 
     signer, signer_name = make_signer(chain)
     payer = RoutePayer(hub_url, NET, chain.rpc.getblockcount, fund=chain.fund, signer=signer,
@@ -245,13 +257,16 @@ def main():
 
     ev = hub.events
     rolls = [e for e in ev if e["event"] == "ch2_rollover"]
-    check("hub rolled D's channel over at D's threshold (2x close fee)", len(rolls) >= 1,
-          f"{len(rolls)} rollover(s), amounts {[r['amount'] for r in rolls]}")
+    fee_d = hub.out.chans[urls["D"]].p().close_fee
+    check("hub rolled D's channel over at D's threshold (net payout >= 2x its own close fee)",
+          len(rolls) >= 1 and all(r["amount"] - fee_d >= 2 * fee_d for r in rolls),
+          f"{len(rolls)} rollover(s), amounts {[r['amount'] for r in rolls]}, nets {[r['amount'] - fee_d for r in rolls]}")
     for r in rolls:
-        confs, paid = chain.payee_out(r["txid"], next(a["params"]["payee_spk"] for a in hub.out.archived
-                                                      if a.get("rolled_to") == f"{r['txid']}:1"))
-        check(f"rollover {r['txid'][:12]}... confirmed and pays D exactly {r['amount']}",
-              confs >= 1 and paid == r["amount"], f"{confs} conf, payee output {paid}")
+        old = next(a for a in hub.out.archived if a.get("rolled_to") == f"{r['txid']}:1")
+        confs, paid = chain.payee_out(r["txid"], old["params"]["payee_spk"])
+        check(f"rollover {r['txid'][:12]}... confirmed, pays D {r['amount']} less D's fee, the hub keeps the rest",
+              confs >= 1 and paid == r["amount"] - fee_d and r["nextCapacity"] == old["params"]["capacity"] - r["amount"],
+              f"{confs} conf, payee output {paid}, next ch2 {r['nextCapacity']} = {old['params']['capacity']} - {r['amount']}")
 
     voids = [e for e in ev if e["event"] == "void" and e["provider"] == urls["C"]]
     oc_c = hub.out.chans[urls["C"]]
@@ -325,7 +340,7 @@ def main():
     check("client and hub agree on ch1", payer.routed == int((st1.extra or {}).get("routed_sat", 0))
           and payer.fee_paid == int((st1.extra or {}).get("fee_paid", 0)),
           f"routed {payer.routed}, fees {payer.fee_paid}")
-    total_d = onchain = 0
+    total_d = onchain = fees_paid = 0
     for n, c in list(closes.items()):
         if c.get("event") == "ch2_idle":
             print(f"   ch2 {n}: {c['chan'][:16]}... has no state yet (opened by a rollover): nothing to close")
@@ -334,13 +349,18 @@ def main():
         st2 = next(s for s in provs[n][0].ledger.channels.values() if s.closed_txid == c["txid"])
         confs, paid = chain.payee_out(c["txid"], st2.params.payee_spk)
         routed = int(st2.extra.get("routed_sat", 0))
+        fee2 = st2.params.close_fee
         total_d += routed
         onchain += paid
-        check(f"ch2 {n} close confirmed, pays the provider its best state", confs >= 1 and paid == st2.best_cum,
-              f"{paid} sat, routed on this channel {routed}"
-              + (f", {paid - routed} of it the hub's dust-floor prepay" if paid > routed else ""))
+        fees_paid += fee2
+        _, change = chain.payee_out(c["txid"], st2.params.payer_spk)
+        check(f"ch2 {n} close confirmed, pays the provider its best state less its own close fee",
+              confs >= 1 and paid == st2.best_cum - fee2 and change == st2.params.capacity - st2.best_cum,
+              f"{paid} = {st2.best_cum} - {fee2} sat, hub change {change}, routed on this channel {routed}"
+              + (f", {st2.best_cum - routed} of the state the hub's floor prepay" if st2.best_cum > routed else ""))
     for r in rolls:
-        onchain += r["amount"]
+        onchain += r["amount"] - fee_d
+        fees_paid += fee_d
         total_d += r["amount"]
     lock_ms = [x for s in shards.values() for x in s.lock_ms]
     call_ms = [x for s in shards.values() for x in s.call_ms]
@@ -366,9 +386,11 @@ def main():
     print(f"   locks: {payer.stats['locks']} settled ({payer.stats['floor_locks']} under the dust floor, "
           f"{payer.stats['via_provider']} receipts via the provider), {payer.stats['voided']} voided")
     print(f"   client paid {payer.routed} sat through the hub ({payer.fee_paid} sat routing fees); providers were "
-          f"routed {total_d} sat and received {onchain} sat on-chain (closes + rollovers; the difference is the "
-          f"hub's one-off 546-sat dust floor on channels that routed less than that)")
+          f"routed {total_d} sat and received {onchain} sat on-chain after paying their own {fees_paid} sat of close "
+          f"fees (closes + rollovers; states above the routed total are the hub's one-off floor prepay, "
+          f"dust + closeFee = 1,146 sat, on channels that routed less than that)")
     report["onchain_to_providers_sat"], report["routed_to_providers_sat"] = onchain, total_d
+    report["provider_close_fees_sat"] = fees_paid
     ok = all(c["ok"] for c in CHECKS)
     with open(os.path.join(RUN, "demo_route_report.json"), "w") as f:
         json.dump(report, f, indent=1, default=str)

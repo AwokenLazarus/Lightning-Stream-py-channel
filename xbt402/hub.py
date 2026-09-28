@@ -26,8 +26,14 @@ The watcher (`watch_tick`): posts the opens of hub-funded ch2s once confirmed; r
 ch2 lock until `revealTimeoutSec`, then writes it off and stops routing to that provider; reads t
 off any ch2 close that spends a funding with a pending or written-off lock and completes the ch1
 lock with t + r; rolls ch2 over (one tx pays the provider and funds the next ch2) once the provider's
-balance reaches its settleMultiple x closeFee or ch2 nears expiry, never while a lock is pending;
+net payout reaches its settleMultiple x closeFee or ch2 nears expiry, never while a lock is pending;
 and closes ch1s at their margin.
+
+Close fees (xbt402 v1.2 closeFeePayer, AGP-023): ch2 is payee-pays by default (Mike, 2026-09-28): the
+provider pays its own settlement's close fee out of its output, so the hub's fees price only liquidity
+and routing, and the settle threshold counts the provider's net payout. ch1 stays payer-pays (the
+client pays, as on any plain channel) unless the operator configures otherwise. extra.routing
+advertises both.
 """
 import json
 import os
@@ -39,7 +45,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
 from . import adaptor, ecc
-from .channel import (DUST, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, canonical_chan)
+from .channel import (FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, canonical_chan, settle_due)
 from .funding import FundingPolicy
 from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, fee_due,
                     find_spend, hub_channel_message, next_cum, route_ok)
@@ -111,8 +117,10 @@ class HubConfig:
     "ppm_min", "ppm_max"} scales feePpm with the share of liquidity_cap_sat already committed to ch2s
     (a library user may pass any callable(hub) -> (base_msat, ppm) instead). liquidity_cap_sat bounds
     the hub's own coins in hub-funded ch2s (0: no cap); rollovers reuse a channel's coins and add none.
-    Who pays a ch2 settlement's close fee is the channel's closeFeeSat terms, taken from the provider's
-    /terms; nothing here assumes the hub pays it (AGP-023 moves it to the payee on routed channels)."""
+    ch2_close_fee_payer: "payee" (default, v1.2): the hub opens ch2s only to providers whose /terms offer
+    payee-pays, and each provider pays its own ch2 settlement fee; "payer": the hub pays ch2 closes
+    (v1.1 providers) and should price them into its fees. ch1_close_fee_payer: ch1's terms (default
+    "payer": the client pays its own channel's close, as on any plain channel)."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -125,6 +133,8 @@ class HubConfig:
     ch2_expiry_blocks: int = 1_100
     liquidity_cap_sat: int = 0
     close_fee: int = 600                 # ch1 terms (the hub is ch1's payee)
+    ch1_close_fee_payer: str = "payer"
+    ch2_close_fee_payer: str = "payee"
     close_margin: int = 144
     rollover_margin: int = 36
     hrp: str = "bcrt"
@@ -136,6 +146,10 @@ class HubConfig:
         if unknown:
             raise ValueError(f"unknown hub config keys: {sorted(unknown)}")
         return cls(**d)
+
+    def __post_init__(self):
+        if self.ch1_close_fee_payer not in FEE_PAYERS or self.ch2_close_fee_payer not in FEE_PAYERS:
+            raise ValueError("ch1_close_fee_payer / ch2_close_fee_payer are payer or payee")
 
     def funding_policy(self) -> FundingPolicy:
         return FundingPolicy(**{"close_margin": self.close_margin, **self.policy})
@@ -160,7 +174,7 @@ class RouteHub:
         self.inbound = XbtChannelProvider(
             rpc, pay_to_secret, network, os.path.join(datadir, "ch1.sqlite"), price=lambda m, p: 0,
             handler=lambda m, p, b: (404, {}, b"not found"), close_fee=cfg.close_fee, close_margin=cfg.close_margin,
-            policy=policy or cfg.funding_policy())
+            policy=policy or cfg.funding_policy(), close_fee_payer=cfg.ch1_close_fee_payer)
         self.out = OutBook(os.path.join(datadir, "ch2.json"))
         self.fee_base_msat, self.fee_ppm, self.quote_ttl = cfg.fee_base_msat, cfg.fee_ppm, cfg.quote_ttl
         self.max_lock_sat, self.max_unguarded_lock_sat, self.delta = cfg.max_lock_sat, cfg.max_unguarded_lock_sat, cfg.delta
@@ -209,6 +223,10 @@ class RouteHub:
         return {"feeBaseMsat": q.feeBaseMsat, "feePpm": q.feePpm, "maxLockSat": q.maxLockSat,
                 "maxUnguardedLockSat": q.maxUnguardedLockSat, "minInExpiryDelta": q.minInExpiryDelta,
                 "revealTimeoutSec": q.revealTimeoutSec, "routeUrl": HUB_ROUTE_PATH, "quote": asdict(q),
+                # v1.2: who pays each hop's settlement close fee. ch2 payee-pays means the providers pay
+                # their own closes, so feePpm prices only liquidity and routing
+                "ch1CloseFeePayer": self.config.ch1_close_fee_payer,
+                "ch2CloseFeePayer": self.config.ch2_close_fee_payer,
                 "providers": sorted(o for o, c in self.out.chans.items() if c.state == "open" and not c.blocked)}
 
     def body_limit(self, path: str, max_body: int = None) -> int:
@@ -280,7 +298,7 @@ class RouteHub:
             ex1 = st1.extra or {}
             routed1 = int(ex1.get("routed_sat", 0))
             cum = int(pl.get("cum", -1))
-            need1 = next_cum(routed1, d + f)
+            need1 = next_cum(routed1, d + f, st1.params.min_amount)
             if d < 1 or f < 0 or d > self.max_lock_sat:
                 return self._err("bad_amount", f"lock amount must be in [1, {self.max_lock_sat}]")
             floor1 = need1 <= st1.best_cum
@@ -360,7 +378,7 @@ class RouteHub:
         if self.withhold == "all":                    # test hook: a hub that takes locks and forwards none
             return self._err("route_pending", "hub withholding (test)", status=504)
         p2 = oc.p()
-        need2 = next_cum(oc.routed, d)
+        need2 = next_cum(oc.routed, d, p2.min_amount)
         T = adaptor.dec(lock1["T"])
         pre2 = None
         if need2 > oc.signed:
@@ -522,6 +540,10 @@ class RouteHub:
             raise ChannelError("provider_error", f"terms: HTTP {st}")
         terms = json.loads(raw)
         ex = terms["extra"]
+        offered = ex.get("closeFeePayer", "payer")
+        if self.config.ch2_close_fee_payer == "payee" and offered != "payee":
+            raise ChannelError("bad_fee_payer", f"{origin} does not offer payee-pays routed channels "
+                                                f"(closeFeePayer {offered!r}); set ch2_close_fee_payer payer to fund it")
         cap = max(capacity or self.ch2_capacity, int(ex["minCapacity"]))
         blocks = min(max(expiry_blocks or self.ch2_expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
                      int(ex["maxExpiryBlocks"]) - 1)
@@ -536,7 +558,8 @@ class RouteHub:
                                                     f"{self.liquidity_cap_sat}")
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
-        p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), network=self.network)
+        p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), network=self.network,
+                                 close_fee_payer=self.config.ch2_close_fee_payer)
         if funding is None:
             txid, vout = self.fund(segwit_address(self.hrp, p.spk), cap)
         else:
@@ -559,11 +582,22 @@ class RouteHub:
         body = {"x402Version": 2, "network": self.network,
                 "channel": {"txid": p.funding_txid, "vout": p.funding_vout, "capacity": p.capacity,
                             "expiry": p.expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
-                            "redeemScript": p.script.hex()},
+                            "redeemScript": p.script.hex(),
+                            **({"closeFeePayer": p.close_fee_payer} if p.close_fee_payer != "payer" else {})},
                 "hub": {"payTo": self.pay_to, "sig": ecc.sign(self.secret, hub_channel_message(p.channel_id)).hex()}}
         st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["openUrl"], json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
         if st != 200:
+            return False
+        try:
+            echoed = json.loads(raw).get("closeFeePayer", "payer")
+        except (ValueError, AttributeError):
+            echoed = None
+        if echoed != p.close_fee_payer:
+            # every state we would sign would fail at the provider: never route over this channel
+            with self.out.lock:
+                oc.blocked = f"the provider opened ch2 with closeFeePayer {echoed!r}"
+                self.out.save()
             return False
         with self.out.lock:
             oc.state = "open"
@@ -575,16 +609,17 @@ class RouteHub:
         """One tx pays the provider its balance and funds the next ch2 (rollover instead of close)."""
         p = oc.p()
         amount = oc.signed
-        next_cap = p.capacity - p.close_fee - amount
+        next_cap = p.rollover_next_capacity(amount)      # payee-pays: capacity - amount, the fee is the provider's
         min_cap = int(oc.terms["extra"]["minCapacity"])
         tip = self.rpc.getblockcount()
         ex = oc.terms["extra"]
         expiry = tip + min(max(self.ch2_expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
-        if next_cap < max(min_cap, DUST):
+        if next_cap < max(min_cap, p.min_amount):
             return self.close_ch2(oc, refill=True)
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
-        nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, network=self.network)
+        nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, network=self.network,
+                                   close_fee_payer=p.close_fee_payer)
         tx = p.rollover_tx(amount, nxt.spk, next_cap)
         sig = ecc.sign(int(oc.secret, 16), p.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])
         req = {"chan": p.channel_id, "amount": amount, "sig": sig.hex(),
@@ -702,10 +737,15 @@ class RouteHub:
                                block="the provider did not reveal a lock in time")
                     out.append({"event": "lock_written_off", "provider": oc.origin})
             return out
-        # settlement: >= settleMultiple x closeFee, or near ch2 expiry: roll over
-        due = oc.signed >= oc.settle_multiple * p.close_fee
-        near = tip >= p.expiry - self.close_margin - self.rollover_margin
-        if (due or near) and oc.signed >= DUST and not oc.pending:
+        # settlement: the provider's net payout >= its settleMultiple x closeFee (on a payee-pays ch2 the
+        # close fee is the provider's, so it counts against the payout), or near ch2's close margin as
+        # the provider counts it (it co-signs only then): roll over
+        ex = oc.terms.get("extra", {})
+        due = settle_due(p, oc.signed, oc.settle_multiple)
+        margin = int(ex.get("closeMarginBlocks", self.close_margin))
+        grace = min(self.rollover_margin, int(ex.get("rolloverGraceBlocks", self.rollover_margin)))
+        near = tip >= p.expiry - margin - grace
+        if (due or near) and oc.signed >= p.min_amount and not oc.pending:
             out.append(self.rollover(oc))
         return out
 

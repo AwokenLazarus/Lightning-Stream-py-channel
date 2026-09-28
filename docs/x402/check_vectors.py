@@ -14,7 +14,13 @@ PAYMENT-RESPONSE is a SettlementResponse whose receipt verifies under P, a repla
 refused with `bad_auth`, and for the hash-locked conditional call: H = sha256(k), the ciphertext is
 the plaintext XOR the sha256(k || BE32(i)) keystream and is in the 402 before the payer signs, the
 hash-lock script and P2WSH output are laid out as the spec says, the conditional state's payer
-signature verifies, the provider's close carries that state, and its claim reveals k in the witness. Exits 0 when everything matches, 1 on any mismatch.
+signature verifies, the provider's close carries that state, and its claim reveals k in the witness;
+and for v1.2 payee-pays channels (closeFeePayer "payee"): every state pays the payee cum - closeFee and
+the payer capacity - cum, the v1.1 signature for the same cum does not verify (the payer's signature
+commits to who pays), the least state is dust + closeFee, the 0xA3 output 0 and the rollover's next
+channel are the payer's whole remainder, the conditional state's fee comes out of the payee's
+unconditional output, and a provider's /terms and hub-bound open carry closeFeePayer. Exits 0 when
+everything matches, 1 on any mismatch.
 Run it under both crypto backends: the project venv (libsecp256k1 via coincurve) and a Python without
 coincurve (the pure-Python fallback); the output names the backend.
 
@@ -32,9 +38,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from xbt402 import ecc  # noqa: E402
-from xbt402.channel import (DERIVATION, PAYEE_TAG, ChannelError, ChannelParams, Payee, Payer,  # noqa: E402
-                            _payee_tweak, channel_auth_key, channel_payee_pub, channel_payee_secret,
-                            payee_tweak_preimage)
+from xbt402.channel import (DERIVATION, DUST, PAYEE_TAG, SIGHASH_SINGLE_ACP_UNIFIED, ChannelError,  # noqa: E402
+                            ChannelParams, Payee, Payer, _payee_tweak, channel_auth_key, channel_payee_pub,
+                            channel_payee_secret, payee_tweak_preimage)
 from xbt402.conditional import ConditionalParams, decrypt, preimage_from_tx  # noqa: E402
 from xbt402.tx import SIGHASH_ALL, SIGHASH_ALL_UNIFIED, Tx, segwit_address, sha256, tagged_hash  # noqa: E402
 from xbt402.x402_channel import (FACILITATOR_SETTLE, FACILITATOR_SUPPORTED, FACILITATOR_VERIFY,  # noqa: E402
@@ -62,8 +68,10 @@ def _pub(secret: int) -> str:
     return ecc.pubkey(secret).hex()
 
 
-def _params(payer_secret: int, expiry: int = EXPIRY, capacity: int = CAPACITY, vout: int = 0) -> ChannelParams:
-    p = ChannelParams.derive(_pub(PAYTO_SECRET), _pub(payer_secret), expiry, CLOSE_FEE, network=NETWORK)
+def _params(payer_secret: int, expiry: int = EXPIRY, capacity: int = CAPACITY, vout: int = 0,
+            close_fee_payer: str = "payer") -> ChannelParams:
+    p = ChannelParams.derive(_pub(PAYTO_SECRET), _pub(payer_secret), expiry, CLOSE_FEE, network=NETWORK,
+                             close_fee_payer=close_fee_payer)
     p.funding_txid, p.funding_vout, p.capacity = FUNDING_TXID, vout, capacity
     return p
 
@@ -335,15 +343,79 @@ def gen_conditional():
             "steps": steps}
 
 
+# --- 6. v1.2 payee-pays (closeFeePayer "payee") -----------------------------------------------------
+HUB_SECRET = int.from_bytes(sha256(b"xbt402 test vector: hub payTo secret"), "big") % ecc.N
+
+
+def gen_payee_pays():
+    """A payee-pays channel (v1.2, the default for hub-funded routed channels): states, close, the
+    0xA3 fee-input state, a rollover, a conditional state, what does not verify, and the provider's
+    /terms plus a hub-bound open that carries closeFeePayer."""
+    from xbt402.route import hub_channel_message
+    a = PAYER_SECRETS[2]
+    p = _params(a, close_fee_payer="payee")
+    payee_secret = channel_payee_secret(NETWORK, PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
+    out = {"payerSecret": "%064x" % a, "payeeSecret": "%064x" % payee_secret, "params": p.to_dict(),
+           "chan": p.channel_id, "minCum": p.min_amount, "maxCum": p.max_amount, "states": []}
+    for cum in (p.min_amount, 150_000, p.capacity - DUST, p.capacity - DUST + 1, p.capacity):
+        tx = p.state_tx(cum)
+        sig = Payer(p, a).sign_state(cum)
+        out["states"].append({"cum": cum, "unsignedTx": tx.hex(),
+                              "outputs": [[o.value, o.script_pubkey.hex()] for o in tx.outputs],
+                              "sighash": p.sighash(tx).hex(), "payerSig": sig.hex()})
+    payee = Payee(p, payee_secret)
+    payee.accept(150_000, bytes.fromhex(out["states"][1]["payerSig"]))
+    close = payee.close_tx()
+    out["closeTx"] = {"cum": 150_000, "hex": close.hex(), "txid": close.txid()}
+    a3 = p.state_tx_a3(150_000)
+    out["a3State"] = {"cum": 150_000, "unsignedTx": a3.hex(), "sighash": p.sighash_a3(a3).hex(),
+                      "payerSig": Payer(p, a).sign_state_a3(150_000).hex()}
+    nxt = ChannelParams.derive(_pub(PAYTO_SECRET), _pub(a), EXPIRY + 1_000, CLOSE_FEE, network=NETWORK,
+                               close_fee_payer="payee")
+    cap2 = p.rollover_next_capacity(150_000)
+    roll = p.rollover_tx(150_000, nxt.spk, cap2)
+    out["rollover"] = {"amount": 150_000, "nextExpiry": nxt.expiry, "nextSpk": nxt.spk.hex(), "nextCapacity": cap2,
+                       "unsignedTx": roll.hex(), "sighash": p.sighash(roll).hex(),
+                       "payerSig": (ecc.sign(a, p.sighash(roll)) + bytes([SIGHASH_ALL_UNIFIED])).hex()}
+    cp = ConditionalParams(p, sha256(COND_K), COND_PRICE, 10)
+    ctx = cp.state_tx(p.min_amount)
+    out["conditional"] = {"H": cp.h.hex(), "condAmount": COND_PRICE, "csvDelta": 10, "uncond": p.min_amount,
+                          "hashlockSpk": cp.spk.hex(), "unsignedTx": ctx.hex(), "sighash": cp.sighash(ctx).hex(),
+                          "payerSig": (ecc.sign(a, cp.sighash(ctx)) + bytes([SIGHASH_ALL_UNIFIED])).hex()}
+    v11 = Payer(_params(a), a).sign_state(150_000)                 # the same cum, signed as payer-pays
+    out["invalid"] = [
+        {"why": "a payer-pays (v1.1) signature for the same cum: the signature commits to who pays the fee",
+         "cum": 150_000, "payerSig": v11.hex(), "error": "bad_sig"},
+        {"why": "below the least state: the payee output would be dust after its close fee",
+         "cum": p.min_amount - 1, "payerSig": out["states"][0]["payerSig"], "error": "bad_amount"},
+    ]
+    node = StubNode(p)
+    with tempfile.TemporaryDirectory() as d:
+        prov = XbtChannelProvider(node, PAYTO_SECRET, NETWORK, os.path.join(d, "ledger.sqlite"),
+                                  lambda m, path: PRICE, lambda m, path, b: (200, {}, b"{}"), close_fee=CLOSE_FEE)
+        terms = prov.terms()
+        req = {"x402Version": 2, "network": NETWORK, "channel": {
+            "txid": p.funding_txid, "vout": p.funding_vout, "capacity": p.capacity, "expiry": p.expiry,
+            "payerPub": p.payer_pub, "payerSpk": p.payer_spk, "redeemScript": p.script.hex(), "closeFeePayer": "payee"},
+            "hub": {"payTo": _pub(HUB_SECRET), "sig": ecc.sign(HUB_SECRET, hub_channel_message(p.channel_id)).hex()}}
+        status, _, resp = prov.serve("POST", terms["extra"]["openUrl"], {}, json.dumps(req).encode())
+    out["terms"] = terms
+    out["open"] = {"request": req, "status": status, "response": json.loads(resp)}
+    return out
+
+
 def generate():
     return {
         "title": "x402 xbt-channel test vectors",
-        "version": "1.1-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes)" % DERIVATION,
-        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.1",
+        "version": "1.2-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes, "
+                   "closeFeePayer)" % DERIVATION,
+        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",
                   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
                   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
-                  "Fields starting with '_' are cross-checks, not wire values."],
+                  "Fields starting with '_' are cross-checks, not wire values.",
+                  "Sections derivation..conditional are v1.1 and unchanged in v1.2 (payer-pays, closeFeePayer "
+                  "absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format."],
         "constants": {"network": NETWORK, "dust": 546, "closeFeeSat": CLOSE_FEE, "capacity": CAPACITY,
                       "sighashAllUnified": SIGHASH_ALL_UNIFIED,
                       "derivation": DERIVATION,
@@ -354,6 +426,7 @@ def generate():
         "state": gen_states(),
         "roundtrip": gen_roundtrip(),
         "conditional": gen_conditional(),
+        "payeePays": gen_payee_pays(),
     }
 
 
@@ -426,6 +499,74 @@ def independent_checks(v) -> list:
                             close_message(s["request"]["chan"]), bytes.fromhex(s["request"]["sig"])),
                  "close: request signature does not verify")
     errs += conditional_checks(v)
+    errs += payee_pays_checks(v)
+    return errs
+
+
+def payee_pays_checks(v) -> list:
+    """The v1.2 section, recomputed from its own fields: output values against the formula, the
+    payer's signatures, the v1.1 signature refused, the least state, 0xA3, rollover, conditional."""
+    errs = []
+
+    def need(ok, what):
+        if not ok:
+            errs.append("payeePays: " + what)
+    pp = v.get("payeePays")
+    if not pp:
+        return ["payeePays: section missing"]
+    p = ChannelParams(**pp["params"])
+    cap, fee = p.capacity, p.close_fee
+    need(p.close_fee_payer == "payee" and pp["params"].get("close_fee_payer") == "payee", "params are not payee-pays")
+    need(pp["minCum"] == DUST + fee and pp["maxCum"] == cap, "least state != dust + closeFee or most != capacity")
+    A = bytes.fromhex(p.payer_pub)
+    for s in pp["states"]:
+        want = [[s["cum"] - fee, p.payee_spk]] + ([[cap - s["cum"], p.payer_spk]] if cap - s["cum"] >= DUST else [])
+        need(s["outputs"] == want, f"state {s['cum']}: outputs are not [cum - closeFee to P, capacity - cum to A]")
+        tx = Tx.parse(bytes.fromhex(s["unsignedTx"]))
+        need([[o.value, o.script_pubkey.hex()] for o in tx.outputs] == want, f"state {s['cum']}: tx outputs")
+        sig = bytes.fromhex(s["payerSig"])
+        need(sig[-1] == SIGHASH_ALL_UNIFIED and ecc.verify(A, bytes.fromhex(s["sighash"]), sig[:-1]),
+             f"state {s['cum']}: payer signature does not verify")
+    payee = Payee(p, int(pp["payeeSecret"], 16))
+    for bad in pp["invalid"]:
+        try:
+            payee.verify_state(bad["cum"], bytes.fromhex(bad["payerSig"]))
+            errs.append(f"payeePays: invalid state accepted: {bad['why']}")
+        except ChannelError as e:
+            need(e.code == bad["error"], f"invalid {bad['why']}: got {e.code}, want {bad['error']}")
+    v11 = next(b for b in pp["invalid"] if b["error"] == "bad_sig")
+    s150 = next(s for s in pp["states"] if s["cum"] == 150_000)
+    need(not ecc.verify(A, bytes.fromhex(s150["sighash"]), bytes.fromhex(v11["payerSig"])[:-1]),
+         "a v1.1 signature verifies over the payee-pays state")
+    close = Tx.parse(bytes.fromhex(pp["closeTx"]["hex"]))
+    need([o.value for o in close.outputs] == [150_000 - fee, cap - 150_000]
+         and close.inputs[0].witness[0].hex() == s150["payerSig"], "close: not the signed 150,000 state")
+    a3 = Tx.parse(bytes.fromhex(pp["a3State"]["unsignedTx"]))
+    sig = bytes.fromhex(pp["a3State"]["payerSig"])
+    need((a3.outputs[0].value, a3.outputs[0].script_pubkey.hex()) == (cap - 150_000, p.payer_spk)
+         and a3.outputs[1].value == 150_000 - fee and sig[-1] == SIGHASH_SINGLE_ACP_UNIFIED
+         and ecc.verify(A, bytes.fromhex(pp["a3State"]["sighash"]), sig[:-1]),
+         "a3: output 0 is not the payer's capacity - cum under a 0xA3 signature")
+    r = pp["rollover"]
+    rt = Tx.parse(bytes.fromhex(r["unsignedTx"]))
+    need([(o.value, o.script_pubkey.hex()) for o in rt.outputs]
+         == [(r["amount"] - fee, p.payee_spk), (cap - r["amount"], r["nextSpk"])] and r["nextCapacity"] == cap - r["amount"],
+         "rollover: not [amount - closeFee to P, capacity - amount to the next channel]")
+    need(ecc.verify(A, bytes.fromhex(r["sighash"]), bytes.fromhex(r["payerSig"])[:-1]), "rollover: payer signature")
+    c = pp["conditional"]
+    ct = Tx.parse(bytes.fromhex(c["unsignedTx"]))
+    need([(o.value, o.script_pubkey.hex()) for o in ct.outputs]
+         == [(c["uncond"] - fee, p.payee_spk), (c["condAmount"], c["hashlockSpk"]),
+             (cap - c["uncond"] - c["condAmount"], p.payer_spk)] and c["uncond"] >= DUST + fee,
+         "conditional: the fee is not out of the payee's unconditional output")
+    need(ecc.verify(A, bytes.fromhex(c["sighash"]), bytes.fromhex(c["payerSig"])[:-1]), "conditional: payer signature")
+    t = pp["terms"]["extra"]
+    need(t.get("closeFeePayer") == "payee" and "settleMultiple" in t, "terms: no closeFeePayer payee / settleMultiple")
+    o = pp["open"]
+    need(o["status"] == 200 and o["response"].get("closeFeePayer") == "payee"
+         and o["response"].get("minCum") == str(DUST + fee) and o["response"]["chan"] == p.channel_id
+         and o["request"]["channel"]["closeFeePayer"] == "payee",
+         "open: a hub-bound payee-pays open must echo closeFeePayer and minCum")
     return errs
 
 
@@ -524,7 +665,8 @@ def main() -> int:
     errs = diff(want, got) + independent_checks(want)
     n = (len(want["derivation"]) + len(want["auth"]["cases"]) + len(want["state"]["states"])
          + len(want["state"]["invalid"]) + 2 + len(want["roundtrip"]["steps"])
-         + 1 + len(want.get("conditional", {}).get("steps", [])))
+         + 1 + len(want.get("conditional", {}).get("steps", []))
+         + len(want.get("payeePays", {}).get("states", [])) + len(want.get("payeePays", {}).get("invalid", [])) + 6)
     for e in errs:
         print("MISMATCH", e)
     print(f"{'FAIL' if errs else 'OK'}: {n} vectors, backend {ecc.BACKEND}, {len(errs)} mismatches")

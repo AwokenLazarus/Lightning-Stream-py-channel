@@ -28,6 +28,7 @@ DUST = 546            # conservative dust floor for any output we create
 STATE_VSIZE = 190     # 1-in/2-out close: ~113 B base + ~229 B witness -> ~171 vB, plus room for a P2TR change
 REFUND_VSIZE = 140    # 1-in/1-out refund
 EXPIRY_MAX = 500_000_000  # below this nLockTime/CLTV is a block height
+FEE_PAYERS = ("payer", "payee")   # who pays a state's close fee (v1.2 closeFeePayer; v1.1 is "payer")
 
 
 class ChannelError(ValueError):
@@ -124,10 +125,17 @@ class ChannelParams:
     expiry: int         # absolute block height
     payer_spk: str      # hex scriptPubKey of the payer's change
     payee_spk: str      # hex scriptPubKey of the payee's earnings
-    close_fee: int      # sats, fixed at open (x402 extra.closeFeeSat); the payer pays it
+    close_fee: int      # sats, fixed at open (x402 extra.closeFeeSat)
     funding_txid: str = ""
     funding_vout: int = 0
     capacity: int = 0   # sats in the funding output
+    close_fee_payer: str = "payer"   # v1.2: who pays close_fee out of its output, fixed at open
+
+    def __post_init__(self):
+        if self.close_fee_payer not in FEE_PAYERS:
+            raise ChannelError("bad_fee_payer", "closeFeePayer must be payer or payee")
+        if int(self.close_fee) < 0:
+            raise ChannelError("bad_amount", "close fee must be >= 0")
 
     @property
     def script(self) -> bytes:
@@ -143,20 +151,49 @@ class ChannelParams:
 
     @classmethod
     def derive(cls, pay_to: str, payer_pub: str, expiry: int, close_fee: int, payer_spk: str = "", *,
-               network: str) -> "ChannelParams":
+               network: str, close_fee_payer: str = "payer") -> "ChannelParams":
         """Terms both sides compute from the challenge (payTo, network) + the payer's key and expiry."""
         payee = channel_payee_pub(network, bytes.fromhex(pay_to), bytes.fromhex(payer_pub), expiry)
         return cls(payer_pub=payer_pub, payee_pub=payee.hex(), expiry=expiry,
                    payer_spk=payer_spk or p2wpkh_spk(bytes.fromhex(payer_pub)).hex(),
-                   payee_spk=p2wpkh_spk(payee).hex(), close_fee=close_fee)
+                   payee_spk=p2wpkh_spk(payee).hex(), close_fee=close_fee, close_fee_payer=close_fee_payer)
+
+    # --- who pays the close fee (v1.2) -----------------------------------------------------------
+    # A state for cumulative amount `cum` pays
+    #     payer-pays (v1.1): payee cum,              payer capacity - close_fee - cum
+    #     payee-pays (v1.2): payee cum - close_fee,  payer capacity - cum
+    # `cum` is always what the payer has paid. Under payee-pays the payer's output depends on cum
+    # alone, so no choice of the payee's (close_fee included) can lower it: the payer's 0x21
+    # signature commits to that exact output.
+    @property
+    def payee_fee(self) -> int:
+        """The part of the close fee that comes out of the payee's output."""
+        return self.close_fee if self.close_fee_payer == "payee" else 0
+
+    @property
+    def payer_fee(self) -> int:
+        """The part of the close fee that comes out of the payer's output."""
+        return self.close_fee if self.close_fee_payer == "payer" else 0
+
+    @property
+    def min_amount(self) -> int:
+        """Least cumulative amount a state can pay: the payee output must clear dust after its fee."""
+        return DUST + self.payee_fee
 
     @property
     def max_amount(self) -> int:
         """Most the payer can ever sign to the payee."""
-        return self.capacity - self.close_fee
+        return self.capacity - self.payer_fee
+
+    def payee_value(self, amount: int) -> int:
+        """What the payee's output of the state for `amount` holds (its net payout)."""
+        return amount - self.payee_fee
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        if d["close_fee_payer"] == "payer":     # v1.1 channels serialise exactly as before
+            del d["close_fee_payer"]
+        return d
 
     def funding_prevout(self) -> TxOut:
         return TxOut(self.capacity, self.spk)
@@ -165,15 +202,19 @@ class ChannelParams:
         return TxIn(bytes.fromhex(self.funding_txid)[::-1], self.funding_vout, sequence)
 
     # --- state (commitment) txs -----------------------------------------------------------
+    def _check_amount(self, amount: int):
+        if not self.min_amount <= amount <= self.max_amount:
+            raise ChannelError("bad_amount", f"amount {amount} outside [{self.min_amount}, {self.max_amount}]")
+
     def state_tx(self, amount: int) -> Tx:
-        """Close tx paying `amount` (cumulative) to the payee; payer gets the rest minus fee.
+        """Close tx for cumulative `amount`: the payee gets `amount`, the payer the rest, and the
+        close fee comes out of close_fee_payer's side (see payee_fee).
 
         A payer remainder below dust is dropped into the fee rather than creating dust.
         """
-        if not DUST <= amount <= self.max_amount:
-            raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
-        outs = [TxOut(amount, bytes.fromhex(self.payee_spk))]
-        change = self.capacity - self.close_fee - amount
+        self._check_amount(amount)
+        outs = [TxOut(self.payee_value(amount), bytes.fromhex(self.payee_spk))]
+        change = self.capacity - self.payer_fee - amount
         if change >= DUST:
             outs.append(TxOut(change, bytes.fromhex(self.payer_spk)))
         return Tx(version=2, inputs=[self._funding_in()], outputs=outs, locktime=0)
@@ -199,31 +240,45 @@ class ChannelParams:
         output the payer needs fixed, and the payee may rearrange the rest (its `amount` plus the close
         fee) as it likes. Wave 2 put the payee output first, which left the payer's whole remainder
         uncommitted (XBT-061 H5). No change output (a full channel) means no 0xA3 state: use 0x21."""
-        if not DUST <= amount <= self.max_amount:
-            raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
-        change = self.capacity - self.close_fee - amount
+        self._check_amount(amount)
+        change = self.capacity - self.payer_fee - amount
         if change < DUST:
             raise ChannelError("bad_amount", "no payer change to commit to: sign a 0x21 state instead")
         return Tx(version=2, inputs=[self._funding_in()],
-                  outputs=[TxOut(change, bytes.fromhex(self.payer_spk)), TxOut(amount, bytes.fromhex(self.payee_spk))],
+                  outputs=[TxOut(change, bytes.fromhex(self.payer_spk)),
+                           TxOut(self.payee_value(amount), bytes.fromhex(self.payee_spk))],
                   locktime=0)
 
     def sighash_a3(self, tx: Tx) -> bytes:
         return unified_sighash(tx, [self.funding_prevout()], 0, ST_WITNESS_V0, self.script,
                                SIGHASH_SINGLE_ACP_UNIFIED)
 
+    def rollover_next_capacity(self, amount: int) -> int:
+        """The next channel's capacity in a rollover paying `amount`: the payer's whole remainder
+        after its share of the close fee (payee-pays: exactly capacity - amount)."""
+        return self.capacity - self.payer_fee - amount
+
     def rollover_tx(self, amount: int, next_spk: bytes, next_capacity: int) -> Tx:
-        """Close that pays the payee and funds the next channel from the payer leftover."""
-        if not DUST <= amount <= self.max_amount:
-            raise ChannelError("bad_amount", f"amount {amount} outside [{DUST}, {self.max_amount}]")
+        """Close that pays the payee and funds the next channel from the payer leftover. Under
+        payee-pays the payee's output carries the close fee (amount - close_fee), exactly as in a
+        state, so the next channel can take the payer's whole remainder."""
+        self._check_amount(amount)
         if next_capacity < DUST:
             raise ChannelError("bad_amount", "next channel capacity below dust")
-        leftover = self.capacity - amount - next_capacity
-        if leftover < 0:
-            raise ChannelError("bad_amount", "rollover does not leave a non-negative fee")
+        # the next channel is the payer's: it may take at most the payer's remainder, capacity - amount.
+        # (Under payee-pays anything above that would come out of the fee the payee's output pays.)
+        if next_capacity > self.capacity - amount:
+            raise ChannelError("bad_amount", "next channel capacity above the payer's remainder")
         return Tx(version=2, inputs=[self._funding_in()],
-                  outputs=[TxOut(amount, bytes.fromhex(self.payee_spk)),
+                  outputs=[TxOut(self.payee_value(amount), bytes.fromhex(self.payee_spk)),
                            TxOut(next_capacity, next_spk)], locktime=0)
+
+
+def settle_due(p: ChannelParams, cum: int, multiple: int) -> bool:
+    """The settlement threshold (cmp CONTRACT "Settlement policy"): the payee's net payout for `cum`
+    (its output after any close fee it pays) is at least `multiple` x closeFee, so a settlement's fee
+    is at most 1/multiple of what it pays out. Under payer-pays the net payout is cum itself."""
+    return cum >= p.min_amount and p.payee_value(cum) >= int(multiple) * p.close_fee
 
 
 class Payer:
