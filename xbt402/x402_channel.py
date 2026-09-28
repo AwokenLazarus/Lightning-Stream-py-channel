@@ -690,7 +690,7 @@ class XbtChannelProvider:
         paid = self._close_paid(st)
         out = {"cum": str(paid), "unpaidMsat": str(max(0, st.spent_msat - paid * 1000))}
         if st.params.payee_fee:
-            out.update(payeeFee=str(st.params.payee_fee), payeeNet=str(paid - st.params.payee_fee))
+            out.update(payeeFee=str(st.params.payee_fee), payeeNet=str(max(0, paid - st.params.payee_fee)))
         return out
 
     def facilitator_settle(self, req: dict) -> dict:
