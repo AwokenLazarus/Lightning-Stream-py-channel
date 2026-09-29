@@ -22,7 +22,9 @@ HUB = "http://hub.test"
 class RouteNode(FakeNode):
     """FakeNode plus what the hub's watcher reads: gettxspendingprevout and raw tx hex. A conflicting
     spend is refused unless it replaces a mempool spend by BIP125 (the old one signals, the new one pays
-    its fee + 1 sat/vB more: AGP-044); blocks take only txs paying block_min_feerate sat/vB."""
+    its fee + 1 sat/vB more: AGP-044); blocks take only txs paying block_min_feerate sat/vB. It is also the
+    hub's fund wallet (AGP-045): fund_address is a wallet send (listtransactions, gettransaction, which
+    remembers a send after it left the mempool; `abandon` / `conflict` mark one that can never confirm)."""
 
     def __init__(self, height=1000):
         super().__init__(height)
@@ -30,6 +32,7 @@ class RouteNode(FakeNode):
         self.feerate = None               # estimatesmartfee's BTC/kvB (None: no estimate)
         self.fees = {}                    # txid -> (fee, vsize) of every broadcast tx
         self.block_min_feerate = 0.0
+        self.wallet_txs = {}              # txid -> {address, vout: [...], abandoned, conflicted}
 
     def fee_of(self, txid):
         return self.fees.get(txid)
@@ -44,10 +47,38 @@ class RouteNode(FakeNode):
     def fund_address(self, address, sats, confirmations=6):
         spk = address_to_spk(address, "bcrt")
         txid = os.urandom(32).hex()
-        self.txs[txid] = {"vin": [{"txid": "cd" * 32, "vout": 0}],
-                          "vout": [{"n": 0, "value": sats / 1e8, "scriptPubKey": {"hex": spk.hex()}}],
-                          "confirmations": confirmations}
+        vout = [{"n": 0, "value": sats / 1e8, "scriptPubKey": {"hex": spk.hex()}}]
+        self.txs[txid] = {"vin": [{"txid": "cd" * 32, "vout": 0}], "vout": vout, "confirmations": confirmations}
+        self.wallet_txs[txid] = {"address": address, "vout": vout, "abandoned": False, "conflicted": False}
         return txid, 0
+
+    def listtransactions(self, label="*", count=10, skip=0, watchonly=False):
+        return [{"category": "send", "address": w["address"], "txid": t, "amount": -w["vout"][0]["value"]}
+                for t, w in self.wallet_txs.items()][skip:skip + count]
+
+    def gettransaction(self, txid, watchonly=False, verbose=False):
+        w = self.wallet_txs.get(txid)
+        if w is None:
+            raise RuntimeError("Invalid or non-wallet transaction id")
+        conf = -1 if w["conflicted"] else self.txs.get(txid, {}).get("confirmations", 0)
+        return {"txid": txid, "confirmations": conf,
+                "details": [{"category": "send", "address": w["address"], "abandoned": w["abandoned"]}],
+                **({"decoded": {"txid": txid, "vout": w["vout"]}} if verbose else {})}
+
+    def getmempoolentry(self, txid):
+        if self.txs.get(txid, {}).get("confirmations", 1) >= 1:
+            raise RuntimeError("Transaction not in mempool")
+        return {"vsize": 150}
+
+    def abandon(self, txid):
+        """The wallet gives up on a send that left the mempool (abandontransaction)."""
+        self.evict(txid)
+        self.wallet_txs[txid]["abandoned"] = True
+
+    def conflict(self, txid):
+        """A send double-spent by a confirmed tx: gettransaction confirmations -1."""
+        self.evict(txid)
+        self.wallet_txs[txid]["conflicted"] = True
 
     def sendrawtransaction(self, hx):
         tx = Tx.parse(bytes.fromhex(hx))

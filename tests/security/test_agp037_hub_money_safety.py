@@ -209,13 +209,14 @@ class ReconcileEveryCh2(_World):
         self.assertGreaterEqual(oc.signed, oc.p().min_amount)
         self.assertFalse(oc.pending or oc.stale)
         txid = self.provider_closes()
-        acts = self.hub.watch_tick()
-        self.assertTrue(any(a["event"] == "ch2_closed" and a["txid"] == txid for a in acts), acts)
-        self.assertEqual((oc.state, oc.close_txid, oc.final), ("closed", txid, False))
+        acts = self.hub.watch_tick()                             # in the mempool: closing (AGP-045)
+        self.assertTrue(any(a["event"] == "ch2_closing" and a["txid"] == txid for a in acts), acts)
+        self.assertEqual((oc.state, oc.close_txid, oc.final), ("closing", txid, False))
         self.assertEqual(self.hub.committed_sat(), 0)
         self.node.mine()
-        self.hub.watch_tick()
-        self.assertTrue(oc.final)
+        acts = self.hub.watch_tick()
+        self.assertTrue(any(a["event"] == "ch2_closed" and a["txid"] == txid for a in acts), acts)
+        self.assertEqual((oc.state, oc.final), ("closed", True))
         n = len(self.hub.events)
         self.hub.watch_tick()                                    # final: nothing more, no retries
         self.assertEqual(len(self.hub.events), n)
@@ -231,7 +232,10 @@ class ReconcileEveryCh2(_World):
         closed = [s for s in self.prov.ledger.channels.values() if s.closed_txid]
         self.assertEqual(len(closed), 1)
         acts = self.hub.watch_tick()                             # ...the chain does
-        self.assertTrue(any(a["event"] == "ch2_closed" for a in acts), acts)
+        self.assertTrue(any(a["event"] == "ch2_closing" for a in acts), acts)
+        self.assertEqual((oc.state, oc.close_txid), ("closing", closed[0].closed_txid))
+        self.node.mine()
+        self.hub.watch_tick()
         self.assertEqual((oc.state, oc.close_txid), ("closed", closed[0].closed_txid))
         self.assertEqual(self.hub.committed_sat(), 0)
         self.hub.watch_tick()
@@ -250,8 +254,11 @@ class ReconcileEveryCh2(_World):
             self.assertEqual(oc.state, "open")
             oc.stale = []
             self.hub.watch_tick()
-            self.assertEqual((oc.state, oc.close_txid), ("closed", ""))
+            self.assertEqual((oc.state, oc.close_txid), ("closing", ""))     # the spend is in the mempool
             self.assertEqual(self.hub.committed_sat(), 0)
+            self.node.mine()
+            self.hub.watch_tick()
+            self.assertEqual((oc.state, oc.close_txid, oc.final), ("closed", "", False))   # confirmed, txid still unknown
         finally:
             hubmod.find_spend = real
         self.hub.watch_tick()                                    # found later: the real txid
@@ -358,18 +365,20 @@ class RefundLostToAProviderClose(_World):
         self.node.evict(oc.refund_txid)                          # the provider's close replaces it
         close = self.provider_closes()
         self.assertEqual(self.node.spenders[(oc.p().funding_txid, oc.p().funding_vout)], close)
-        acts = self.hub.watch_tick()
+        fees = self.hub.refund_fees_sat()
+        acts = self.hub.watch_tick()                             # the close is in the mempool: the secret is read now
         self.assertTrue(any(a["event"] == "secret_from_close" and a["lockId"] == stale_id and a["ch1_completed"]
                             for a in acts), acts)
-        ev = next(a for a in acts if a["event"] == "ch2_closed")
-        self.assertEqual((ev["txid"], ev["refundFeeReverted"] > 0), (close, True))
-        self.assertEqual((oc.state, oc.close_txid, oc.stale), ("closed", close, []))
-        self.assertEqual(self.hub.refund_fees_sat(), self.oc(self.idle).refund_fee)   # only the idle ch2's
+        self.assertEqual((oc.state, oc.close_txid, oc.stale), ("closing", close, []))
+        self.assertEqual(self.hub.refund_fees_sat(), fees)       # ...but the refund fee stays booked (AGP-045)
         st1 = self.hub.inbound.ledger.channels[self.pay.chan]
         self.assertIn(stale_id, [r["lockId"] for r in st1.extra["recovered"]])
         self.node.mine()
-        self.hub.watch_tick()
-        self.assertTrue(oc.final)
+        acts = self.hub.watch_tick()
+        ev = next(a for a in acts if a["event"] == "ch2_closed")
+        self.assertEqual((ev["txid"], ev["refundFeeReverted"] > 0), (close, True))
+        self.assertEqual((oc.state, oc.close_txid, oc.final), ("closed", close, True))
+        self.assertEqual(self.hub.refund_fees_sat(), self.oc(self.idle).refund_fee)   # only the idle ch2's
 
 
 
@@ -385,6 +394,9 @@ class CloseReply(_World):
         self.assertEqual((oc.state, oc.close_txid), ("open", ""))
         self.hub.watch_tick()                                    # the watcher survives and reconciles
         self.assertEqual(self.events("ch2_watch_error"), [])
+        self.assertEqual(oc.state, "closing")                    # the provider's close, in the mempool
+        self.node.mine()
+        self.hub.watch_tick()
         self.assertEqual(oc.state, "closed")
 
     def test_no_txid(self):
@@ -412,7 +424,10 @@ class CloseReply(_World):
         self.assertEqual(p.close_fee_payer, "payee")
         self.assertEqual((ev["amount"], ev["payeeFee"], ev["payeeNet"]), (oc.signed, p.close_fee, oc.signed - p.close_fee))
         self.assertEqual(ev["chan"], p.channel_id)
-        self.assertEqual(oc.state, "closed")
+        self.assertEqual((oc.state, oc.close_txid), ("closing", ev["txid"]))   # closed once it confirms (AGP-045)
+        self.node.mine()
+        self.hub.watch_tick()
+        self.assertEqual((oc.state, oc.final), ("closed", True))
 
 
 # --- 5 bounded /terms ---------------------------------------------------------------------------------
@@ -487,7 +502,7 @@ class RefillHook(_World):
         self.hub.liquidity_cap_sat = 50_000                      # below one ch2: the refill is refused
         ev = self.hub.close_ch2(self.oc(), refill=True)
         self.assertIn("liquidity_cap", ev["refillError"])
-        self.assertEqual(self.oc().state, "closed")              # the close stands
+        self.assertEqual(self.oc().state, "closing")             # the close stands
         self.assertTrue(self.events("ch2_refill_failed"))
 
 

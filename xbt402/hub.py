@@ -33,13 +33,16 @@ and closes ch1s at their margin.
 Money safety (AGP-037):
   * write-ahead funding: a ch2's payer key and params are on disk (state `funding`) before the `fund`
     hook runs, and a rollover's next ch2 (`next`) before the rollover request leaves. A fund hook that
-    fails after it broadcast leaves a record the watcher reconciles against the chain (scantxoutset:
-    found -> funded, the open goes on; not found within funding_timeout_blocks -> archived as
-    `dropped`, key kept);
-  * every non-final ch2 (funded, open, refunded, closed but unconfirmed) is checked each tick: a spent
-    funding is read (find_spend) and the ch2 marked closed with the real spender, its locks' secrets
-    recovered (_from_close); the hub's own refund is final once it confirms, rebroadcast while it is
-    not; a provider close that beats the refund reverts the refund fee;
+    fails after it broadcast leaves a record the watcher reconciles: the wallet's sends to the ch2
+    address (gettransaction), gettxout incl. the mempool, getmempoolentry, then scantxoutset (AGP-045).
+    Found in a block or the mempool -> funded, the open goes on; not found within
+    funding_timeout_blocks -> archived as `dropped`, key kept; a send the wallet still knows is watched
+    while dropped and refunded at expiry if it confirms late, a failed one (conflicted, abandoned, none) is final;
+  * every non-final ch2 (funded, open, refunded, closing, closed but unconfirmed) is checked each tick: a
+    spent funding is read (find_spend) and its locks' secrets recovered (_from_close); a provider's close
+    in the mempool makes the ch2 `closing`, and only a confirmed one `closed` (AGP-045); the hub's own
+    refund is final once it confirms, rebroadcast while it is not; a provider close that beats the refund
+    reverts the refund fee once it confirms (a mempool close that vanishes restores the refund, fee booked);
   * refunds: an unsigned ch2 at expiry, a signed one at expiry + refund_grace_blocks (the provider had
     its close margin to settle), at a hub-chosen fee (estimatesmartfee x vsize, floor
     refund_min_feerate), never the provider's closeFee;
@@ -94,7 +97,7 @@ class OutChannel:
     pay_to: str                  # the provider operator's payTo (one key may serve many devices)
     params: dict
     secret: str                  # payer key (regtest: stored here; production: the B2 signer)
-    state: str = "funded"        # funding -> funded -> open -> closed | rolled | refunded; funding -> dropped
+    state: str = "funded"        # funding -> funded -> open -> closing -> closed | rolled | refunded; funding -> dropped
     signed: int = 0              # highest cumulative state the provider can close with
     routed: int = 0              # sum of completed routed amounts (the provider keeps the same total)
     seq: int = 0
@@ -115,13 +118,30 @@ class OutChannel:
     fund_error: str = ""         # the fund hook raised: reconciled against the chain
     refund_at: int = 0           # the tip when the current refund version was signed (AGP-044)
     refund_prev: list = field(default_factory=list)  # earlier refund versions it replaced, {txid, fee}
+    close_prev: str = ""         # the state a `closing` ch2 left (AGP-045): "refunded" is restored if the close vanishes
+    fund_txid: str = ""          # the funding send the hub knows of (wallet), watched while `dropped` (AGP-045)
+    fund_vout: int = 0
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
 
 
 LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
-NONFINAL = ("funded", "open", "refunded", "closed")         # the watcher reconciles these until final
+NONFINAL = ("funded", "open", "refunded", "closing", "closed")   # the watcher reconciles these until final
+
+
+def watched(r: dict) -> bool:
+    """An archived record the watcher still reconciles: a non-final ch2, or a dropped funding whose
+    send is known (it may confirm late: AGP-045)."""
+    if r.get("final"):
+        return False
+    return r.get("state") in NONFINAL or (r.get("state") == "dropped" and bool(r.get("fund_txid")))
+
+
+def refund_booked(r: dict) -> bool:
+    """The record's refund fee counts: refunded, or refunded and now `closing` on a spender that has
+    not confirmed (it is un-booked only when that close confirms: AGP-045)."""
+    return r.get("state") == "refunded" or (r.get("state") == "closing" and r.get("close_prev") == "refunded")
 
 
 class OutBook:
@@ -194,8 +214,9 @@ class HubConfig:
     <= ch2_max_settle_multiple. Refunds: refund_grace_blocks past expiry for a signed ch2, fee
     estimatesmartfee(refund_conf_target) x vsize, at least refund_min_feerate sat/vB, at most
     refund_max_fee_sat (bumps included); a refund still unconfirmed refund_bump_blocks after it was
-    signed is re-signed at a higher fee (RBF, AGP-044; 0: never). A `funding` record the chain never
-    shows is dropped after funding_timeout_blocks."""
+    signed is re-signed at a higher fee (RBF, AGP-044; 0: never). A `funding` record that neither the
+    wallet, the mempool nor the chain shows is dropped after funding_timeout_blocks (a known send is
+    still watched: AGP-045)."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -246,12 +267,15 @@ class RouteHub:
     def __init__(self, rpc, pay_to_secret: int, network: str, datadir: str, fund: Callable[[str, int], tuple],
                  config: HubConfig = None, *, http: Callable = None, policy: FundingPolicy = None,
                  fee_strategy: Callable = None, refill: Callable[[str], "OutChannel"] = None,
-                 refund_to: Callable[[], str] = None, **overrides):
+                 refund_to: Callable[[], str] = None, wallet=None, **overrides):
         """`config` (a HubConfig) holds the operator's choices; keyword `overrides` set single fields
         (fee_ppm=..., liquidity_cap_sat=...). `fee_strategy`, if given, is a callable(hub) ->
         (fee_base_msat, fee_ppm) that replaces the configured one. `refill(origin)` funds the ch2 that
         replaces a closed one (default `connect`: an embedder passes its own path, with its lock and
-        cap). `refund_to()` gives the address a ch2 refund pays (default: the ch2's payer key)."""
+        cap); it is looked up at each call, so assigning `hub.refill` or `hub.connect` later takes effect
+        (AGP-045). `refund_to()` gives the address a ch2 refund pays (default: the ch2's payer key).
+        `wallet` is an RPC handle on the fund wallet (default `rpc`): listtransactions/gettransaction,
+        how the watcher finds a funding send whose fund call failed (AGP-045)."""
         cfg = config or HubConfig()
         if isinstance(fee_strategy, dict):              # a configured strategy, not a callable
             overrides["fee_strategy"], fee_strategy = fee_strategy, None
@@ -273,13 +297,24 @@ class RouteHub:
         self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap_sat
         self.fee_strategy = fee_strategy or self._configured_fees
         self.http = http or XbtChannelClient.http
-        self.refill = refill or self.connect
+        self._refill = refill
         self.refund_to = refund_to
+        self.wallet = wallet if wallet is not None else rpc
         self._quote: Optional[FeeQuote] = None
         self._quote_seq = int(time.time())
         self.withhold = ""           # tests/demo: "" | "receipt" (keep t + r from the client) | "all"
         self.events: list = []
         self.stats = {"routed": 0, "floor": 0, "refused": {}, "lock_ms": []}
+
+    @property
+    def refill(self) -> Callable[[str], "OutChannel"]:
+        """The refill hook, looked up at call time (AGP-045): the embedder's, else `self.connect` as it
+        is now (so replacing `connect` after construction takes effect)."""
+        return self._refill or self.connect
+
+    @refill.setter
+    def refill(self, f):
+        self._refill = f
 
     # ---------------------------------------------------------------------------------------------
     def committed_sat(self) -> int:
@@ -291,7 +326,7 @@ class RouteHub:
         """Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings."""
         with self.out.lock:
             recs = [asdict(c) for c in self.out.chans.values()] + list(self.out.archived)
-        return sum(int(r.get("refund_fee") or 0) for r in recs if r.get("state") == "refunded")
+        return sum(int(r.get("refund_fee") or 0) for r in recs if refund_booked(r))
 
     def _configured_fees(self, hub) -> tuple:
         st = self.config.fee_strategy or {"kind": "flat"}
@@ -762,37 +797,126 @@ class RouteHub:
         p.funding_txid, p.funding_vout, p.capacity = txid, int(vout), int(cap)
         with self.out.lock:
             oc.params, oc.state = p.to_dict(), "funded"
+            oc.fund_txid, oc.fund_vout = txid, int(vout)
             oc.refund_hex = p.refund_tx(int(oc.secret, 16)).hex()   # fallback; the watcher refunds at its own fee
             self.out.save()
 
-    def _reconcile_funding(self, oc: OutChannel, tip: int) -> list:
-        """A `funding` record (the fund hook raised, or the hub stopped mid-fund): the funding on chain
-        -> funded, and the open goes on; none within funding_timeout_blocks -> dropped (archived with
-        its key, so a late confirmation can still be refunded by hand)."""
+    def _wallet_sends(self, oc: OutChannel) -> list:
+        """What the fund wallet knows of sends to this ch2's address: [{txid, vout, sats, confirmations,
+        abandoned}] (listtransactions + gettransaction; confirmations < 0: conflicted). The record's
+        own fund_txid is looked up first. [] without a wallet."""
         p = oc.p()
+        addr = segwit_address(self.hrp, p.spk)
+        txids = [oc.fund_txid] if oc.fund_txid else []
+        try:
+            for t in self.wallet.listtransactions("*", 1000, 0, True) or []:
+                if t.get("category") == "send" and t.get("address") == addr and t.get("txid") not in txids:
+                    txids.append(t["txid"])
+        except Exception as e:  # noqa: BLE001 - no wallet on this RPC handle: the chain checks still run
+            sys.stderr.write(f"hub: listtransactions for {oc.origin}: {e}\n")
+        out = []
+        for txid in txids:
+            try:
+                wt = self.wallet.gettransaction(txid, True, True) or {}
+            except Exception:  # noqa: BLE001 - not the wallet's (e.g. an embedder's own fund hook)
+                wt = {}
+            vout, sats = (oc.fund_vout, None) if txid == oc.fund_txid else (None, None)
+            for o in (wt.get("decoded") or {}).get("vout", []):
+                if str((o.get("scriptPubKey") or {}).get("hex", "")).lower() == p.spk.hex():
+                    vout, sats = int(o["n"]), round(float(o["value"]) * 1e8)
+                    break
+            if vout is None:
+                continue
+            out.append({"txid": txid, "vout": vout, "sats": sats,
+                        "confirmations": int(wt.get("confirmations", 0) or 0),
+                        "abandoned": any(d.get("abandoned") for d in wt.get("details", []) or [])})
+        return out
+
+    def _in_mempool(self, txid: str) -> bool:
+        try:
+            return bool(self.rpc.getmempoolentry(txid))
+        except Exception:  # noqa: BLE001 - "Transaction not in mempool"
+            return False
+
+    def _utxo_sats(self, txid: str, vout: int) -> Optional[int]:
+        """gettxout incl. the mempool: the output's sats while it is unspent, else None."""
+        u = self.rpc.gettxout(txid, int(vout), True)
+        return round(float(u["value"]) * 1e8) if u else None
+
+    def _reconcile_funding(self, oc: OutChannel, tip: int) -> list:
+        """A `funding` record (the fund hook raised, or the hub stopped mid-fund). Where the funding may be
+        (AGP-045, not only scantxoutset, which sees the confirmed UTXO set only): the sends the wallet
+        knows (gettransaction), each checked with gettxout incl. the mempool and getmempoolentry, then
+        scantxoutset (a fund hook outside the wallet). Found, in a block or the mempool -> funded, and the
+        open goes on once it has minConf. Not found within funding_timeout_blocks -> dropped (archived with
+        its key): a send the wallet still knows (not conflicted or abandoned) is watched while dropped,
+        and refunded at expiry if it confirms late; a genuinely failed send is final."""
+        p = oc.p()
+        sends = self._wallet_sends(oc)
+        pending = None
+        for w in sends:
+            sats = self._utxo_sats(w["txid"], w["vout"])
+            if sats is not None and sats >= DUST:
+                return self._recovered(oc, w["txid"], w["vout"], sats)
+            if w["confirmations"] < 0 or w["abandoned"]:
+                continue                                # conflicted or abandoned: never confirms
+            if pending is None or self._in_mempool(w["txid"]):
+                pending = w
         try:
             r = self.rpc.scantxoutset("start", [f"raw({p.spk.hex()})"]) or {}
-        except Exception as e:  # noqa: BLE001 - a node without scantxoutset: wait, then drop
+        except Exception as e:  # noqa: BLE001 - a node without scantxoutset: the wallet checks above
             sys.stderr.write(f"hub: scantxoutset for {oc.origin}: {e}\n")
             r = {}
         hits = [u for u in r.get("unspents", []) if round(float(u.get("amount", 0)) * 1e8) >= DUST]
         if hits:
             u = hits[0]
-            self._funded(oc, u["txid"], int(u["vout"]), round(float(u["amount"]) * 1e8))
-            ev = {"event": "ch2_funding_recovered", "provider": oc.origin, "chan": oc.p().channel_id}
-            self.events.append(ev)
-            return [ev]
+            return self._recovered(oc, u["txid"], int(u["vout"]), round(float(u["amount"]) * 1e8))
         if tip - oc.opened_at < self.config.funding_timeout_blocks:
             return []
         with self.out.lock:
             oc.state = "dropped"
+            if pending is not None:                     # its send may still confirm: keep watching it
+                oc.fund_txid, oc.fund_vout = pending["txid"], int(pending["vout"])
+            else:
+                oc.final = True
             self.out.archived.append(asdict(oc))
             if self.out.chans.get(oc.origin) is oc:
                 del self.out.chans[oc.origin]
             self.out.save()
-        ev = {"event": "ch2_funding_dropped", "provider": oc.origin, "error": oc.fund_error}
+        ev = {"event": "ch2_funding_dropped", "provider": oc.origin, "error": oc.fund_error,
+              **({"watching": oc.fund_txid} if pending is not None else {})}
         self.events.append(ev)
         return [ev]
+
+    def _recovered(self, oc: OutChannel, txid: str, vout: int, sats: int) -> list:
+        self._funded(oc, txid, vout, sats)
+        ev = {"event": "ch2_funding_recovered", "provider": oc.origin, "chan": oc.p().channel_id, "txid": txid}
+        self.events.append(ev)
+        return [ev]
+
+    def _reconcile_dropped(self, oc: OutChannel, tip: int) -> list:
+        """A dropped funding whose send is known (AGP-045). Its output appears (it confirmed late, or is
+        back in the mempool) -> funded, in the archive: never opened, refunded at expiry by the reconcile
+        like any unused ch2 (event ch2_funding_late). The wallet says it can never confirm (conflicted or
+        abandoned) -> final (event ch2_funding_failed)."""
+        sats = self._utxo_sats(oc.fund_txid, oc.fund_vout)
+        if sats is not None and sats >= DUST:
+            p = oc.p()
+            p.funding_txid, p.funding_vout, p.capacity = oc.fund_txid, int(oc.fund_vout), sats
+            oc.params, oc.state = p.to_dict(), "funded"
+            oc.refund_hex = p.refund_tx(int(oc.secret, 16)).hex()
+            ev = {"event": "ch2_funding_late", "provider": oc.origin, "chan": p.channel_id, "txid": oc.fund_txid,
+                  "capacity": sats, "refundAt": p.expiry}
+            self.events.append(ev)
+            return [ev]
+        w = next((w for w in self._wallet_sends(oc) if w["txid"] == oc.fund_txid), None)
+        if w is not None and (w["confirmations"] < 0 or w["abandoned"]):
+            oc.final = True
+            ev = {"event": "ch2_funding_failed", "provider": oc.origin, "txid": oc.fund_txid,
+                  "why": "abandoned" if w["abandoned"] else "conflicted"}
+            self.events.append(ev)
+            return [ev]
+        return []
 
     def _open(self, oc: OutChannel) -> bool:
         p = oc.p()
@@ -889,7 +1013,8 @@ class RouteHub:
         through the `refill` hook. The provider's reply must match the ledger (AGP-037): a 64-hex txid,
         cum = a state the hub signed (its best, or a pending or written-off lock's), and on a payee-pays
         ch2 payeeFee = the channel's close fee, payeeNet = cum - payeeFee. Anything else raises
-        bad_close_reply and changes nothing: the watcher reads the real close off the chain."""
+        bad_close_reply and changes nothing: the watcher reads the real close off the chain. A good reply
+        makes the ch2 `closing` (AGP-045): it is `closed` once the watcher sees the close confirm."""
         from .x402_channel import close_message
         p = oc.p()
         if not oc.signed:
@@ -912,7 +1037,7 @@ class RouteHub:
             raise ChannelError("provider_error", str(doc)[:200])
         txid, cum = self._check_close_reply(oc, doc)
         with self.out.lock:
-            oc.state, oc.close_txid = "closed", txid
+            oc.state, oc.close_prev, oc.close_txid = "closing", oc.state, txid
             self.out.save()
         ev = {"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "amount": cum,
               "payeeFee": p.payee_fee, "payeeNet": max(0, cum - p.payee_fee)}
@@ -981,7 +1106,7 @@ class RouteHub:
         return oc.refund_fee if f < step else f
 
     def _refund_due(self, oc: OutChannel, tip: int) -> bool:
-        if oc.state not in ("funded", "open", "closed") or oc.pending or not oc.p().funding_txid:
+        if oc.state not in ("funded", "open", "closing", "closed") or oc.pending or not oc.p().funding_txid:
             return False
         p = oc.p()
         grace = self.config.refund_grace_blocks if oc.signed >= p.min_amount else 0
@@ -1058,12 +1183,11 @@ class RouteHub:
             except Exception as e:  # noqa: BLE001 - one channel never stops the rest
                 self._watch_error(origin, "watch", e)
         with self.out.lock:
-            archived = [(i, r) for i, r in enumerate(self.out.archived)
-                        if r.get("state") in NONFINAL and not r.get("final")]
+            archived = [(i, r) for i, r in enumerate(self.out.archived) if watched(r)]
         for i, rec in archived:                             # replaced ch2s are still the hub's coins
             try:
                 oc = OutChannel(**rec)
-                acts = self._reconcile(oc, tip)
+                acts = self._reconcile_dropped(oc, tip) if oc.state == "dropped" else self._reconcile(oc, tip)
                 with self.out.lock:
                     self.out.archived[i] = asdict(oc)
                     self.out.save()
@@ -1141,11 +1265,14 @@ class RouteHub:
 
     def _reconcile(self, oc: OutChannel, tip: int) -> list:
         """Check one non-final ch2's funding against the chain (AGP-037).
-        unspent: refund it when due; rebroadcast our refund if it left the mempool.
-        spent by the rollover we wrote ahead: finish it. spent by our refund: final once confirmed.
-        spent by anything else (the provider's close): read the locks' secrets off it, mark it closed
-        with the real txid, and take back the refund fee if our refund lost. Spent, spender not found:
-        with locks outstanding leave it (their secrets are on that tx); without, closed, txid unknown."""
+        unspent: refund it when due; rebroadcast our refund if it left the mempool. spent by the
+        rollover we wrote ahead: finish it. spent by our refund: final once confirmed. spent by
+        anything else (the provider's close): read the locks' secrets off it; in the mempool it is only
+        `closing` (AGP-045: the refund fee stays booked), and once it confirms the ch2 is `closed` with the
+        real txid and the refund fee is taken back if our refund lost. A `closing` ch2 whose spender left
+        the mempool is `refunded` again if it was (the fee re-booked), else it stays `closing` and is
+        refunded at expiry unless the close comes back. Spent, spender not found: with locks outstanding
+        leave it (their secrets are on that tx); without, closing (closed once confirmed), txid unknown."""
         if oc.final or oc.state not in NONFINAL:
             return []
         p = oc.p()
@@ -1153,26 +1280,38 @@ class RouteHub:
             return []
         out = []
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+            if oc.state == "closing" and (oc.close_txid or oc.close_prev == "refunded"):
+                out += self._close_vanished(oc)
             if oc.state == "refunded" or self._refund_due(oc, tip):
                 # due, or our refund left the mempool: send it (again, or bumped once it waited)
-                return self._refund(oc, tip)
+                return out + self._refund(oc, tip)
             return out
         confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
-        if oc.state == "closed" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid:
-            if confirmed:                                   # the provider's close as it told us: done
-                with self.out.lock:
-                    oc.final = True
-                    self.out.save()
-            return out
+        if oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid and confirmed:
+            with self.out.lock:                             # the provider's close as it told us, confirmed: done
+                oc.state, oc.final = "closed", True
+                self.out.save()
+            ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": oc.close_txid, "by": "provider"}
+            self.events.append(ev)
+            return [ev]
         tx = find_spend(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
         if tx is None:
-            if oc.state == "open" and not (oc.pending or oc.stale):     # a funded one may not be visible yet
-                with self.out.lock:
-                    oc.state, oc.close_txid = "closed", ""
-                    self.out.save()
-                ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": "", "by": "unknown"}
-                self.events.append(ev)
-                out.append(ev)
+            # a funded one may not be visible yet; with locks, their secrets are on that tx: wait for it.
+            # A closing one closes once the spend confirms, unless it was refunded (the spender may be our
+            # refund: the fee stays booked until the spender is found)
+            if oc.pending or oc.stale or oc.state not in ("open", "closing"):
+                return out
+            if oc.state == "closing" and (not confirmed or oc.close_prev == "refunded"):
+                return out
+            st = "closed" if confirmed else "closing"
+            with self.out.lock:
+                if oc.state == "open":
+                    oc.close_prev, oc.close_txid = "open", ""
+                oc.state = st
+                self.out.save()
+            ev = {"event": "ch2_" + st, "provider": oc.origin, "chan": p.channel_id, "txid": oc.close_txid, "by": "unknown"}
+            self.events.append(ev)
+            out.append(ev)
             return out
         spender = tx.txid()
         if oc.next and spender == OutChannel(**oc.next).p().funding_txid:
@@ -1194,20 +1333,49 @@ class RouteHub:
                 out += self._refund(oc, tip)
             return out
         if oc.pending or oc.stale:
-            out += self._from_close(oc, tx)
+            out += self._from_close(oc, tx)                 # the secrets are on it, confirmed or not
+        if not confirmed:
+            # in the mempool: it may still be replaced or expire, so the ch2 is only closing and a refund
+            # fee stays booked until it confirms
+            if oc.state == "closing" and oc.close_txid == spender:
+                return out
+            with self.out.lock:
+                if oc.state != "closing":
+                    oc.close_prev = oc.state
+                oc.state, oc.close_txid = "closing", spender
+                self.out.save()
+            ev = {"event": "ch2_closing", "provider": oc.origin, "chan": p.channel_id, "txid": spender, "by": "provider",
+                  **({"refundAtRisk": oc.refund_txid} if refund_booked(asdict(oc)) else {})}
+            self.events.append(ev)
+            out.append(ev)
+            return out
         lost = oc.refund_fee if oc.refund_txid else 0
-        changed = oc.state != "closed" or oc.close_txid != spender
         with self.out.lock:
-            oc.state, oc.close_txid, oc.final, oc.next = "closed", spender, confirmed, {}
+            oc.state, oc.close_txid, oc.final, oc.next = "closed", spender, True, {}
             if lost:
                 oc.refund_fee = 0
             self.out.save()
-        if changed:
-            ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": spender, "by": "provider",
-                  **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
-            self.events.append(ev)
-            out.append(ev)
+        ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": spender, "by": "provider",
+              **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
+        self.events.append(ev)
+        out.append(ev)
         return out
+
+    def _close_vanished(self, oc: OutChannel) -> list:
+        """A `closing` ch2's funding is unspent again: the close left the mempool (replaced, expired) or
+        never reached this node. A ch2 that was refunded is refunded again (its fee booked again, and the
+        refund goes out once more); any other stays `closing` (the hub never routes over it again) and is
+        refunded at expiry unless the provider's close comes back."""
+        was = oc.close_txid
+        with self.out.lock:
+            if oc.close_prev == "refunded":
+                oc.state, oc.close_prev = "refunded", ""
+            oc.close_txid = ""
+            self.out.save()
+        ev = {"event": "ch2_close_vanished", "provider": oc.origin, "chan": oc.p().channel_id, "txid": was,
+              "state": oc.state, **({"feeRebooked": oc.refund_fee} if oc.state == "refunded" else {})}
+        self.events.append(ev)
+        return [ev]
 
     def _from_close(self, oc: OutChannel, tx) -> list:
         out = []
@@ -1274,7 +1442,7 @@ def main(argv=None, serve: bool = True):
         txid = wallet.sendtoaddress(address, sats / 1e8)
         raw = wallet.gettransaction(txid, False, True)["decoded"]
         return txid, next(o["n"] for o in raw["vout"] if o["scriptPubKey"].get("address") == address)
-    hub = RouteHub(rpc, secret, conf["network"], os.path.expanduser(conf["datadir"]), fund, cfg,
+    hub = RouteHub(rpc, secret, conf["network"], os.path.expanduser(conf["datadir"]), fund, cfg, wallet=wallet,
                    refund_to=lambda: wallet.getnewaddress("", "bech32"))   # bech32 whatever the wallet default (AGP-044)
     for origin in conf.get("connect", []):
         if origin.rstrip("/") not in hub.out.chans:
