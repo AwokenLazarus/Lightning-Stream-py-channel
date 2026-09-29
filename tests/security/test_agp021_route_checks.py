@@ -356,13 +356,17 @@ class Constraints(_World):
             self.pay.call(sh, "POST", b"x")
         self.assertEqual(getattr(e.exception, "code", ""), "bad_receipt")
 
-    def test_c7_one_payee_key_for_two_devices(self):
+    def test_c7_one_payee_key_for_two_origins_one_ch2(self):
+        # AGP-044: one live ch2 per payTo. One operator key behind two origins (CMP-023: one paid provider
+        # per operator) gets ONE hub-funded ch2; both origins route over it.
         net, node, h = self.net, self.node, self.hub
-        op = 0xA0A0
-        a = R.provider(node, net, "http://dev-a.test", op)
-        b = R.provider(node, net, "http://dev-b.test", op)
-        h.connect("http://dev-a.test")
-        h.connect("http://dev-b.test")
+        a = R.provider(node, net, "http://dev-a.test", 0xA0A0)
+        net.apps["http://dev-b.test"] = a
+        cap0 = h.committed_sat()
+        oa = h.connect("http://dev-a.test")
+        ob = h.connect("http://DEV-B.test:80/")                  # canonicalized
+        self.assertEqual(oa.p().channel_id, ob.p().channel_id)
+        self.assertEqual(h.committed_sat(), cap0 + oa.p().capacity)
         node.confirm_all()
         h.watch_tick()
         sa, sb = self.pay.shard("http://dev-a.test/v1/chunk"), self.pay.shard("http://dev-b.test/v1/chunk")
@@ -370,9 +374,8 @@ class Constraints(_World):
         for sh in (sa, sb):
             R.stream(self.pay, sh, 5)
             self.assertEqual(self.pay.lock(sh)["status"], "paid")
-        ca, cb = h.out.chans["http://dev-a.test"].p(), h.out.chans["http://dev-b.test"].p()
-        self.assertNotEqual(ca.payee_pub, cb.payee_pub)          # per-channel keys, one operator key
-        self.assertEqual(a.pay_to, b.pay_to)
+        self.assertNotIn("http://dev-b.test", h.out.chans)
+        self.assertEqual(h.out.chans["http://dev-a.test"].routed, sa.locked_sat + sb.locked_sat)
 
 
 class Withholding(_World):

@@ -20,12 +20,26 @@ HUB = "http://hub.test"
 
 
 class RouteNode(FakeNode):
-    """FakeNode plus what the hub's watcher reads: gettxspendingprevout and raw tx hex."""
+    """FakeNode plus what the hub's watcher reads: gettxspendingprevout and raw tx hex. A conflicting
+    spend is refused unless it replaces a mempool spend by BIP125 (the old one signals, the new one pays
+    its fee + 1 sat/vB more: AGP-044); blocks take only txs paying block_min_feerate sat/vB."""
 
     def __init__(self, height=1000):
         super().__init__(height)
         self.spenders, self.raw, self.mined = {}, {}, set()
         self.feerate = None               # estimatesmartfee's BTC/kvB (None: no estimate)
+        self.fees = {}                    # txid -> (fee, vsize) of every broadcast tx
+        self.block_min_feerate = 0.0
+
+    def fee_of(self, txid):
+        return self.fees.get(txid)
+
+    def confirmed(self, txid):
+        return self.txs.get(txid, {}).get("confirmations", 0) >= 1
+
+    def _held(self, txid):
+        f = self.fees.get(txid)
+        return f is not None and f[0] < self.block_min_feerate * f[1]
 
     def fund_address(self, address, sats, confirmations=6):
         spk = address_to_spk(address, "bcrt")
@@ -39,10 +53,24 @@ class RouteNode(FakeNode):
         tx = Tx.parse(bytes.fromhex(hx))
         if tx.locktime > self.height and tx.locktime < 500_000_000:
             raise RuntimeError("non-final")
-        for i in tx.inputs:                   # like a node: one spend per outpoint (no replacement)
+        ins = 0
+        for i in tx.inputs:
+            prev = self.txs.get(i.txid[::-1].hex(), {}).get("vout", [])
+            ins += sum(round(o["value"] * 1e8) for o in prev if o["n"] == i.vout)
+        fee, vsize = ins - sum(o.value for o in tx.outputs), tx.vsize()
+        replaced = []
+        for i in tx.inputs:                   # like a node: one spend per outpoint, or a BIP125 replacement
             k = (i.txid[::-1].hex(), i.vout)
-            if k in self.spenders and self.spenders[k] != tx.txid():
+            old = self.spenders.get(k)
+            if old is None or old == tx.txid():
+                continue
+            signals = old in self.raw and any(x.sequence < 0xFFFFFFFE for x in Tx.parse(bytes.fromhex(self.raw[old])).inputs)
+            if k in self.mined or not signals or fee < self.fees.get(old, (1 << 62, 0))[0] + vsize:
                 raise RuntimeError("txn-mempool-conflict")
+            replaced.append(old)
+        for old in replaced:
+            self.evict(old)
+        self.fees[tx.txid()] = (fee, vsize)
         txid = super().sendrawtransaction(hx)
         for i in tx.inputs:
             self.spenders[(i.txid[::-1].hex(), i.vout)] = txid
@@ -60,9 +88,10 @@ class RouteNode(FakeNode):
                     if (o["txid"], o["vout"]) in self.spenders else {})} for o in outs]
 
     def confirm_all(self):
-        for t in self.txs.values():
-            t["confirmations"] = max(t.get("confirmations", 0), 1)
-        self.mined |= set(self.spenders)
+        for txid, t in self.txs.items():
+            if not self._held(txid):
+                t["confirmations"] = max(t.get("confirmations", 0), 1)
+        self.mined |= {k for k, v in self.spenders.items() if not self._held(v)}
 
     def mine(self, n=1):
         """n blocks: every mempool tx and spend confirms."""

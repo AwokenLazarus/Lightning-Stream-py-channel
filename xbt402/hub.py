@@ -48,6 +48,17 @@ Money safety (AGP-037):
   * a provider's /terms are bounded before the hub funds anything (HubConfig ch2_max_*); refills go
     through the `refill` hook (default: connect, the same terms, lock and cap path).
 
+Leftovers (AGP-044, as the Rust hub):
+  * a stuck refund is bumped by RBF: the hub holds the ch2 payer key and its refunds signal
+    replaceability (RBF_SEQUENCE), so a refund still unconfirmed refund_bump_blocks after it was signed
+    is re-signed at a higher fee (the estimate, at least 2x and + 1 sat/vB) to the same destination, up
+    to refund_max_fee_sat; every version is kept (refund_prev) until one confirms, and whichever does
+    is the refund;
+  * one live ch2 per payTo: a provider is the payTo its /terms name, not the URL it was reached at
+    (origins are canonical: canon_origin). A second origin with the payTo of a live ch2 reuses it
+    (event ch2_reuse; its locks go over that ch2, to the origin that opened it), so one operator never
+    splits the hub's capital over several ch2s; the cap accounting is unchanged.
+
 Close fees (xbt402 v1.2 closeFeePayer, AGP-023): ch2 is payee-pays by default (Mike, 2026-09-28): the
 provider pays its own settlement's close fee out of its output, so the hub's fees price only liquidity
 and routing, and the settle threshold counts the provider's net payout. ch1 stays payer-pays (the
@@ -65,12 +76,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
 from . import adaptor, ecc
-from .channel import (DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, canonical_chan,
-                      settle_due)
+from .channel import (DUST, FEE_PAYERS, RBF_SEQUENCE, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams,
+                      canonical_chan, settle_due)
 from .funding import FundingPolicy
-from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, fee_due,
-                    find_spend, hub_channel_message, next_cum, route_ok)
-from .tx import address_to_spk, segwit_address
+from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
+                    fee_due, find_spend, hub_channel_message, next_cum, route_ok)
+from .tx import Tx, address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, request_auth, request_digest,
                            unb64json)
 from .channel import channel_auth_key
@@ -102,6 +113,8 @@ class OutChannel:
     final: bool = False          # the funding's spend is confirmed: nothing left to watch
     next: dict = field(default_factory=dict)       # write-ahead: the rollover's next ch2 (asdict)
     fund_error: str = ""         # the fund hook raised: reconciled against the chain
+    refund_at: int = 0           # the tip when the current refund version was signed (AGP-044)
+    refund_prev: list = field(default_factory=list)  # earlier refund versions it replaced, {txid, fee}
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
@@ -112,24 +125,46 @@ NONFINAL = ("funded", "open", "refunded", "closed")         # the watcher reconc
 
 
 class OutBook:
-    """The hub's ch2s, fsynced JSON (keys included: regtest only; the production hub signs with B2)."""
+    """The hub's ch2s, fsynced JSON (keys included: regtest only; the production hub signs with B2).
+
+    One live ch2 per payTo (AGP-044): `origins` maps every origin the hub connected (canonical) to the
+    payTo its /terms named; a second origin with the payTo of a live ch2 routes over that ch2."""
 
     def __init__(self, path: str):
         self.path, self.lock = path, threading.RLock()
         self.chans: Dict[str, OutChannel] = {}
         self.archived: list = []
+        self.origins: Dict[str, str] = {}
         if os.path.exists(path):
             with open(path) as f:
                 raw = json.load(f)
             self.chans = {k: OutChannel(**v) for k, v in raw.get("chans", {}).items()}
             self.archived = raw.get("archived", [])
+            self.origins = {k: str(v) for k, v in raw.get("origins", {}).items()}
         self.mutex: Dict[str, threading.Lock] = {}
+
+    def live_for_pay_to(self, pay_to: str) -> Optional[str]:
+        """The key of the live ch2 (funding, funded or open) to `pay_to`."""
+        with self.lock:
+            return next((k for k, c in self.chans.items() if c.pay_to.lower() == pay_to.lower() and c.state in LIVE), None)
+
+    def key_for(self, origin: str) -> Optional[str]:
+        """The key of the ch2 that serves `origin` (canonical): its own record while live, else the live
+        ch2 of the payTo it was connected under, else its own record (closed, refunded, ...)."""
+        with self.lock:
+            own = self.chans.get(origin)
+            if own is not None and own.state in LIVE:
+                return origin
+            pt = self.origins.get(origin) or (own.pay_to if own is not None else None)
+            k = self.live_for_pay_to(pt) if pt else None
+            return k or (origin if own is not None else None)
 
     def save(self):
         with self.lock:
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"chans": {k: asdict(v) for k, v in self.chans.items()}, "archived": self.archived}, f)
+                json.dump({"chans": {k: asdict(v) for k, v in self.chans.items()}, "archived": self.archived,
+                           "origins": self.origins}, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
@@ -157,8 +192,10 @@ class HubConfig:
     too), closeFeeSat <= ch2_max_close_fee_sat and ch2_close_fee_multiple x closeFeeSat <= capacity,
     minConf <= ch2_max_min_conf, minCapacity <= ch2_max_min_capacity (0: ch2_capacity), settleMultiple
     <= ch2_max_settle_multiple. Refunds: refund_grace_blocks past expiry for a signed ch2, fee
-    estimatesmartfee(refund_conf_target) x vsize, at least refund_min_feerate sat/vB. A `funding`
-    record the chain never shows is dropped after funding_timeout_blocks."""
+    estimatesmartfee(refund_conf_target) x vsize, at least refund_min_feerate sat/vB, at most
+    refund_max_fee_sat (bumps included); a refund still unconfirmed refund_bump_blocks after it was
+    signed is re-signed at a higher fee (RBF, AGP-044; 0: never). A `funding` record the chain never
+    shows is dropped after funding_timeout_blocks."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -187,6 +224,8 @@ class HubConfig:
     refund_conf_target: int = 6
     refund_min_feerate: float = 1.0
     funding_timeout_blocks: int = 6
+    refund_bump_blocks: int = 3
+    refund_max_fee_sat: int = 5_000
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -286,7 +325,23 @@ class RouteHub:
                 # their own closes, so feePpm prices only liquidity and routing
                 "ch1CloseFeePayer": self.config.ch1_close_fee_payer,
                 "ch2CloseFeePayer": self.config.ch2_close_fee_payer,
-                "providers": sorted(o for o, c in self.out.chans.items() if c.state == "open" and not c.blocked)}
+                "providers": self._routable()}
+
+    def _routable(self) -> list:
+        """Every origin whose ch2 (its own, or its payTo's) is open and not blocked."""
+        with self.out.lock:
+            def ok(o):
+                k = self.out.key_for(o)
+                c = self.out.chans.get(k) if k else None
+                return c is not None and c.state == "open" and not c.blocked
+            return sorted({o for o in list(self.out.chans) + list(self.out.origins) if ok(o)})
+
+    def ch2_for(self, origin: str) -> Optional[OutChannel]:
+        """The ch2 that serves `origin` (AGP-044: the live ch2 of its payTo, which may have been opened
+        at another origin of the same operator)."""
+        with self.out.lock:
+            k = self.out.key_for(canon_origin(origin))
+            return self.out.chans.get(k) if k else None
 
     def body_limit(self, path: str, max_body: int = None) -> int:
         return self.inbound.body_limit(path, max_body)
@@ -322,7 +377,7 @@ class RouteHub:
             if not isinstance(pl, dict) or not isinstance(rt, dict):
                 raise TypeError
             d, f, lock_id = int(rt["amount"]), int(rt["fee"]), str(rt["lockId"])
-            provider = str(rt["provider"]).rstrip("/")
+            provider = canon_origin(str(rt["provider"]))
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._err("bad_payload")
         ib = self.inbound
@@ -393,7 +448,9 @@ class RouteHub:
             if f < f_due:
                 return self._err("route_fee", f"fee {f} < {f_due} due under quote {q.seq}", feeDue=f_due)
             # 6 expiry rule --------------------------------------------------------------------
-            oc = self.out.chans.get(provider)
+            # the provider is its payTo: an origin sharing a live ch2's payTo routes over that ch2
+            key = self.out.key_for(provider) or provider
+            oc = self.out.chans.get(key)
             if oc is None or oc.state != "open":
                 return self._err("route_blocked", "no open channel to that provider")
             if oc.blocked:
@@ -413,7 +470,7 @@ class RouteHub:
             # 7 one lock per channel -----------------------------------------------------------
             if ex1.get("route_lock"):
                 return self._err("lock_outstanding", "a lock on this ch1 is pending")
-            mtx = self.out.mutex_for(provider)
+            mtx = self.out.mutex_for(key)
             if not mtx.acquire(timeout=0.5):
                 return self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
             if oc.pending:
@@ -625,8 +682,12 @@ class RouteHub:
 
     def connect(self, origin: str, capacity: int = None, expiry_blocks: int = None) -> OutChannel:
         """Fund a ch2 to `origin` from the hub's own wallet. It opens (watch_tick / open_pending) once
-        the funding has the provider's minConf."""
-        origin = origin.rstrip("/")
+        the funding has the provider's minConf.
+
+        One live ch2 per payTo (AGP-044): if the provider's payTo already has a live ch2 (under this
+        origin or another), nothing is funded: `origin` is recorded under that payTo and the live ch2 is
+        returned (event ch2_reuse); its rollovers and refills go on as usual."""
+        origin = canon_origin(origin)
         cur = self.out.chans.get(origin)
         if cur is not None and cur.state == "funding":
             raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
@@ -642,6 +703,19 @@ class RouteHub:
             raise ChannelError("bad_fee_payer", f"{origin} does not offer payee-pays routed channels "
                                                 f"(closeFeePayer {offered!r}); set ch2_close_fee_payer payer to fund it")
         cap, blocks = self.ch2_terms(terms, capacity, expiry_blocks)
+        pay_to = str(terms["payTo"]).lower()
+        with self.out.lock:
+            self.out.origins[origin] = pay_to
+            k = self.out.live_for_pay_to(pay_to)
+            reused = self.out.chans[k] if k else None
+            self.out.save()
+        if reused is not None:
+            if reused.state == "funding":
+                raise ChannelError("ch2_funding", f"a ch2 to payTo {pay_to[:16]}... is being funded (the watcher reconciles it)")
+            if reused.origin != origin:
+                self.events.append({"event": "ch2_reuse", "provider": origin, "ch2": reused.origin, "payTo": pay_to,
+                                    "chan": reused.p().channel_id})
+            return reused
         return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks)
 
     def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int) -> OutChannel:
@@ -660,6 +734,9 @@ class RouteHub:
             old = self.out.chans.get(origin)
             if old is not None and old.state == "funding":
                 raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded")
+            live = self.out.live_for_pay_to(terms["payTo"])
+            if live is not None:                    # one live ch2 per payTo, checked with the insert (racing connects)
+                raise ChannelError("ch2_funding", f"a live ch2 to that payTo exists ({live})")
             if self.liquidity_cap_sat:
                 freed = old.p().capacity if old is not None and old.state in LIVE else 0
                 if self.committed_sat() - freed + cap > self.liquidity_cap_sat:
@@ -877,7 +954,8 @@ class RouteHub:
     # --- refunds -----------------------------------------------------------------------------------
     def refund_fee(self, p: ChannelParams, dest: bytes = None) -> int:
         """The hub's fee for a ch2 refund: estimatesmartfee(refund_conf_target) x vsize, at least
-        refund_min_feerate sat/vB; never the provider's closeFee, and never below dust left over."""
+        refund_min_feerate sat/vB; never the provider's closeFee, never above refund_max_fee_sat, and
+        never below dust left over."""
         vsize = p.refund_tx(1, dest, 0).vsize() + 1        # +1: a 73-byte signature at worst
         rate = float(self.config.refund_min_feerate)
         try:
@@ -886,7 +964,21 @@ class RouteHub:
                 rate = max(rate, float(est["feerate"]) * 1e8 / 1000)
         except Exception:  # noqa: BLE001 - no estimate (regtest, a fresh node): the floor
             pass
-        return max(0, min(math.ceil(rate * vsize), p.capacity - DUST))
+        return max(0, min(math.ceil(rate * vsize), self._refund_fee_cap(p)))
+
+    def _refund_fee_cap(self, p: ChannelParams) -> int:
+        return max(0, min(int(self.config.refund_max_fee_sat), p.capacity - DUST))
+
+    def _bumped_fee(self, oc: OutChannel, dest: bytes) -> int:
+        """The fee of the version that replaces a stuck refund (AGP-044): the current estimate, at least
+        double the stuck fee, capped. A replacement must pay the stuck fee + 1 sat/vB (BIP125's
+        incremental relay fee): when the cap leaves less, there is none (the stuck fee is returned)."""
+        p = oc.p()
+        est = self.refund_fee(p, dest)
+        vsize = Tx.parse(bytes.fromhex(oc.refund_hex)).vsize() + 1 if oc.refund_hex else 0
+        step = oc.refund_fee + vsize
+        f = min(max(est, 2 * oc.refund_fee, step), self._refund_fee_cap(p))
+        return oc.refund_fee if f < step else f
 
     def _refund_due(self, oc: OutChannel, tip: int) -> bool:
         if oc.state not in ("funded", "open", "closed") or oc.pending or not oc.p().funding_txid:
@@ -895,28 +987,66 @@ class RouteHub:
         grace = self.config.refund_grace_blocks if oc.signed >= p.min_amount else 0
         return tip >= p.expiry + grace
 
-    def _refund(self, oc: OutChannel, again: bool = False) -> list:
+    def _bump_due(self, oc: OutChannel, tip: int) -> bool:
+        """The current refund has waited refund_bump_blocks since it was signed."""
+        n = int(self.config.refund_bump_blocks)
+        return bool(oc.refund_txid) and n > 0 and tip >= oc.refund_at + n
+
+    def _refund(self, oc: OutChannel, tip: int) -> list:
+        """Refund a ch2 at the hub's fee, or send the refund already signed again; once it has waited
+        refund_bump_blocks, re-sign it at _bumped_fee (RBF: the hub holds the payer key and its refunds
+        signal replaceability), paying the same destination. Every version is written ahead and kept
+        (refund_prev) until one confirms."""
         p = oc.p()
-        if not (again and oc.refund_txid):
-            dest = address_to_spk(self.refund_to(), self.hrp) if self.refund_to else None
-            tx = p.refund_tx(int(oc.secret, 16), dest, self.refund_fee(p, dest))
-            with self.out.lock:                             # write-ahead: the refund we will look for
-                oc.refund_hex, oc.refund_txid, oc.refund_fee = tx.serialize().hex(), tx.txid(), p.capacity - tx.outputs[0].value
-                self.out.save()
+        prior, bump = bool(oc.refund_txid), self._bump_due(oc, tip)
+        out = []
+        kind = "ch2_refund_rebroadcast" if prior else "ch2_refund"
+        old_txid, old_fee = oc.refund_txid, oc.refund_fee
+        if not prior or bump:
+            if bump:        # the same destination as the version it replaces (refund_to may hand out a new address)
+                dest = Tx.parse(bytes.fromhex(oc.refund_hex)).outputs[0].script_pubkey
+                f = self._bumped_fee(oc, dest)
+            else:
+                dest = address_to_spk(self.refund_to(), self.hrp) if self.refund_to else None
+                f = self.refund_fee(p, dest)
+            if bump and f <= oc.refund_fee:
+                # at the cap: nothing higher to sign; send what we have and look again in refund_bump_blocks
+                with self.out.lock:
+                    oc.refund_at = tip
+                    self.out.save()
+                ev = {"event": "ch2_refund_bump_capped", "provider": oc.origin, "chan": p.channel_id,
+                      "txid": oc.refund_txid, "fee": oc.refund_fee, "cap": self._refund_fee_cap(p)}
+                self.events.append(ev)
+                out.append(ev)
+            else:
+                tx = p.refund_tx(int(oc.secret, 16), dest, f, sequence=RBF_SEQUENCE)
+                with self.out.lock:                         # write-ahead: every version we may see confirm
+                    if prior:
+                        oc.refund_prev = oc.refund_prev + [{"txid": oc.refund_txid, "fee": oc.refund_fee}]
+                    oc.refund_hex, oc.refund_txid, oc.refund_fee, oc.refund_at = tx.serialize().hex(), tx.txid(), f, tip
+                    self.out.save()
+                if bump:
+                    kind = "ch2_refund_bump"
         try:
             self.rpc.sendrawtransaction(oc.refund_hex)
-        except Exception as e:  # noqa: BLE001 - e.g. the provider's close got there first: reconcile sees it
-            ev = {"event": "ch2_refund_failed", "provider": oc.origin, "chan": p.channel_id,
+        except Exception as e:  # noqa: BLE001 - e.g. the provider's close got there first (the reconcile
+            # sees it), or a replacement the node refused (the version it replaces is still tracked)
+            ev = {"event": "ch2_refund_bump_failed" if kind == "ch2_refund_bump" else "ch2_refund_failed",
+                  "provider": oc.origin, "chan": p.channel_id, "txid": oc.refund_txid, "fee": oc.refund_fee,
                   "error": f"{type(e).__name__}: {e}"[:200]}
             self.events.append(ev)
-            return [ev]
+            out.append(ev)
+            return out
         with self.out.lock:
             oc.state = "refunded"
             self.out.save()
-        ev = {"event": "ch2_refund_rebroadcast" if again else "ch2_refund", "provider": oc.origin,
-              "chan": p.channel_id, "txid": oc.refund_txid, "fee": oc.refund_fee, "signed": oc.signed}
+        ev = {"event": kind, "provider": oc.origin, "chan": p.channel_id, "txid": oc.refund_txid, "fee": oc.refund_fee,
+              "signed": oc.signed}
+        if kind == "ch2_refund_bump":
+            ev.update(replaces=old_txid, feeFrom=old_fee)
         self.events.append(ev)
-        return [ev]
+        out.append(ev)
+        return out
 
     # --- watcher -----------------------------------------------------------------------------------
     def watch_tick(self) -> list:
@@ -1023,10 +1153,9 @@ class RouteHub:
             return []
         out = []
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
-            if oc.state == "refunded":                      # our refund left the mempool: send it again
-                return self._refund(oc, again=True)
-            if self._refund_due(oc, tip):
-                return self._refund(oc)
+            if oc.state == "refunded" or self._refund_due(oc, tip):
+                # due, or our refund left the mempool: send it (again, or bumped once it waited)
+                return self._refund(oc, tip)
             return out
         confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
         if oc.state == "closed" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid:
@@ -1048,15 +1177,21 @@ class RouteHub:
         spender = tx.txid()
         if oc.next and spender == OutChannel(**oc.next).p().funding_txid:
             return [self._finish_rollover(oc, oc.signed)]
-        if spender == oc.refund_txid:
+        prev_fee = next((int(r.get("fee") or 0) for r in oc.refund_prev if r.get("txid") == spender), None)
+        if spender == oc.refund_txid or prev_fee is not None:          # one of our refund versions
+            fee = oc.refund_fee if prev_fee is None else prev_fee
             with self.out.lock:
                 oc.state, oc.final = "refunded", confirmed
+                if confirmed and prev_fee is not None:     # an earlier version won: it is the refund that counts
+                    oc.refund_txid, oc.refund_fee, oc.refund_hex = spender, fee, ""
                 self.out.save()
             if confirmed:
                 ev = {"event": "ch2_refund_confirmed", "provider": oc.origin, "chan": p.channel_id,
-                      "txid": spender, "fee": oc.refund_fee}
+                      "txid": spender, "fee": fee, "versions": len(oc.refund_prev) + 1}
                 self.events.append(ev)
                 out.append(ev)
+            elif self._bump_due(oc, tip):                   # stuck in the mempool: replace it at a higher fee
+                out += self._refund(oc, tip)
             return out
         if oc.pending or oc.stale:
             out += self._from_close(oc, tx)
@@ -1140,7 +1275,7 @@ def main(argv=None, serve: bool = True):
         raw = wallet.gettransaction(txid, False, True)["decoded"]
         return txid, next(o["n"] for o in raw["vout"] if o["scriptPubKey"].get("address") == address)
     hub = RouteHub(rpc, secret, conf["network"], os.path.expanduser(conf["datadir"]), fund, cfg,
-                   refund_to=lambda: wallet.getnewaddress())
+                   refund_to=lambda: wallet.getnewaddress("", "bech32"))   # bech32 whatever the wallet default (AGP-044)
     for origin in conf.get("connect", []):
         if origin.rstrip("/") not in hub.out.chans:
             try:

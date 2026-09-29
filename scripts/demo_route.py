@@ -4,8 +4,9 @@ close fee, D's threshold counts that fee (net payout >= 2x the fee), and every c
 checked to pay the provider its state less its own fee, and the hub its whole remainder.
 
 1 client (B2 wallet signer when ~/xbt-rnd/b2-agp-023 is there, else B1's ChannelSigner), 1 hub,
-4 providers. Operator 1 runs providers A and B under ONE payTo key; C and D are separate operators.
-The client has ONE channel (to the hub); the hub funds one channel to each provider itself.
+4 providers. Operator 1 runs providers A and B under ONE payTo key (one provider serving two mounts on
+two ports); C and D are separate operators. The client has ONE channel (to the hub); the hub funds one
+channel per payTo itself (AGP-044: A and B share one).
 
   phase 1 (~10 s): the client streams chunks to all 4 providers at >= 12 calls/s each; per-window
                    adaptor locks pay each provider's accrued amount through the hub. A and B are
@@ -117,6 +118,11 @@ def make_signer(chain):
     return ChannelSigner(fund=chain.fund), "B1 ChannelSigner"
 
 
+def mount(n):
+    """Each provider's metered mount (A and B are two mounts of operator 1's one provider)."""
+    return "/v1/chunk-b" if n == "B" else "/v1/chunk"
+
+
 def provider(chain, name, secret, port, settle_multiple=20):
     served = {"n": 0}
 
@@ -126,7 +132,7 @@ def provider(chain, name, secret, port, settle_multiple=20):
     pol = FundingPolicy(min_capacity=20_000, min_expiry_blocks=1_008, max_expiry_blocks=8_640, close_margin=144)
     p = XbtChannelProvider(chain.rpc, secret, NET, os.path.join(RUN, f"prov-{name}.sqlite"), lambda m, pth: 1000,
                            handler, close_margin=144, policy=pol, settle_multiple=settle_multiple, height_ttl=0.5)
-    p.offer_route("/v1/chunk", window=WINDOW, lock_wait=LOCK_WAIT, invoice_ttl=INVOICE_TTL, amsat_per_call=PRICES[name])
+    p.offer_route(mount(name), window=WINDOW, lock_wait=LOCK_WAIT, invoice_ttl=INVOICE_TTL, amsat_per_call=PRICES[name])
     srv = p.http_server(port)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return p, srv, served
@@ -140,9 +146,14 @@ def main():
     print(f"== node: height {chain.rpc.getblockcount()}, rpc {RPCPORT}, network {NET}")
     op1, op3, op4, hub_key = 0xA0A0, 0xC0C0, 0xD0D0, 0x4B4B
     provs = {}
-    for name, sec, port, mult in (("A", op1, PROV_PORTS[0], 20), ("B", op1, PROV_PORTS[1], 20),
-                                  ("C", op3, PROV_PORTS[2], 20), ("D", op4, PROV_PORTS[3], 2)):
+    for name, sec, port, mult in (("A", op1, PROV_PORTS[0], 20), ("C", op3, PROV_PORTS[2], 20), ("D", op4, PROV_PORTS[3], 2)):
         provs[name] = provider(chain, name, sec, port, mult)
+    # operator 1's second mount, on its own port: the same provider (one payTo, one ledger)
+    pa = provs["A"][0]
+    pa.offer_route(mount("B"), window=WINDOW, lock_wait=LOCK_WAIT, invoice_ttl=INVOICE_TTL, amsat_per_call=PRICES["B"])
+    srv_b = pa.http_server(PROV_PORTS[1])
+    threading.Thread(target=srv_b.serve_forever, daemon=True).start()
+    provs["B"] = (pa, srv_b, provs["A"][2])
     urls = {n: f"http://127.0.0.1:{PROV_PORTS[i]}" for i, n in enumerate("ABCD")}
     check("operator 1 runs A and B under one payTo key", provs["A"][0].pay_to == provs["B"][0].pay_to
           and provs["A"][0].pay_to != provs["C"][0].pay_to, provs["A"][0].pay_to[:18] + "...")
@@ -153,29 +164,38 @@ def main():
     hsrv = hub.http_server(HUB_PORT)
     threading.Thread(target=hsrv.serve_forever, daemon=True).start()
     hub_url = f"http://127.0.0.1:{HUB_PORT}"
-    print("== hub funds one channel to each provider from its own wallet (providers open nothing)")
+    print("== hub funds one channel per payTo from its own wallet (providers open nothing)")
+    committed0 = hub.committed_sat()
     for n in "ABCD":
         cap = 30_000 if n == "D" else 150_000
         oc = hub.connect(urls[n], capacity=cap)
-        print(f"   ch2 hub->{n}: {oc.p().channel_id[:20]}... capacity {cap}")
+        print(f"   ch2 hub->{n}: {oc.p().channel_id[:20]}... capacity {oc.p().capacity}"
+              + (" (A's: one ch2 per payTo)" if oc.origin != urls[n] else ""))
     hub.watch_tick()
-    opened = [n for n in "ABCD" if hub.out.chans[urls[n]].state == "open"]
+
+    def ch2(n):
+        return hub.ch2_for(urls[n])
+    opened = [n for n in "ABCD" if ch2(n).state == "open"]
     check("hub-funded ch2 open to all 4 providers", len(opened) == 4, ",".join(opened))
+    check("one live ch2 per payTo: A and B share one ch2, 3 funded for 4 origins, the cap counts it once",
+          ch2("A").p().channel_id == ch2("B").p().channel_id and len(hub.out.chans) == 3
+          and hub.committed_sat() - committed0 == 150_000 * 2 + 30_000,
+          f"{len(hub.out.chans)} ch2s, {hub.committed_sat() - committed0} sat committed")
     _, h402, _ = hub.serve("GET", "/x402/route", {}, b"", f"http://127.0.0.1:{HUB_PORT}/x402/route")
     routing = unb64json(h402["PAYMENT-REQUIRED"])["accepts"][0]["extra"]["routing"]
-    payers = {n: hub.out.chans[urls[n]].p().close_fee_payer for n in "ABCD"}
+    payers = {n: ch2(n).p().close_fee_payer for n in "ABCD"}
     check("v1.2: the hub advertises payee-pays ch2 (ch1 payer-pays) and every ch2 is payee-pays",
           (routing.get("ch1CloseFeePayer"), routing.get("ch2CloseFeePayer")) == ("payer", "payee")
           and set(payers.values()) == {"payee"},
           f"extra.routing ch1 {routing.get('ch1CloseFeePayer')}, ch2 {routing.get('ch2CloseFeePayer')}; "
-          f"ch2 minCum {hub.out.chans[urls['A']].p().min_amount}")
+          f"ch2 minCum {ch2('A').p().min_amount}")
 
     signer, signer_name = make_signer(chain)
     payer = RoutePayer(hub_url, NET, chain.rpc.getblockcount, fund=chain.fund, signer=signer,
                        capacity=200_000, expiry_blocks=8_000)
     ch1 = payer.open()
     print(f"== client ({signer_name}) opened ONE channel to the hub: {ch1['chan'][:20]}... capacity {ch1['capacity']}")
-    shards = {n: payer.shard(urls[n] + "/v1/chunk") for n in "ABCD"}
+    shards = {n: payer.shard(urls[n] + mount(n)) for n in "ABCD"}
 
     # background: blocks every 1.5 s (rollover confirmations), hub watcher every 0.3 s
     stop = threading.Event()
@@ -257,7 +277,7 @@ def main():
 
     ev = hub.events
     rolls = [e for e in ev if e["event"] == "ch2_rollover"]
-    fee_d = hub.out.chans[urls["D"]].p().close_fee
+    fee_d = ch2("D").p().close_fee
     check("hub rolled D's channel over at D's threshold (net payout >= 2x its own close fee)",
           len(rolls) >= 1 and all(r["amount"] - fee_d >= 2 * fee_d for r in rolls),
           f"{len(rolls)} rollover(s), amounts {[r['amount'] for r in rolls]}, nets {[r['amount'] - fee_d for r in rolls]}")
@@ -269,7 +289,7 @@ def main():
               f"{confs} conf, payee output {paid}, next ch2 {r['nextCapacity']} = {old['params']['capacity']} - {r['amount']}")
 
     voids = [e for e in ev if e["event"] == "void" and e["provider"] == urls["C"]]
-    oc_c = hub.out.chans[urls["C"]]
+    oc_c = ch2("C")
     held = [h for h in provs["C"][0].routes.held if h.get("pre")]
     st2c = next(iter(provs["C"][0].ledger.channels.values()))
     check("C never revealed: the hub wrote the lock off, stopped routing to C", bool(voids) and bool(oc_c.blocked),
@@ -298,7 +318,7 @@ def main():
         s = provs[n][0].routes.sessions[shards[n].session]
         first402 = next((t for t, st in tl[n] if st == 402 and t > t_w), None)
         stops[n] = first402
-        o = provs[n][0].routes.offers["/v1/chunk"]
+        o = provs[n][0].routes.offers[mount(n)]
         per_window = RATE * WINDOW * PRICES[n]
         bound = (o.window + o.lock_wait + 1.0) * RATE * PRICES[n]    # + 1 s: the last window's lock in flight
         owed = s.owed_amsat()
@@ -322,6 +342,12 @@ def main():
               s.paid_sat == sh.locked_sat <= ceil_div(s.accrued_amsat, AMSAT_PER_SAT),
               f"paid {s.paid_sat}, ceil {ceil_div(s.accrued_amsat, AMSAT_PER_SAT)}")
 
+    ab = ch2("A")
+    la, lb = shards["A"].locked_sat, shards["B"].locked_sat
+    check("one ch2 per payTo: A's and B's locks all went over operator 1's one ch2",
+          ch2("B").p().channel_id == ab.p().channel_id and ab.routed == la + lb and la > 0 and lb > 0,
+          f"ch2 routed {ab.routed} = A {la} + B {lb}")
+
     # --- settlement --------------------------------------------------------------------------------
     print("== settle: client closes ch1, hub closes every ch2; check on-chain")
     ib = hub.inbound
@@ -330,9 +356,9 @@ def main():
     c1 = payer.close()
     closes = {}
     for n in "ABCD":
-        oc = hub.out.chans[urls[n]]
-        if oc.state == "open":
-            closes[n] = hub.close_ch2(oc)
+        oc = ch2(n)
+        if oc is not None and oc.state == "open":        # B's ch2 is A's: closed once
+            closes["A+B" if n == "A" else n] = hub.close_ch2(oc)
     chain.mine()
     confs, paid1 = chain.payee_out(c1["txid"], st1.params.payee_spk)
     check("ch1 close confirmed, pays the hub its best state", confs >= 1 and paid1 == best1 == int(c1["cum"]),
@@ -346,7 +372,7 @@ def main():
             print(f"   ch2 {n}: {c['chan'][:16]}... has no state yet (opened by a rollover): nothing to close")
             del closes[n]
             continue
-        st2 = next(s for s in provs[n][0].ledger.channels.values() if s.closed_txid == c["txid"])
+        st2 = next(s for s in provs[n[0]][0].ledger.channels.values() if s.closed_txid == c["txid"])
         confs, paid = chain.payee_out(c["txid"], st2.params.payee_spk)
         routed = int(st2.extra.get("routed_sat", 0))
         fee2 = st2.params.close_fee

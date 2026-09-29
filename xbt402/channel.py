@@ -25,6 +25,8 @@ from .tx import (OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_DROP
                  tagged_hash, unified_sighash)
 
 DUST = 546            # conservative dust floor for any output we create
+RBF_SEQUENCE = 0xFFFFFFFD   # a refund that signals replaceability (BIP125): the hub re-signs a stuck ch2 refund
+                            # at a higher fee (AGP-044); below 0xFFFFFFFE, so nLockTime is still enforced
 STATE_VSIZE = 190     # 1-in/2-out close: ~113 B base + ~229 B witness -> ~171 vB, plus room for a P2TR change
 REFUND_VSIZE = 140    # 1-in/1-out refund
 EXPIRY_MAX = 500_000_000  # below this nLockTime/CLTV is a block height
@@ -223,11 +225,12 @@ class ChannelParams:
         return unified_sighash(tx, [self.funding_prevout()], 0, ST_WITNESS_V0, self.script,
                                SIGHASH_ALL_UNIFIED)
 
-    def refund_tx(self, payer_secret: int, dest_spk: bytes = None, fee: int = None) -> Tx:
-        """Payer's unilateral refund, valid once the chain reaches `expiry`."""
+    def refund_tx(self, payer_secret: int, dest_spk: bytes = None, fee: int = None, sequence: int = 0xFFFFFFFE) -> Tx:
+        """Payer's unilateral refund, valid once the chain reaches `expiry`. `sequence` RBF_SEQUENCE
+        makes it replaceable (the hub's ch2 refunds, AGP-044)."""
         dest = dest_spk if dest_spk is not None else bytes.fromhex(self.payer_spk)
         fee = self.close_fee if fee is None else fee
-        tx = Tx(version=2, inputs=[self._funding_in(0xFFFFFFFE)],
+        tx = Tx(version=2, inputs=[self._funding_in(sequence)],
                 outputs=[TxOut(self.capacity - fee, dest)],
                 locktime=self.expiry)
         sig = ecc.sign(payer_secret, self.sighash(tx)) + bytes([SIGHASH_ALL_UNIFIED])

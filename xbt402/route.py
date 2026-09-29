@@ -51,6 +51,21 @@ def ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def canon_origin(origin: str) -> str:
+    """A provider origin as the hub keys it (AGP-044, Rust `route::canon_origin`): scheme and host
+    lowercased, the default port (:80 for http, :443 for https) and trailing '/'s dropped."""
+    o = origin.strip().rstrip("/")
+    if "://" not in o:
+        return o
+    scheme, rest = o.split("://", 1)
+    scheme = scheme.lower()
+    host, path = (rest.split("/", 1)[0], "/" + rest.split("/", 1)[1]) if "/" in rest else (rest, "")
+    host = host.lower()
+    if (scheme == "http" and host.endswith(":80")) or (scheme == "https" and host.endswith(":443")):
+        host = host[:host.rfind(":")]
+    return f"{scheme}://{host}{path}"
+
+
 def route_ok(tip: int, in_expiry: int, out_expiry: int, close_margin: int, delta: int) -> bool:
     """May the hub forward a lock from the channel expiring at `in_expiry` into the one expiring at
     `out_expiry`? An adaptor-locked state has no timeout of its own: the provider can complete and
