@@ -212,25 +212,35 @@ class RoutePayer:
         self.events.append({"event": "lock", "provider": sh.origin, "lockId": p["lockId"], "amount": p["d"],
                             "fee": p["f"], "cum1": p["cum"], "via": via, "t": t_hex[:16]})
 
+    def _via_provider(self, p: dict) -> bool:
+        """Under self._lock: the provider's signed ROUTE-STATE says this lock was paid: its t is our
+        receipt even if the hub keeps t + r. Resolves the lock and returns True."""
+        ll = p["shard"].last_lock or {}
+        if ll.get("lockId") != p["lockId"]:
+            return False
+        t = int(ll["secret"], 16)
+        if adaptor.point_of(t) != adaptor.dec(p["T"]):
+            return False
+        if not p["floor"]:
+            self.signer.resolve_lock(self.chan, f"{t:064x}")
+        self.pending = {}
+        self._commit(p, f"{t:064x}", "provider")
+        return True
+
     def _check_pending(self, from_shard: Shard = None):
         with self._lock:
             p = self.pending
             if not p:
                 return
             sh = p["shard"]
-            if from_shard is not None and from_shard is not sh:
+            if from_shard is not None and (from_shard is not sh or p.get("inflight")):
+                # a data call never resolves a lock whose POST is still out (AGP-054): the hub's answer
+                # is on its way and settles it off the data path (a signer's write-ahead is fsyncs); a
+                # lost or refused answer leaves it to the next check, which reads the provider's t
                 return
-            ll = sh.last_lock or {}
-            if ll.get("lockId") == p["lockId"]:
-                # the provider was paid for this lock: its t is our receipt even if the hub keeps t + r
-                t = int(ll["secret"], 16)
-                if adaptor.point_of(t) != adaptor.dec(p["T"]):
-                    return
-                if not p["floor"]:
-                    self.signer.resolve_lock(self.chan, f"{t:064x}")
-                self.pending = {}
-                self._commit(p, f"{t:064x}", "provider")
-            elif time.time() > p["until"] and not p.get("inflight"):
+            if self._via_provider(p):
+                return
+            if time.time() > p["until"] and not p.get("inflight"):
                 # never while our request is out: the hub may still complete it
                 self._void(p, "invoice expired unanswered")
 
@@ -348,7 +358,10 @@ class RoutePayer:
                 self._void(p, "hub: resynced")
                 return {"status": "resynced"}
             if st in (400, 401, 402, 502) and isinstance(code, str):
-                # the hub refused (or the provider did, through it): nothing was completed with t
+                # the hub refused (or the provider did, through it): nothing was completed with t,
+                # unless the provider's signed ROUTE-STATE already says it was paid
+                if self._via_provider(p):
+                    return {"status": "paid", "amount": d, "fee": f, "lockId": p["lockId"], "via": "provider"}
                 self.stats["refused"][code] = self.stats["refused"].get(code, 0) + 1
                 self._void(p, f"hub: {code}")
                 return {"status": "refused", "error": code}

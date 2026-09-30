@@ -17,7 +17,8 @@ This module holds what the three roles share:
     lock but can neither change its amount nor its target);
   * `RouteSeller`, the provider side: sessions metered in amsat, the optimistic credit window,
     completion of adaptor-locked ch2 states (write-ahead), and a fresh point per window;
-  * `find_spend`, used by the hub's watcher to read t off a ch2 close.
+  * `find_spend`, used by the hub's watcher to read t off a ch2 close;
+  * `RouteWal` (AGP-054), the provider's optional write-ahead log of each session's meter.
 
 Units: amsat = 1e-18 msat (cmp/pricing.py), so 1 sat = 10**21 amsat. Running totals are exact;
 whole sats appear only in lock amounts, as the ceil of the running total minus what is already paid.
@@ -29,6 +30,7 @@ import os
 import secrets
 import threading
 import time
+import weakref
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
@@ -244,6 +246,212 @@ def lock_auth(key: bytes, session: str, lock_id: str, amount: int, point: str, h
     return hmac.new(key, msg.encode(), hashlib.sha256).hexdigest()
 
 
+# --- provider write-ahead log of the route meter (AGP-054) ------------------------------------------
+class RouteWal:
+    """A routed session's meter (seq, calls, accruedAmsat, unpaid_since) made durable before the
+    ROUTE-STATE that carries it leaves, without an fsync on the call's critical path.
+
+    Without it, RouteSeller keeps the meter in memory between saves of its routes file (open, lock),
+    so a crash loses what was served since the last lock (the client's signed states run ahead of
+    the provider) and rewinds seq (an already-served ROUTE-AUTH is taken again). A caller that needs
+    that (cmp's RouteJournal) paid one fdatasync per call after the handler.
+
+    Here every record is a snapshot of one session's meter PROJECTED over its calls in flight
+    (`RouteSeller.reserve`: the charge a call is expected to bill, known before it runs), versioned
+    by `v`. One writer thread appends whatever is queued and fdatasyncs it (group commit: a record
+    waits at most for the fsync in progress plus its own). So the fsync runs while the handler
+    computes, and the answer waits only for what is left of it. A call whose charge differs from
+    its projection (an error, a 5xx, fewer tokens) writes a corrected snapshot and waits for that.
+
+    Invariants (tests/security/test_agp054_route_wal.py):
+      * every ROUTE-STATE that left is covered by a durable snapshot: after a restart, seq, calls
+        and accrued are >= what any answer carried;
+      * a restart can count more only for calls that were authenticated and not answered (in
+        flight at the crash), each at its projected charge: the in-doubt chunk a client already
+        accounts for (cmp: MAX_IN_DOUBT per route session); the projection is exact, so it is
+        never more than such a call would have billed;
+      * a seq is durable before its handler runs, so no ROUTE-AUTH is served twice across a crash.
+
+    Replay (at start): the snapshot with the highest `v` per session wins over the routes file when
+    its `v` is above the routes file's `walV` (the version at that file's last save). The file is
+    rewritten as one snapshot per session once it passes `compact_bytes`."""
+
+    def __init__(self, path: str, compact_bytes: int = 1 << 20):
+        self.path, self.compact_bytes = path, int(compact_bytes)
+        self._cv = threading.Condition()
+        self._queue: list = []            # (v, line)
+        self._durable = 0                 # every v <= this is on disk
+        self._failed: list = []           # (lo, hi) v ranges whose write failed
+        self._latest: Dict[str, bytes] = {}
+        self._fh = None
+        self._thread = None
+        self.v = 0
+        self.fsyncs = 0
+        self.error = ""
+        for sid, rec in self.read().items():
+            self.v = max(self.v, int(rec["v"]))
+            self._latest[sid] = self._line(rec)
+
+    @staticmethod
+    def _line(rec: dict) -> bytes:
+        return (json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n").encode()
+
+    def read(self) -> Dict[str, dict]:
+        """The highest-v snapshot per session, from every whole line (a torn last line was never
+        acknowledged: its call was never answered)."""
+        out: Dict[str, dict] = {}
+        if not os.path.exists(self.path):
+            return out
+        with open(self.path, "rb") as f:
+            for raw in f:
+                try:
+                    r = json.loads(raw)
+                    sid, v = str(r["s"]), int(r["v"])
+                    rec = {"s": sid, "v": v, "seq": int(r["seq"]), "calls": int(r["calls"]),
+                           "acc": str(int(r["acc"])), "us": float(r.get("us") or 0.0)}
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if sid not in out or v > out[sid]["v"]:
+                    out[sid] = rec
+        return out
+
+    def submit(self, sid: str, seq: int, calls: int, acc: int, us: float) -> int:
+        """Queue one snapshot; returns its version (the ticket to `wait` for). Never blocks on I/O."""
+        with self._cv:
+            self.v += 1
+            v = self.v
+            self._queue.append((v, sid, self._line({"s": sid, "v": v, "seq": int(seq), "calls": int(calls),
+                                                    "acc": str(int(acc)), "us": round(float(us), 3)})))
+            if self._thread is None:
+                self._thread = threading.Thread(target=RouteWal._writer, args=(weakref.ref(self),), daemon=True,
+                                                name="route-wal")
+                self._thread.start()
+            self._cv.notify_all()
+            return v
+
+    def wait(self, v: int, timeout: float = 30.0) -> None:
+        """Return once snapshot `v` is durable; OSError if its write failed (or timed out)."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            while True:
+                if any(lo <= v <= hi for lo, hi in self._failed):
+                    raise OSError(f"route wal {self.path}: {self.error or 'write failed'}")
+                if self._durable >= v:
+                    return
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise OSError(f"route wal {self.path}: not durable after {timeout} s")
+                self._cv.wait(left)
+
+    def forget(self, sid: str) -> None:
+        """A pruned session: left out of the next compaction."""
+        with self._cv:
+            self._latest.pop(sid, None)
+
+    @staticmethod
+    def _writer(ref):
+        """The writer thread holds its RouteWal only weakly between batches: it ends once the
+        provider that owns it is gone."""
+        while True:
+            w = ref()
+            if w is None or not w._step():
+                return
+            del w
+
+    def _step(self) -> bool:
+        with self._cv:
+            if not self._queue:
+                self._cv.wait(1.0)
+            if not self._queue:
+                return True
+        self._run_batch()
+        return True
+
+    def _run_batch(self):
+        with self._cv:
+            batch, self._queue = self._queue, []
+        lo, hi = batch[0][0], batch[-1][0]
+        try:
+            self._write(batch)
+        except OSError as e:
+            with self._cv:
+                self.error = str(e)
+                self._failed = (self._failed + [(lo, hi)])[-64:]
+                self._durable = max(self._durable, hi)   # waiters of this batch see _failed first
+                self._cv.notify_all()
+            return
+        with self._cv:
+            self._durable = hi
+            for _, sid, line in batch:
+                self._latest[sid] = line
+            self._cv.notify_all()
+        if self._fh is not None and self._fh.tell() > self.compact_bytes:
+            try:
+                self._compact()
+            except OSError:
+                pass                      # the log still holds every line: retried after the next batch
+
+    def __del__(self):
+        fh = getattr(self, "_fh", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    def _write(self, batch):
+        created = False
+        if self._fh is None:
+            created = not os.path.exists(self.path)
+            self._fh = open(self.path, "ab")
+        start = self._fh.tell()
+        try:
+            self._fh.write(b"".join(line for _, _, line in batch))
+            self._fh.flush()
+            os.fdatasync(self._fh.fileno()) if hasattr(os, "fdatasync") else os.fsync(self._fh.fileno())
+            self.fsyncs += 1
+            if created:
+                _fsync_dir(self.path)
+        except OSError:
+            try:
+                self._fh.truncate(start)
+                self._fh.seek(start)
+            except (OSError, ValueError):
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+            raise
+
+    def _compact(self):
+        """In the writer thread: one snapshot per live session, fsynced, renamed over the log."""
+        with self._cv:
+            lines = list(self._latest.values())
+        tmp = self.path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(b"".join(lines))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        _fsync_dir(self.path)
+        self._fh.close()
+        self._fh = open(self.path, "ab")
+
+
+def _fsync_dir(path: str):
+    try:
+        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 # --- provider side ------------------------------------------------------------------------------
 @dataclass
 class RouteSession:
@@ -277,6 +485,9 @@ class RouteOffer:
     amsat_per_call: int = 0
     unit: str = "call"
     credit_msat: int = 0          # optional hard cap on unpaid credit (0: time-based only)
+    charge: Optional[Callable] = None     # (method, path, status, body) -> amsat, after serving
+    precharge: Optional[Callable] = None  # (method, path, body) -> amsat the call will bill, before it runs
+                                          # (AGP-054: its meter is written ahead while the handler runs)
 
 
 class RouteSeller:
@@ -287,7 +498,7 @@ class RouteSeller:
     never arrives and the provider stops within one window: its loss is at most one window of that
     session's traffic, the client's at most one lock per provider."""
 
-    def __init__(self, provider, path: str = None):
+    def __init__(self, provider, path: str = None, wal_path: str = None):
         self.p = provider
         self.offers: Dict[str, RouteOffer] = {}
         self.sessions: Dict[str, RouteSession] = {}
@@ -295,20 +506,51 @@ class RouteSeller:
         self.path = path
         self._quote_seq = int(time.time())
         self._quotes: Dict[str, PriceQuote] = {}
+        self._saved_v = 0             # RouteWal version at the routes file's last save (its "walV")
         if path and os.path.exists(path):
             with open(path) as f:
                 raw = json.load(f)
             self.sessions = {k: RouteSession(**v) for k, v in raw.get("sessions", {}).items()}
+            self._saved_v = int(raw.get("walV", 0))
         self._keys: Dict[str, bytes] = {}
+        self._invoices: Dict[str, tuple] = {}   # session -> ((lockId, validUntil), signed invoice): one sign per window
+        self._inflight: Dict[str, list] = {}    # session -> [calls, amsat] reserved and not yet ended (AGP-054)
+        self.wal = RouteWal(wal_path) if wal_path else None
+        if self.wal is not None:
+            self._replay()
         self.no_reveal = False        # tests/demo: take locks, never reveal t (a withholding provider)
         self.held: list = []
+
+    def _replay(self):
+        """At start: a session's meter from the RouteWal where its snapshot is newer than the routes
+        file (v above walV), then one save, so the routes file carries it."""
+        changed = False
+        for sid, r in self.wal.read().items():
+            s = self.sessions.get(sid)
+            if s is None or r["v"] <= self._saved_v:
+                continue
+            s.seq, s.calls = max(int(s.seq), r["seq"]), r["calls"]
+            s.accrued_amsat, s.unpaid_since = int(r["acc"]), float(r["us"])
+            changed = True
+        if changed:
+            self._save()
+
+    def _persisted(self, s: RouteSession) -> dict:
+        """A session as the routes file keeps it: its meter projected over its calls in flight (the
+        same snapshot a RouteWal line holds), so a save supersedes no reservation (AGP-054)."""
+        d = asdict(s)
+        if s.session in self._inflight:
+            d["seq"], d["calls"], d["accrued_amsat"], d["unpaid_since"] = self._projected(s)
+        return d
 
     def _save(self):
         if not self.path:
             return
+        if self.wal is not None:
+            self._saved_v = self.wal.v    # every snapshot up to here is superseded by this file
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"sessions": {k: asdict(v) for k, v in self.sessions.items()}}, f)
+            json.dump({"sessions": {k: self._persisted(v) for k, v in self.sessions.items()}, "walV": self._saved_v}, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
@@ -346,9 +588,17 @@ class RouteSeller:
         s.valid_until = time.time() + o.invoice_ttl
 
     def invoice(self, s: RouteSession) -> dict:
+        """The window's signed invoice. It only changes with the window (and ECDSA signing is
+        deterministic), so it is signed once per window, not on every ROUTE-STATE (AGP-054)."""
         o = self.offers[s.path]
-        return asdict(Invoice(self.p.pay_to, self.p.network, s.session, s.lock_id, s.point,
-                              round(s.valid_until, 3), o.hubs).sign(self.p.secret))
+        key = (s.lock_id, s.point, round(s.valid_until, 3), json.dumps(o.hubs, sort_keys=True))
+        hit = self._invoices.get(s.session)
+        if hit is not None and hit[0] == key:
+            return dict(hit[1])
+        inv = asdict(Invoice(self.p.pay_to, self.p.network, s.session, s.lock_id, s.point,
+                             round(s.valid_until, 3), o.hubs).sign(self.p.secret))
+        self._invoices[s.session] = (key, inv)
+        return dict(inv)
 
     def open_session(self, path: str, client_pub_hex: str) -> RouteSession:
         pub = bytes.fromhex(client_pub_hex)
@@ -415,15 +665,81 @@ class RouteSeller:
             err = self._serving(s, time.time())
             return s, err
 
-    def end_call(self, s: RouteSession, charge_amsat: int) -> dict:
+    def _projected(self, s: RouteSession) -> tuple:
+        """Under self.lock: (seq, calls, accrued, unpaid_since) with the calls in flight counted at
+        their reserved charges: what a restart may bill (AGP-054)."""
+        n, amt = self._inflight.get(s.session) or (0, 0)
+        us = s.unpaid_since
+        if amt > 0 and s.owed_amsat() <= 0:
+            us = time.time()
+        return s.seq, s.calls + n, s.accrued_amsat + amt, us
+
+    def _submit(self, s: RouteSession) -> int:
+        return self.wal.submit(s.session, *self._projected(s))
+
+    def reserve(self, s: RouteSession, expect_amsat: int) -> Optional[tuple]:
+        """Before the handler runs (AGP-054): count the call in flight at `expect_amsat` and queue its
+        session's projected meter, so the fsync overlaps the handler. Returns the ticket for
+        end_call (None without a RouteWal)."""
+        if self.wal is None:
+            return None
+        expect = max(0, int(expect_amsat))
+        with self.lock:
+            inf = self._inflight.setdefault(s.session, [0, 0])
+            inf[0] += 1
+            inf[1] += expect
+            return (self._submit(s), expect)
+
+    def _unreserve(self, s: RouteSession, ticket) -> None:
+        inf = self._inflight.get(s.session)
+        if ticket is None or inf is None:
+            return
+        inf[0] -= 1
+        inf[1] -= ticket[1]
+        if inf[0] <= 0:
+            self._inflight.pop(s.session, None)
+
+    def cancel(self, s: RouteSession, ticket) -> None:
+        """The handler raised: the call bills nothing. Its projection is corrected (not waited for:
+        no answer leaves, and until the correction is on disk the call is an in-doubt one)."""
+        if ticket is None:
+            return
+        with self.lock:
+            self._unreserve(s, ticket)
+            self._submit(s)
+
+    def end_call(self, s: RouteSession, charge_amsat: int, ticket=None) -> dict:
+        """Meter the call and return its ROUTE-STATE. With a RouteWal the state is returned only once
+        a snapshot covering it is durable: the reserved one when the charge is what was projected
+        and no routes-file save superseded it, else a fresh one. On a write failure the call is taken
+        back (nothing billed) and ChannelError('route_wal_failed') is raised: no state may leave."""
         with self.lock:
             now = time.time()
+            self._unreserve(s, ticket)
             if charge_amsat > 0:
                 if s.owed_amsat() <= 0:
                     s.unpaid_since = now
                 s.accrued_amsat += charge_amsat
             s.calls += 1
-            return self.state(s, charge_amsat)
+            state = self.state(s, charge_amsat)
+            if self.wal is None:
+                return state
+            if ticket is None or ticket[1] != charge_amsat:
+                # a reserved snapshot (or a routes-file save after it, which projects the same way)
+                # already covers this state; any other charge needs its own
+                v = self._submit(s)
+            else:
+                v = ticket[0]
+        try:
+            self.wal.wait(v)
+        except OSError as e:
+            with self.lock:
+                s.accrued_amsat -= charge_amsat
+                s.calls -= 1
+                if s.owed_amsat() <= 0:
+                    s.unpaid_since = 0.0
+            raise ChannelError("route_wal_failed", str(e))
+        return state
 
     # adaptor-locked ch2 states (from the hub) ----------------------------------------------------
     def complete_lock(self, st, pl: dict, route: dict) -> dict:

@@ -192,7 +192,7 @@ class XbtChannelProvider:
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
                  max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
                  close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36,
-                 rollover_zero_conf_max: int = None):
+                 rollover_zero_conf_max: int = None, route_wal: str = None):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
         if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
@@ -224,21 +224,29 @@ class XbtChannelProvider:
         # up to this cum while it stays unconfirmed. None: two settlements' worth; 0: never (open at minConf)
         self.rollover_zero_conf_max = (2 * self.settle_multiple * int(close_fee) if rollover_zero_conf_max is None
                                        else int(rollover_zero_conf_max))
+        # AGP-054 route_wal: a path makes each routed session's meter (seq, calls, accrued) durable
+        # before its ROUTE-STATE leaves, written ahead while the handler runs (offer_route precharge)
         self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
-                                  + ".routes.json")
+                                  + ".routes.json", wal_path=route_wal)
 
     def offer_route(self, path: str, window: float = 1.0, lock_wait: float = 2.0, invoice_ttl: float = 15.0,
                     hubs="any", amsat_per_call: int = 0, unit: str = "call", credit_msat: int = 0,
-                    charge: Callable = None):
+                    charge: Callable = None, precharge: Callable = None):
         """Sell `path` through hubs (AGP-021). Its 402 carries `extra.route`: the signed price quote and,
         for a client that names its route key (ROUTE-CLIENT header), a session with a fresh lock point
         T per window, signed by payTo. Calls carry ROUTE-AUTH and are metered in amsat
         (`amsat_per_call`, or `charge(method, path, status, body) -> amsat`); each window's accrued
         amount is paid by one adaptor-locked ch2 state from a hub. A session is served while its
-        unpaid charges are younger than `window + lock_wait` (the lock wait is configurable)."""
+        unpaid charges are younger than `window + lock_wait` (the lock wait is configurable).
+
+        With a `route_wal` (AGP-054), `precharge(method, path, body) -> amsat` is what the call will
+        bill, known before it runs (a flat path needs none: amsat_per_call). Its session's meter is
+        then written ahead while the handler runs, and the answer waits only for what is left of that
+        fsync. A charge that differs from it costs one more fsync; None or an exception: no overlap."""
         o = self.routes.offer(path, window=window, lock_wait=lock_wait, invoice_ttl=invoice_ttl, hubs=hubs,
                               amsat_per_call=amsat_per_call, unit=unit, credit_msat=credit_msat)
         o.charge = charge
+        o.precharge = precharge
         return o
 
     def terms(self) -> dict:
@@ -901,7 +909,21 @@ class XbtChannelProvider:
                     doc["routeState"] = self.routes.state(s)
             h["PAYMENT-REQUIRED"] = b64json(doc)
             return 402, h, json.dumps(doc).encode()
-        status, hdrs, out = self.handler(method, path, body)
+        ticket = None
+        if self.routes.wal is not None:
+            expect = int(o.amsat_per_call) if not getattr(o, "charge", None) else None
+            if getattr(o, "precharge", None):
+                try:
+                    expect = o.precharge(method, path, body)
+                except Exception:  # noqa: BLE001 - a bad hint only costs the overlap
+                    expect = None
+            if expect is not None:
+                ticket = self.routes.reserve(s, int(expect))
+        try:
+            status, hdrs, out = self.handler(method, path, body)
+        except BaseException:
+            self.routes.cancel(s, ticket)
+            raise
         if unsafe_headers(hdrs):
             status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
         charge = int(o.amsat_per_call)
@@ -909,7 +931,13 @@ class XbtChannelProvider:
             charge = int(o.charge(method, path, status, out))
         if status >= 500:
             charge = 0
-        state = self.routes.end_call(s, max(0, charge))
+        try:
+            state = self.routes.end_call(s, max(0, charge), ticket)
+        except ChannelError as e:
+            if e.code != "route_wal_failed":
+                raise
+            return 500, {"Content-Type": "application/json"}, json.dumps(
+                {"error": "route_wal_failed", "detail": "the route meter is not durable: this call is not billed"}).encode()
         hdrs = dict(hdrs)
         hdrs["ROUTE-STATE"] = b64json(state)
         return status, hdrs, out

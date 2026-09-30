@@ -56,3 +56,43 @@ status, headers, body = payer.call(sh, "POST", chunk)   # per chunk
 hub = RouteHub(rpc, pay_to_secret, network, datadir, fund, HubConfig.from_dict(conf["hub"]))
 hub.connect(provider_url); hub.watch(5); hub.http_server(port).serve_forever()
 ```
+
+## Routed billing throughput (AGP-054)
+cmp measured routed decode at 0.742 of unpaid (CMP-024), about 4-5 ms of billing per stage per
+token. A profile of the per-call path (`scripts/route_perf.py`, spans on cmp's operator app) put
+most of it in one place: cmp's `RouteJournal` fdatasyncs every routed call's meter after the
+handler and before the answer (2.5 ms on the lab's ext4, 66% of the provider-side cost). The
+rails' own crypto is small: ROUTE-STATE signing 0.12 ms, the client's verify 0.03 ms.
+
+**RouteWal** (`XbtChannelProvider(route_wal=path)`, `offer_route(..., precharge=)`) makes the same
+guarantee the rails' own, with the fsync off the critical path:
+* before the handler runs, `reserve` counts the call in flight at its expected charge (`precharge`,
+  or `amsat_per_call` on a flat path) and queues the session's projected meter
+  `{s, v, seq, calls, acc, us}`;
+* one writer thread appends what is queued and fdatasyncs it (group commit), while the handler
+  computes;
+* `end_call` returns the ROUTE-STATE only once a snapshot covering it is durable: the reserved one
+  when the charge is as projected, else a corrected one (one more fsync);
+* a write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed;
+* the routes file keeps each session projected over its calls in flight, plus `walV`. A save during
+  a call (a lock completing) therefore covers that call's reservation. At start, a WAL snapshot wins
+  over the routes file when its `v` is above `walV`. The log is compacted to one line per session
+  past 1 MiB.
+
+What a crash can do now:
+* every answered state survives it;
+* a seq is durable before its handler runs, so a ROUTE-AUTH is never served twice;
+* the restart counts more only for calls in flight at the crash, once each, at their projected
+  charge. Those are the in-doubt chunks a client already reconciles (cmp: `MAX_IN_DOUBT` per route
+  session).
+
+**RoutePayer.** A data call no longer resolves a lock whose POST to the hub is still out. The hub's
+answer settles it off the data path, so a signer's write-ahead fsyncs (B2 `resolve_lock`: about
+3 fsyncs) no longer land on a chunk. A hub refusal of a lock that the provider's signed ROUTE-STATE
+shows as paid now resolves it through the provider, instead of voiding it.
+
+**ROUTE-STATE.** The window's invoice is signed once per window, not on every call. The bytes are
+identical because ECDSA signing is deterministic.
+
+Tests: `tests/security/test_agp054_route_wal.py` (16). In Rust: `crates/xbt402-interop/tests/route_wal.rs`
+(12) and `routing_checks.rs` `agp054_*` (2).
