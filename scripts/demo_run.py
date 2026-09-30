@@ -91,11 +91,11 @@ def main():
     st, h, _ = client.http("GET", base + "/v1/infer")
     pr = unb64json(h["PAYMENT-REQUIRED"])
     acc = pr["accepts"][0]
-    check(st == 402 and pr["x402Version"] == 2 and acc["scheme"] == "xbt-channel" and acc["network"] == net,
+    check(st == 402 and pr["x402Version"] == 2 and acc["scheme"] == "batch-settlement" and acc["network"] == net,
           f"402 PAYMENT-REQUIRED: scheme={acc['scheme']} amount={acc['amount']} {acc['asset']} "
           f"billing={acc['extra']['billing']} closeFeeSat={acc['extra']['closeFeeSat']}")
     sup, _, body = client.http("GET", base + "/x402/supported")
-    check(sup == 200 and json.loads(body)["kinds"][0]["scheme"] == "xbt-channel",
+    check(sup == 200 and json.loads(body)["kinds"][0]["scheme"] == "batch-settlement",
           "facilitator /x402/supported lists xbt-channel")
 
     print(f"[2] signer-backed SDK + httpx: {CALLS} postpay calls at {PRICE} sat")

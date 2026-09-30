@@ -1,4 +1,4 @@
-# xbt402: HTTP 402 payment channels on XBT (x402 scheme `xbt-channel`)
+# xbt402: HTTP 402 payment channels on XBT (x402 `batch-settlement` XBT channel binding)
 
 **Version 1.1-draft**, 2026-09-25. Status: draft, unpublished. **Not wire-compatible with v1.0**: the
 payee key commits to the network (§5.1, §11) and the payment response and facilitator bodies use the
@@ -14,7 +14,7 @@ The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT and MAY are to be int
 in RFC 2119 and RFC 8174 when, and only when, they appear in all capitals.
 
 Companion documents in this directory:
-- `scheme_xbt-channel.md`: the same protocol as an x402 scheme proposal, in the upstream format.
+- `scheme_batch_settlement_xbt.md`: the same protocol as an x402 scheme proposal (XBT binding of `batch-settlement`). `scheme_xbt-channel.md` is a pointer to it.
 - `vectors.json` and `check_vectors.py`: test vectors, recomputed from the reference implementation.
 
 ## Contents
@@ -111,7 +111,7 @@ being served). Under **prepay** the client risks one call. Neither can take more
 
 | Name | Value | Where | Notes |
 |---|---|---|---|
-| `scheme` | `xbt-channel` | wire | |
+| `scheme` | `batch-settlement` (`xbt-channel` accepted on input) | wire | |
 | `network`, mainnet | `bip122:0000000000000050c1e5f69672f45929` | wire | CAIP-2 `bip122:` + the first 32 hex characters of the hash of block 961640, the first BLAKE2b block (`0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb`). XBT shares Bitcoin's genesis, so, as other Bitcoin forks do, it is identified by a post-fork block. Block 961640 rather than 961632 (the first BIP-110 block) because a SHA-256 chain enforcing BIP-110 without the proof-of-work change would share 961632–961639. |
 | `network`, regtest | `bip122:` + first 32 hex of block 101 | wire | Same rule, on the block where regtest switches to BLAKE2b. |
 | `asset` | `XBT:sat` | wire | Not a CAIP-19 identifier; see [open questions](scheme_xbt-channel.md#open-questions). |
@@ -285,14 +285,14 @@ input; implementations emit lowercase.
 ```json
 {"x402Version":2,"error":"payment_required",
  "resource":{"url":"https://api.example.com/v1/infer?model=small"},
- "accepts":[{"scheme":"xbt-channel","network":"bip122:0000000000000050c1e5f69672f45929",
+ "accepts":[{"scheme":"batch-settlement","network":"bip122:0000000000000050c1e5f69672f45929",
    "amount":"150","asset":"XBT:sat",
    "payTo":"02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
    "maxTimeoutSeconds":30,
    "extra":{"minCapacity":"20000","maxCapacity":"10000000","minExpiryBlocks":1008,
             "maxExpiryBlocks":8640,"closeMarginBlocks":144,"minConf":1,"closeFeeSat":"600",
             "openUrl":"/x402/xbt-channel/open","closeUrl":"/x402/xbt-channel/close",
-            "billing":"postpay","derivation":"v2"}}]}
+            "billing":"postpay","derivation":"v2","assetTransferMethod":"channel"}}]}
 ```
 - `amount` is the per-call **maximum**. A metered call may charge less (x402 `upto`).
 - `payTo` is the provider's 33-byte identity key (hex), not an address.
@@ -392,7 +392,7 @@ response with the channel receipt in `extra`:
 ```json
 {"success":true,"transaction":"","network":"bip122:…","payer":"<A hex>","amount":"",
  "extra":{"chargedAmount":"150",
-          "receipt":{"scheme":"xbt-channel","chan":"<txid>:<vout>","seq":5,"cum":"600","charged":"150",
+          "receipt":{"scheme":"batch-settlement","chan":"<txid>:<vout>","seq":5,"cum":"600","charged":"150",
                      "spentMsat":"750000","owedMsat":"150000","creditMsat":"0","expiry":2014,
                      "req":"<hex>","sig":"<DER hex>"}}}
 ```
@@ -436,21 +436,21 @@ they never shadow an API route of the same name (L6). Bodies follow x402 v2:
  "paymentRequirements":<PaymentRequirements>}
 ```
 Both `paymentRequirements` and `paymentPayload.accepted` MUST name this scheme, the provider's network
-and its `payTo` (else `invalid_xbt_channel_scheme_or_network`); anything else malformed is
-`invalid_xbt_channel_payload`. Answers are HTTP 200 whether valid or not; the reason codes are the
+and its `payTo` (else `invalid_batch_settlement_xbt_scheme_or_network`); anything else malformed is
+`invalid_batch_settlement_xbt_payload`. Answers are HTTP 200 whether valid or not; the reason codes are the
 upstream-style names of Appendix B.
 - `GET /x402/supported` →
-  `{"kinds":[{"x402Version":2,"scheme":"xbt-channel","network":"bip122:…"}],"extensions":[],"signers":{}}`.
+  `{"kinds":[{"x402Version":2,"scheme":"batch-settlement","network":"bip122:…"}],"extensions":[],"signers":{}}`.
 - `POST /x402/verify`, `payload = {"chan","cum","sig"}`: checks a signed state and records it if higher.
   It is unauthenticated, so it MUST require `sig` for exactly the `cum` given, MUST report nothing the
   caller did not send, MUST NOT check `auth` and MUST NOT move `seq` (otherwise a stranger learns `cum`,
   or locks the client out with a huge `seq`). A state for a channel that is closed, closing (tip at or
   above `expiry − closeMarginBlocks`) or suspended is answered `isValid: false`
-  (`invalid_xbt_channel_closing` / `invalid_xbt_channel_unconfirmed`) even when its signature is good:
+  (`invalid_batch_settlement_xbt_closing` / `invalid_batch_settlement_xbt_unconfirmed`) even when its signature is good:
   a resource server serves on `isValid` (L11). A higher state is still recorded while the channel is
   open or closing. Answer: a `VerifyResponse`,
   `{"isValid":true,"payer":"<A hex>","extra":{"chan","cum"}}` or
-  `{"isValid":false,"invalidReason":"invalid_xbt_channel_signature"}`. This is also how a client hands
+  `{"isValid":false,"invalidReason":"invalid_batch_settlement_xbt_signature"}`. This is also how a client hands
   over a folded conditional state (§6.5).
 - `POST /x402/settle`, `payload` = the close request of §7.5 (`{"chan","sig","payload"?}`): closes the
   channel under the same rules. Answer: a `SettlementResponse`,
@@ -763,7 +763,7 @@ Breaking (a v1.1 party refuses a v1.0 one at the 402 or the open, before any fun
   `extra.receipt` and `extra.chargedAmount`. The receipt keeps its signed fields and signature; its
   `success` and `network` moved to the envelope, and it names its `scheme`.
 - **Facilitator bodies are x402 v2** (§7.6): `{x402Version, paymentPayload, paymentRequirements}` in,
-  `VerifyResponse` / `SettlementResponse` out, with `invalid_xbt_channel_*` reasons (Appendix B).
+  `VerifyResponse` / `SettlementResponse` out, with `invalid_batch_settlement_xbt_*` reasons (Appendix B).
   `kinds` entries carry `x402Version`.
 - **Facilitator paths moved under `/x402/`** (`/x402/verify`, `/x402/settle`, `/x402/supported`). v1.0
   also answered the bare `/verify`, `/settle`, `/supported`, which shadowed any API route of those
@@ -828,11 +828,9 @@ Codes in the 402 `error` field and in `400 {"error"}` answers of the control end
 (open), `settle_early` (a routed channel's rollover, §12).
 
 The facilitator answers (§7.6) carry the upstream-style name of the same code in
-`invalidReason` / `errorReason`: `invalid_xbt_channel_<code>`, except `unsupported_scheme_or_network` →
-`invalid_xbt_channel_scheme_or_network`, `bad_payload` → `invalid_xbt_channel_payload`, `bad_auth` →
-`invalid_xbt_channel_auth`, `channel_closing` → `invalid_xbt_channel_closing`, `bad_sig` →
-`invalid_xbt_channel_signature`, `wrong_network` → `invalid_network`, and `close_failed` →
-`unexpected_settle_error` (full table: `scheme_xbt-channel.md`, Error Codes). The 402 `error` field
-keeps the short codes until the scheme name is settled, because the upstream prefix depends on it
-(`invalid_xbt_channel_*` for a new scheme, `invalid_batch_settlement_xbt_*` for a `batch-settlement`
-binding; `PUBLISHING.md`).
+`invalidReason` / `errorReason`: `invalid_batch_settlement_xbt_<code>`, except `unsupported_scheme_or_network` →
+`invalid_batch_settlement_xbt_scheme_or_network`, `bad_payload` → `invalid_batch_settlement_xbt_payload`, `bad_auth` →
+`invalid_batch_settlement_xbt_auth`, `channel_closing` → `invalid_batch_settlement_xbt_closing`, `bad_sig` →
+`invalid_batch_settlement_xbt_signature`, `wrong_network` → `invalid_network`, and `close_failed` →
+`unexpected_settle_error` (full table: `scheme_batch_settlement_xbt.md`, Error Codes). The 402 `error`
+field keeps the short codes; facilitator answers use `invalid_batch_settlement_xbt_*`.

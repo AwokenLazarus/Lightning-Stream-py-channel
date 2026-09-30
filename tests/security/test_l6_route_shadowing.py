@@ -64,7 +64,7 @@ class RouteShadowing(Repro, unittest.TestCase):
         xm, cm = load("x402_channel"), load("channel")
         prov, p, payer = self.provider(xm, cm)
         st, _, out = prov.serve("GET", "/x402/supported", {}, b"")
-        self.assertEqual((st, json.loads(out)["kinds"][0]["scheme"]), (200, "xbt-channel"))
+        self.assertEqual((st, json.loads(out)["kinds"][0]["scheme"]), (200, "batch-settlement"))
         sig = payer.sign_state(2000).hex()
         acc = prov.requirements(PRICE)
         st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps(xm.facilitator_request(
@@ -73,7 +73,7 @@ class RouteShadowing(Repro, unittest.TestCase):
         self.assertEqual(prov.ledger.channels[p.channel_id].best_cum, 2000)
         st, _, out = prov.serve("POST", "/x402/verify", {}, json.dumps(xm.facilitator_request(
             acc, {"chan": p.channel_id, "cum": "0"})).encode())
-        self.assertEqual((st, json.loads(out)["invalidReason"]), (200, "invalid_xbt_channel_signature"))
+        self.assertEqual((st, json.loads(out)["invalidReason"]), (200, "invalid_batch_settlement_xbt_signature"))
         self.assertEqual(prov.serve("GET", "/x402/verify", {}, b"")[0], 405)
 
     def check_transport(self, send):

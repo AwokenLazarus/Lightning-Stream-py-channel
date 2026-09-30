@@ -111,7 +111,7 @@ class FacilitatorBodies(unittest.TestCase):
                                ("scheme", "exact")):
                 cum += 1
                 v = self.r.prov.facilitator_verify(self.body(cum, **{side: {field: val}}))
-                self.assertEqual(v, {"isValid": False, "invalidReason": "invalid_xbt_channel_scheme_or_network"})
+                self.assertEqual(v, {"isValid": False, "invalidReason": "invalid_batch_settlement_xbt_scheme_or_network"})
 
     def test_invalid_reason_is_a_bare_code(self):
         prov, xm = self.r.prov, self.r.xm

@@ -13,7 +13,7 @@ never settle.
 
 Fix: after the close, `close()` and `/x402/settle` report the recorded close (`close_paid`) and ignore
 payloads. `/x402/verify` still records a higher state while the channel is open or closing, but
-answers `isValid: false` with `invalid_xbt_channel_closing` / `invalid_xbt_channel_unconfirmed` for a
+answers `isValid: false` with `invalid_batch_settlement_xbt_closing` / `invalid_batch_settlement_xbt_unconfirmed` for a
 state the channel can no longer settle.
 """
 import unittest
@@ -93,14 +93,14 @@ class VerifyOnDeadChannel(Repro, unittest.TestCase):
     def test_fixed_closed(self):
         r = paid_calls(load("x402_channel"))
         settle(r, 1_000)
-        self.assertEqual(verify(r, 7_000), {"isValid": False, "invalidReason": "invalid_xbt_channel_closing"})
+        self.assertEqual(verify(r, 7_000), {"isValid": False, "invalidReason": "invalid_batch_settlement_xbt_closing"})
         self.assertEqual(r.chan.best_cum, 1_000)
 
     def test_fixed_closing_records_but_invalid(self):
         r = paid_calls(load("x402_channel"))
         r.node.height = r.chan.params.expiry - r.prov.close_margin
         r.prov._height_at = 0
-        self.assertEqual(verify(r, 2_000)["invalidReason"], "invalid_xbt_channel_closing")
+        self.assertEqual(verify(r, 2_000)["invalidReason"], "invalid_batch_settlement_xbt_closing")
         self.assertEqual(r.chan.best_cum, 2_000)                       # still the provider's to close with
 
     def test_fixed_suspended(self):
@@ -108,7 +108,7 @@ class VerifyOnDeadChannel(Repro, unittest.TestCase):
         r.node.reorg_out(r.chan.params.funding_txid)
         r.prov.close_due()
         self.assertTrue(r.chan.suspended)
-        self.assertEqual(verify(r, 2_000)["invalidReason"], "invalid_xbt_channel_unconfirmed")
+        self.assertEqual(verify(r, 2_000)["invalidReason"], "invalid_batch_settlement_xbt_unconfirmed")
 
     def test_control_open_channel_valid(self):
         r = paid_calls(load("x402_channel"))

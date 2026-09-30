@@ -1,4 +1,4 @@
-"""x402 v2 scheme `xbt-channel`: HTTP 402 payments over XBT Spillman channels (xbt402 v1.1).
+"""x402 v2 scheme `batch-settlement` (XBT channel binding; `xbt-channel` accepted as an alias): HTTP 402 payments over XBT Spillman channels (xbt402 v1.1).
 
 Spec: docs/x402/xbt402-spec-v1.1-draft.md (was ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402
 HTTP 402 payment channels.md). v1.1: the payee key commits to the network (extra.derivation "v2"),
@@ -7,11 +7,13 @@ v2 facilitator shapes.
 
   402 + PAYMENT-REQUIRED: base64(PaymentRequired)      (same JSON in the body)
   PaymentRequired = {x402Version: 2, error?, resource: {url}, accepts: [PaymentRequirements]}
-  PaymentRequirements = {scheme: "xbt-channel", network: "bip122:<first 32 hex of block 961640>",
+  PaymentRequirements = {scheme: "batch-settlement" (alias "xbt-channel" accepted on input),
+      network: "bip122:<first 32 hex of block 961640>",
       amount: "<sats per call, max>", asset: "XBT:sat", payTo: "<33-byte compressed pubkey hex>",
       maxTimeoutSeconds, extra: {minCapacity, maxCapacity, minExpiryBlocks, maxExpiryBlocks,
       closeMarginBlocks, minConf, closeFeeSat, openUrl, closeUrl, billing: "postpay"|"prepay",
-      derivation: "v2", closeFeePayer?: "payer"|"payee" (v1.2, absent = payer)}}
+      derivation: "v2", assetTransferMethod: "channel",
+      closeFeePayer?: "payer"|"payee" (v1.2, absent = payer)}}
       payee key P = payTo + t*G, t = H("xbt-channel/payee/v2", len8(network) network payTo A LE32(expiry))
 
   open:   POST extra.openUrl {x402Version, network, channel: {txid, vout, capacity, expiry, payerPub,
@@ -54,8 +56,15 @@ from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
-SCHEME = "xbt-channel"
+SCHEME = "batch-settlement"
+SCHEME_ALIAS = "xbt-channel"                                # one-release input alias; emit SCHEME
+ASSET_TRANSFER_METHOD = "channel"
 MAX_BODY = 1 << 20                                          # default bytes per request body (overridable)
+
+
+def scheme_accepted(s) -> bool:
+    """True for the canonical scheme or the one-release `xbt-channel` alias."""
+    return s in (SCHEME, SCHEME_ALIAS)
 XBT_MAINNET = "bip122:0000000000000050c1e5f69672f45929"   # block 961640, the first BLAKE2b block
 FACILITATOR_VERIFY, FACILITATOR_SETTLE, FACILITATOR_SUPPORTED = "/x402/verify", "/x402/settle", "/x402/supported"
 
@@ -99,11 +108,11 @@ def network_id(first_blake2b_block_hash: str) -> str:
 
 
 # x402 v2 facilitator reasons (VerifyResponse.invalidReason, SettlementResponse.errorReason) for the
-# protocol's own codes. The 402 `error` field keeps the short codes until the scheme name is settled
-# (`xbt-channel` or a `batch-settlement` binding would change the prefix; docs/x402/PUBLISHING.md).
-UPSTREAM_CODES = {"unsupported_scheme_or_network": "invalid_xbt_channel_scheme_or_network",
-                  "bad_payload": "invalid_xbt_channel_payload", "bad_auth": "invalid_xbt_channel_auth",
-                  "channel_closing": "invalid_xbt_channel_closing", "bad_sig": "invalid_xbt_channel_signature",
+# protocol's own codes. The 402 `error` field keeps the short codes; facilitator answers use the
+# XBT batch-settlement prefix (docs/x402/PUBLISHING.md).
+UPSTREAM_CODES = {"unsupported_scheme_or_network": "invalid_batch_settlement_xbt_scheme_or_network",
+                  "bad_payload": "invalid_batch_settlement_xbt_payload", "bad_auth": "invalid_batch_settlement_xbt_auth",
+                  "channel_closing": "invalid_batch_settlement_xbt_closing", "bad_sig": "invalid_batch_settlement_xbt_signature",
                   "wrong_network": "invalid_network", "close_failed": "unexpected_settle_error"}
 
 
@@ -113,7 +122,7 @@ def safe_code(code) -> bool:
 
 
 def upstream_code(code: str) -> str:
-    return UPSTREAM_CODES.get(code) or "invalid_xbt_channel_" + (code or "payload")
+    return UPSTREAM_CODES.get(code) or "invalid_batch_settlement_xbt_" + (code or "payload")
 
 
 def settlement_response(receipt: dict, network: str, payer: str, success: bool) -> dict:
@@ -126,8 +135,8 @@ def settlement_response(receipt: dict, network: str, payer: str, success: bool) 
 def receipt_of(resp: dict) -> dict:
     """The signed channel receipt inside a PAYMENT-RESPONSE SettlementResponse."""
     r = ((resp or {}).get("extra") or {}).get("receipt") if isinstance(resp, dict) else None
-    if not isinstance(r, dict) or r.get("scheme") != SCHEME:
-        raise ChannelError("bad_receipt", "PAYMENT-RESPONSE carries no xbt-channel receipt in extra.receipt")
+    if not isinstance(r, dict) or not scheme_accepted(r.get("scheme")):
+        raise ChannelError("bad_receipt", "PAYMENT-RESPONSE carries no batch-settlement receipt in extra.receipt")
     if str(resp["extra"].get("chargedAmount")) != str(r.get("charged")):
         raise ChannelError("bad_receipt", "extra.chargedAmount differs from the signed receipt")
     return r
@@ -206,7 +215,7 @@ class XbtChannelProvider:
         self.ledger, self.price, self.handler, self.charge = Ledger(ledger_path), price, handler, charge
         self.billing, self.close_fee, self.close_margin, self.hrp = billing, close_fee, close_margin, hrp
         # v1.2 closeFeePayer: plain channels keep payer-pays (v1.1) unless configured; channels a hub
-        # funds to this provider (routed ch2) default to payee-pays (Mike, 2026-09-28): the provider
+        # funds to this provider (routed ch2) default to payee-pays (2026-09-28): the provider
         # pays its own settlement, so settle_due counts it against the net payout
         self.close_fee_payer, self.route_close_fee_payer = close_fee_payer, route_close_fee_payer
         self.rollover_grace = int(rollover_grace)   # blocks before the close margin a rollover is due anyway
@@ -288,6 +297,7 @@ class XbtChannelProvider:
                           "closeFeeSat": str(self.close_fee), "openUrl": "/x402/xbt-channel/open",
                           "closeUrl": "/x402/xbt-channel/close", "billing": self.billing,
                           "derivation": DERIVATION,
+                          "assetTransferMethod": ASSET_TRANSFER_METHOD,
                           # v1.2: absent means payer-pays, so a v1.1 payer's 402 is unchanged
                           **({"closeFeePayer": self.close_fee_payer} if self.close_fee_payer != "payer" else {})}}
 
@@ -726,7 +736,7 @@ class XbtChannelProvider:
             raise ChannelError("bad_payload", "paymentPayload {x402Version, accepted, payload} and "
                                               "paymentRequirements expected")
         for acc in (want, pp["accepted"]):
-            if acc.get("scheme") != SCHEME or acc.get("network") != self.network or acc.get("payTo") != self.pay_to:
+            if not scheme_accepted(acc.get("scheme")) or acc.get("network") != self.network or acc.get("payTo") != self.pay_to:
                 raise ChannelError("unsupported_scheme_or_network")
         return pp["payload"]
 
@@ -1027,7 +1037,7 @@ class XbtChannelProvider:
             acc, pl = pp["accepted"], pp["payload"]
             if not isinstance(acc, dict) or not isinstance(pl, dict):
                 raise TypeError("accepted and payload are objects")
-            if pp.get("x402Version") != 2 or acc.get("scheme") != SCHEME or acc.get("network") != self.network \
+            if pp.get("x402Version") != 2 or not scheme_accepted(acc.get("scheme")) or acc.get("network") != self.network \
                     or acc.get("payTo") != self.pay_to:
                 return self._payment_required(url, price, "unsupported_scheme_or_network")
         except (ValueError, KeyError, TypeError):
@@ -1224,7 +1234,7 @@ class XbtChannelClient:
 
     def _pick(self, pr: dict) -> dict:
         for acc in pr.get("accepts", []):
-            if acc.get("scheme") == SCHEME and acc.get("network") == self.network:
+            if scheme_accepted(acc.get("scheme")) and acc.get("network") == self.network:
                 if int(acc["amount"]) > self.max_price:
                     raise ChannelError("too_expensive", f"{acc['amount']} sat > max {self.max_price}")
                 if int(acc["extra"]["closeFeeSat"]) > self.max_close_fee:

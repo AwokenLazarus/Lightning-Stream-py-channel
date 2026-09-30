@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test vectors for the x402 `xbt-channel` scheme (xbt402), checked against the reference library.
+"""Test vectors for the x402 `batch-settlement` XBT channel binding (xbt402), checked against the reference library.
 
     python docs/x402/check_vectors.py            recompute every vector and compare with vectors.json
     python docs/x402/check_vectors.py --write    regenerate vectors.json from the library
@@ -437,7 +437,7 @@ def _payee_pays_close(prov, node, p, a):
 
 def generate():
     return {
-        "title": "x402 xbt-channel test vectors",
+        "title": "x402 batch-settlement (XBT channel) test vectors",
         "version": "1.2-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes, "
                    "closeFeePayer)" % DERIVATION,
         "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
@@ -515,8 +515,8 @@ def independent_checks(v) -> list:
         if s["step"] == "facilitator verify":
             need(s["response"].get("isValid") is True, "verify: a signed state must be valid")
         if s["step"].startswith("facilitator verify,"):
-            need(s["response"] == {"isValid": False, "invalidReason": "invalid_xbt_channel_signature"},
-                 "verify: a relabelled cum must be invalid_xbt_channel_signature")
+            need(s["response"] == {"isValid": False, "invalidReason": "invalid_batch_settlement_xbt_signature"},
+                 "verify: a relabelled cum must be invalid_batch_settlement_xbt_signature")
         if s["step"].startswith("facilitator settle"):
             close = next(c for c in rt["steps"] if c["step"] == "cooperative close")
             need(s["response"].get("success") is True and s["response"].get("transaction") == close["response"]["txid"]

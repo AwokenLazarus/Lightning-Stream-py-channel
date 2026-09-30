@@ -93,7 +93,7 @@ class BearerPayload(Repro, unittest.TestCase):
         acc = prov.requirements(150)
         for req in ({"chan": p.channel_id, "cum": "0"}, {"chan": p.channel_id, "cum": "3000", "seq": 10**9}):
             st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(xp.facilitator_request(acc, req)).encode())
-            self.assertEqual((st, json.loads(out)), (200, {"isValid": False, "invalidReason": "invalid_xbt_channel_signature"}))
+            self.assertEqual((st, json.loads(out)), (200, {"isValid": False, "invalidReason": "invalid_batch_settlement_xbt_signature"}))
         st, _, out = prov.serve("POST", xp.FACILITATOR_VERIFY, {}, json.dumps(xp.facilitator_request(
             acc, {"chan": p.channel_id, "cum": "3000", "sig": sig3, "seq": 10**9})).encode())
         self.assertEqual((st, json.loads(out)["isValid"]), (200, True))
