@@ -22,9 +22,11 @@ the other.
 **Why a channel instead of one on-chain payment per request.** A request priced at 150 sat is far
 below any transaction fee, and XBT blocks arrive every 7–10 minutes. A channel costs one funding and
 one close transaction whatever the number of requests, and verifying a request costs one ECDSA
-verification and one HMAC (about 4 ms p50 in the reference server). XBT has no stablecoin, no
-Lightning network and no facilitator service. A direct channel is the only rail that works for
-sub-cent HTTP payments on it today.
+verification and one HMAC (about 4 ms p50 in the reference server). XBT has no stablecoin and no facilitator service. It has a young Lightning network (forked LND and
+Core Lightning, live since September 2026), but paying through it needs an LN node, a watchtower and an
+invoice round-trip per request, and it cannot enforce sub-dust amounts. A direct channel needs none of
+these: the payer runs no node, the refund needs nothing from the provider, and each request carries its
+own signed, authenticated state.
 
 ## Use Cases
 - An AI agent paying an inference, search or data API per call, with a budget it cannot exceed.
