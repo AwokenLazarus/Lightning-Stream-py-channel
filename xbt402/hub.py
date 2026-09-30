@@ -67,6 +67,13 @@ provider pays its own settlement's close fee out of its output, so the hub's fee
 and routing, and the settle threshold counts the provider's net payout. ch1 stays payer-pays (the
 client pays, as on any plain channel) unless the operator configures otherwise. extra.routing
 advertises both.
+
+Make-before-break rollover (AGP-053, as the Rust hub): the next ch2 is opened right after the rollover
+reply, unconfirmed, where the provider takes it (`zeroConf` in its /open reply: the child of its own
+confirmed hub-bound channel, up to maxCum and before `until`), so routing never pauses for a block; the
+hub keeps within those bounds itself, never rolls an unconfirmed child over, and blocks or drops a child
+whose rollover left the mempool or was replaced. A watcher tick waits (bounded) for a provider that
+streams locks, so its rollover is not starved.
 """
 import json
 import math
@@ -121,12 +128,16 @@ class OutChannel:
     close_prev: str = ""         # the state a `closing` ch2 left (AGP-045): "refunded" is restored if the close vanishes
     fund_txid: str = ""          # the funding send the hub knows of (wallet), watched while `dropped` (AGP-045)
     fund_vout: int = 0
+    rolled_from: str = ""        # the ch2 whose rollover funds this one (AGP-053)
+    zero_conf: dict = field(default_factory=dict)   # the provider took it unconfirmed (AGP-053): {parent, maxCum, until, confirmed}
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
 
 
 LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
+WATCH_WAIT_ONE, WATCH_WAIT_BUDGET = 0.25, 1.0    # a watcher tick waits for one busy provider's mutex, and for all (AGP-053)
+ROLLOVER_GONE = "the rollover that funds this ch2 is in no block and not in the mempool"   # AGP-053
 NONFINAL = ("funded", "open", "refunded", "closing", "closed")   # the watcher reconciles these until final
 
 
@@ -216,7 +227,9 @@ class HubConfig:
     refund_max_fee_sat (bumps included); a refund still unconfirmed refund_bump_blocks after it was
     signed is re-signed at a higher fee (RBF, AGP-044; 0: never). A `funding` record that neither the
     wallet, the mempool nor the chain shows is dropped after funding_timeout_blocks (a known send is
-    still watched: AGP-045)."""
+    still watched: AGP-045). zero_conf_rollover (AGP-053, default on): open a rollover's next ch2 at
+    once, unconfirmed, where the provider takes it (its /open reply carries zeroConf), so routing to the
+    provider never pauses for a block (make-before-break); a provider that refuses is opened at minConf."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -247,6 +260,7 @@ class HubConfig:
     funding_timeout_blocks: int = 6
     refund_bump_blocks: int = 3
     refund_max_fee_sat: int = 5_000
+    zero_conf_rollover: bool = True
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -295,6 +309,8 @@ class RouteHub:
         self.reveal_timeout, self.close_margin, self.close_fee = cfg.reveal_timeout, cfg.close_margin, cfg.close_fee
         self.ch2_capacity, self.ch2_expiry_blocks = cfg.ch2_capacity, cfg.ch2_expiry_blocks
         self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap_sat
+        self.zero_conf_rollover = bool(cfg.zero_conf_rollover)
+        self._zc_tried: set = set()  # (chan, tip): a rollover child's unconfirmed open, tried once a block
         self.fee_strategy = fee_strategy or self._configured_fees
         self.http = http or XbtChannelClient.http
         self._refill = refill
@@ -486,7 +502,10 @@ class RouteHub:
             # the provider is its payTo: an origin sharing a live ch2's payTo routes over that ch2
             key = self.out.key_for(provider) or provider
             oc = self.out.chans.get(key)
-            if oc is None or oc.state != "open":
+            # a rollover's next ch2 is opened (AGP-053) under the mutex the lock takes below: it is checked
+            # again there, once it is open
+            opening = oc is not None and oc.state == "funded" and oc.rolled_from and self.zero_conf_rollover
+            if oc is None or (oc.state != "open" and not opening):
                 return self._err("route_blocked", "no open channel to that provider")
             if oc.blocked:
                 return self._err("route_blocked", oc.blocked)
@@ -508,9 +527,13 @@ class RouteHub:
             mtx = self.out.mutex_for(key)
             if not mtx.acquire(timeout=0.5):
                 return self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
-            if oc.pending:
+            # re-read under the mutex: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
+            # the checks that depend on the channel are made again on the one the lock will use
+            oc = self.out.chans.get(key)
+            why = self._ch2_refusal(oc, st1, d)
+            if why:
                 mtx.release()
-                return self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
+                return self._err(*why)
             # write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
             lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
                      "T": rt["point"], "T1": pl.get("point"), "r": f"{r:064x}", "d": d, "f": f, "units": units,
@@ -522,6 +545,29 @@ class RouteHub:
             return self._forward(st1, oc, lock1, rt, pl, t0)
         finally:
             mtx.release()
+
+    def _ch2_refusal(self, oc: Optional[OutChannel], st1, d: int) -> Optional[tuple]:
+        """(code, detail) if the ch2 (as read under its mutex) cannot take a lock of `d` now: another
+        lock is pending, it is not open (a rollover child the provider did not take unconfirmed), it is blocked, the expiry rule, or (AGP-053) it is an
+        unconfirmed rollover child past the provider's zero-conf bounds."""
+        if oc is None or oc.pending:
+            return "lock_outstanding", "a lock on this provider's ch2 is pending"
+        if oc.state != "open":
+            return "route_blocked", "no open channel to that provider"
+        if oc.blocked:
+            return "route_blocked", oc.blocked
+        p2, tip = oc.p(), self.inbound.height()
+        if not route_ok(tip, st1.params.expiry, p2.expiry, self.close_margin, self.delta) and d > self.max_unguarded_lock_sat:
+            return "route_expiry", f"ch2 outlives ch1 and {d} > maxUnguardedLockSat"
+        zc = oc.zero_conf
+        if zc and not zc.get("confirmed"):
+            if tip >= int(zc.get("until", 0)):
+                return "route_blocked", "the rollover funding this ch2 is unconfirmed at the parent's close margin"
+            need2 = max(next_cum(oc.routed, d, p2.min_amount), oc.signed)
+            if need2 > int(zc.get("maxCum", 0)):
+                return "route_blocked", (f"the rollover funding this ch2 is unconfirmed: cum {need2} > the provider's "
+                                         f"zero-conf cap {zc.get('maxCum', 0)}")
+        return None
 
     def _forward(self, st1, oc: OutChannel, lock1: dict, rt: dict, pl: dict, t0: float):
         """Pre-sign ch2 under T (only now), send it to the provider, settle ch1 with t + r."""
@@ -931,19 +977,36 @@ class RouteHub:
         if st != 200:
             return False
         try:
-            echoed = json.loads(raw).get("closeFeePayer", "payer")
+            doc = json.loads(raw)
+            echoed = doc.get("closeFeePayer", "payer")
         except (ValueError, AttributeError):
-            echoed = None
+            doc, echoed = {}, None
         if echoed != p.close_fee_payer:
             # every state we would sign would fail at the provider: never route over this channel
             with self.out.lock:
                 oc.blocked = f"the provider opened ch2 with closeFeePayer {echoed!r}"
                 self.out.save()
             return False
+        zc = {}
+        z = doc.get("zeroConf")
+        if isinstance(z, dict):
+            # AGP-053: the provider took this ch2 unconfirmed (a rollover child), bounded; a malformed
+            # bound routes nothing until it confirms
+            try:
+                if not isinstance(z["parent"], str) or any(isinstance(z[k], float) for k in ("maxCum", "until")):
+                    raise TypeError("zeroConf")
+                zc = {"parent": z["parent"], "maxCum": int(z["maxCum"]), "until": int(z["until"]), "confirmed": False}
+                if zc["maxCum"] < 0 or zc["until"] < 0:
+                    raise ValueError("zeroConf")
+            except (KeyError, TypeError, ValueError):
+                zc = {"parent": "", "maxCum": 0, "until": 0, "confirmed": False}
         with self.out.lock:
-            oc.state = "open"
+            oc.state, oc.zero_conf = "open", zc
             self.out.save()
-        self.events.append({"event": "ch2_open", "provider": oc.origin, "chan": p.channel_id, "capacity": p.capacity})
+        ev = {"event": "ch2_open", "provider": oc.origin, "chan": p.channel_id, "capacity": p.capacity}
+        if zc:
+            ev["zeroConf"] = zc["maxCum"]
+        self.events.append(ev)
         return True
 
     def rollover(self, oc: OutChannel) -> dict:
@@ -968,7 +1031,7 @@ class RouteHub:
         nxt.funding_txid, nxt.funding_vout, nxt.capacity = txid, 1, next_cap
         new = OutChannel(oc.origin, oc.pay_to, nxt.to_dict(), f"{secret:064x}", "funded",
                          settle_multiple=oc.settle_multiple, terms=oc.terms, refund_hex=nxt.refund_tx(secret).hex(),
-                         opened_at=tip, scanned_to=tip)
+                         opened_at=tip, scanned_to=tip, rolled_from=p.channel_id)
         with self.out.lock:
             oc.next = asdict(new)                     # write-ahead: the next ch2's key before the request
             self.out.save()
@@ -990,7 +1053,26 @@ class RouteHub:
                                str(doc)[:200])
         if not isinstance(doc, dict) or str(doc.get("txid", "")).lower() != txid:
             raise ChannelError("bad_rollover_reply", f"rollover reply {str(doc)[:120]} is not tx {txid}")
-        return self._finish_rollover(oc, amount)
+        ev = self._finish_rollover(oc, amount)
+        # make-before-break (AGP-053): open the next ch2 now, still under this provider's mutex, so the
+        # next lock goes over it; a provider that wants confirmations first refuses, and the watcher
+        # opens it at minConf
+        self._open_child(self.out.chans.get(oc.origin), p.channel_id)
+        return ev
+
+    def _open_child(self, new: Optional[OutChannel], parent: str) -> bool:
+        """Open a rollover child before it confirms (AGP-053), at most once a block. Never raises."""
+        if not self.zero_conf_rollover or new is None or new.state != "funded" or new.rolled_from != parent:
+            return False
+        try:
+            key = (new.p().channel_id, self.rpc.getblockcount())
+            if key in self._zc_tried:
+                return False
+            self._zc_tried = {k for k in self._zc_tried if k[1] >= key[1] - 1} | {key}
+            return self._open(new)
+        except (OSError, ValueError, KeyError, ChannelError) as e:
+            self.events.append({"event": "ch2_open_failed", "provider": new.origin, "error": f"{type(e).__name__}: {e}"[:200]})
+            return False
 
     def _finish_rollover(self, oc: OutChannel, amount: int) -> dict:
         new = OutChannel(**oc.next)
@@ -1177,10 +1259,24 @@ class RouteHub:
     def watch_tick(self) -> list:
         actions = []
         tip = self.rpc.getblockcount()
+        skipped = []
         for origin, oc in list(self.out.chans.items()):
             try:
-                actions += self._watch_out(oc, tip)
+                acts = self._watch_out(oc, tip)
+                if acts is None:
+                    skipped.append((origin, oc))
+                else:
+                    actions += acts
             except Exception as e:  # noqa: BLE001 - one channel never stops the rest
+                self._watch_error(origin, "watch", e)
+        # a provider streaming locks holds its mutex most of the time, and a tick in step with its locks
+        # could miss every gap (a rollover never due to run, AGP-053): wait for it between two locks,
+        # within a budget per tick
+        until = time.time() + WATCH_WAIT_BUDGET
+        for origin, oc in skipped:
+            try:
+                actions += self._watch_out(oc, tip, wait=max(0.0, min(WATCH_WAIT_ONE, until - time.time()))) or []
+            except Exception as e:  # noqa: BLE001
                 self._watch_error(origin, "watch", e)
         with self.out.lock:
             archived = [(i, r) for i, r in enumerate(self.out.archived) if watched(r)]
@@ -1205,11 +1301,12 @@ class RouteHub:
         sys.stderr.write(f"hub watcher {origin} ({step}): {msg}\n")
         self.events.append({"event": "ch2_watch_error", "provider": origin, "step": step, "error": msg})
 
-    def _watch_out(self, oc: OutChannel, tip: int) -> list:
-        # a route request in flight owns this ch2 (its mutex): never race it for the same lock
+    def _watch_out(self, oc: OutChannel, tip: int, wait: float = 0.0) -> Optional[list]:
+        """None when a route request in flight owns this ch2 (its mutex) past `wait`: never race it
+        for the same lock."""
         mtx = self.out.mutex_for(oc.origin)
-        if not mtx.acquire(blocking=False):
-            return []
+        if not (mtx.acquire(timeout=wait) if wait > 0 else mtx.acquire(blocking=False)):
+            return None
         try:
             return self._watch_out_locked(oc, tip)
         finally:
@@ -1231,9 +1328,14 @@ class RouteHub:
             if utxo and utxo.get("confirmations", 0) >= int(oc.terms["extra"].get("minConf", 1)):
                 if self._open(oc):
                     out.append({"event": "ch2_open", "provider": oc.origin})
+            elif oc.rolled_from and self._open_child(oc, oc.rolled_from):
+                # a rollover child not opened right after the rollover (a lost reply, a restart)
+                out.append({"event": "ch2_open", "provider": oc.origin, "zeroConf": True})
             return out
         if oc.state != "open":
             return out
+        if oc.zero_conf:
+            out += self._zero_conf_tick(oc, p)
         if oc.pending:
             if time.time() - oc.pending["at"] < self.reveal_timeout:
                 ans = self._send_lock(oc)
@@ -1259,9 +1361,26 @@ class RouteHub:
         margin = int(ex.get("closeMarginBlocks", self.close_margin))
         grace = min(self.rollover_margin, int(ex.get("rolloverGraceBlocks", self.rollover_margin)))
         near = tip >= p.expiry - margin - grace
-        if (due or near) and oc.signed >= p.min_amount and not oc.pending and tip < p.expiry:
+        # an unconfirmed rollover child is not rolled over again before it confirms (AGP-053)
+        unconfirmed = oc.zero_conf and not oc.zero_conf.get("confirmed")
+        if (due or near) and oc.signed >= p.min_amount and not oc.pending and tip < p.expiry and not unconfirmed:
             out.append(self.rollover(oc))
         return out
+
+    def _zero_conf_tick(self, oc: OutChannel, p: ChannelParams) -> list:
+        """A ch2 the provider took unconfirmed (AGP-053): confirmed with minConf, or unconfirmed again (a
+        reorg), and the provider's bounds apply again."""
+        utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
+        now = bool(utxo) and utxo.get("confirmations", 0) >= int(oc.terms["extra"].get("minConf", 1))
+        if now == bool(oc.zero_conf.get("confirmed")):
+            return []
+        with self.out.lock:
+            oc.zero_conf = {**oc.zero_conf, "confirmed": now}
+            self.out.save()
+        ev = {"event": "ch2_zero_conf_confirmed" if now else "ch2_zero_conf_reorg", "provider": oc.origin,
+              "chan": p.channel_id}
+        self.events.append(ev)
+        return [ev]
 
     def _reconcile(self, oc: OutChannel, tip: int) -> list:
         """Check one non-final ch2's funding against the chain (AGP-037).
@@ -1280,12 +1399,22 @@ class RouteHub:
             return []
         out = []
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+            if oc.blocked == ROLLOVER_GONE:                  # the rollover is back (AGP-053)
+                with self.out.lock:
+                    oc.blocked = ""
+                    self.out.save()
+                out.append({"event": "ch2_rollover_back", "provider": oc.origin, "chan": p.channel_id})
+                self.events.append(out[-1])
             if oc.state == "closing" and (oc.close_txid or oc.close_prev == "refunded"):
                 out += self._close_vanished(oc)
             if oc.state == "refunded" or self._refund_due(oc, tip):
                 # due, or our refund left the mempool: send it (again, or bumped once it waited)
                 return out + self._refund(oc, tip)
             return out
+        if oc.rolled_from and oc.state in ("funded", "open"):
+            gone = self._rollover_gone(oc, p)
+            if gone is not None:
+                return out + gone
         confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
         if oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid and confirmed:
             with self.out.lock:                             # the provider's close as it told us, confirmed: done
@@ -1359,6 +1488,47 @@ class RouteHub:
               **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
         self.events.append(ev)
         out.append(ev)
+        return out
+
+    def _rollover_gone(self, oc: OutChannel, p: ChannelParams) -> Optional[list]:
+        """A rollover child's funding output is not in the UTXO set nor the mempool (AGP-053). The
+        rollover tx exists (in the mempool, or its output confirmed): None, the usual reconcile (it was
+        spent). The parent is unspent even counting the mempool: the rollover left the mempool (the
+        provider, who holds it signed, sends it again), so routing stops (blocked) until it is back. The
+        parent was spent by another tx (the provider's own close): this ch2 never existed; it is dropped
+        (final) and any secrets of the parent's written-off locks are read off that close."""
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is not None or self._in_mempool(p.funding_txid):
+            return None
+        ptxid, pvout = oc.rolled_from.split(":")
+        pvout = int(pvout)
+        if self.rpc.gettxout(ptxid, pvout, True) is not None:
+            if oc.blocked == ROLLOVER_GONE:
+                return []
+            with self.out.lock:
+                oc.blocked = ROLLOVER_GONE
+                self.out.save()
+            ev = {"event": "ch2_rollover_vanished", "provider": oc.origin, "chan": p.channel_id, "parent": oc.rolled_from}
+            self.events.append(ev)
+            return [ev]
+        tx = find_spend(self.rpc, ptxid, pvout, max(0, oc.opened_at - 6))
+        if tx is None or tx.txid() == p.funding_txid:
+            return None
+        spender = tx.txid()
+        with self.out.lock:
+            oc.state, oc.final, oc.blocked = "dropped", True, f"the rollover was replaced by {spender}"
+            self.out.save()
+        ev = {"event": "ch2_rollover_replaced", "provider": oc.origin, "chan": p.channel_id, "parent": oc.rolled_from,
+              "spender": spender}
+        self.events.append(ev)
+        out = [ev]
+        with self.out.lock:
+            found = [(i, OutChannel(**r)) for i, r in enumerate(self.out.archived)
+                     if r.get("rolled_to") == p.channel_id and r.get("stale")]
+        for i, parent in found:
+            out += self._from_close(parent, tx)
+            with self.out.lock:
+                self.out.archived[i] = asdict(parent)
+                self.out.save()
         return out
 
     def _close_vanished(self, oc: OutChannel) -> list:

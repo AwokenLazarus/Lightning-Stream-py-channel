@@ -177,12 +177,13 @@ class Net:
 
 
 def provider(node, net, origin, secret=None, *, window=0.3, lock_wait=0.6, invoice_ttl=8.0,
-             amsat_per_call=370 * 10 ** 18, settle_multiple=20, hubs="any"):
+             amsat_per_call=370 * 10 ** 18, settle_multiple=20, hubs="any", rollover_zero_conf_max=None):
     secret = secret or secrets.randbelow(ecc.N - 1) + 1
     pol = FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640, close_margin=36)
     p = XbtChannelProvider(node, secret, NET, tempfile.mktemp(suffix=".sqlite"), lambda m, pth: 1000,
                            lambda m, pth, b: (200, {"Content-Type": "application/json"}, b'{"ok":1}'),
-                           close_margin=36, policy=pol, settle_multiple=settle_multiple, height_ttl=0)
+                           close_margin=36, policy=pol, settle_multiple=settle_multiple, height_ttl=0,
+                           rollover_zero_conf_max=rollover_zero_conf_max)
     p.offer_route("/v1/chunk", window=window, lock_wait=lock_wait, invoice_ttl=invoice_ttl,
                   amsat_per_call=amsat_per_call, hubs=hubs)
     net.apps[origin] = p
@@ -208,10 +209,10 @@ def payer(node, net, signer=None, **kw):
                       **{"capacity": 200_000, "expiry_blocks": 8_000, **kw})
 
 
-def world(n_providers=1, **pkw):
+def world(n_providers=1, hkw=None, **pkw):
     """node, net, hub, providers {origin: provider}, payer (ch1 open), shards {origin: Shard}."""
     node, net = RouteNode(), Net()
-    h = hub(node, net)
+    h = hub(node, net, **(hkw or {}))
     provs = {}
     for i in range(n_providers):
         origin = f"http://p{i}.test"

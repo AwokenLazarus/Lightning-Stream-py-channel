@@ -42,7 +42,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
@@ -191,7 +191,8 @@ class XbtChannelProvider:
                  close_fee: int = 600, close_margin: int = 144, policy: FundingPolicy = None,
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
                  max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
-                 close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36):
+                 close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36,
+                 rollover_zero_conf_max: int = None):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
         if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
@@ -218,6 +219,11 @@ class XbtChannelProvider:
         # AGP-021 hub routing: routed paths, their sessions and the adaptor-locked ch2 states
         from .route import RouteSeller
         self.settle_multiple = int(settle_multiple)   # settle once the net payout >= this x closeFee (settle_due)
+        # AGP-053 make-before-break: a hub-bound channel's rollover child is taken unconfirmed (its parent
+        # is our own confirmed channel, and only we can sign a conflicting spend of it before its expiry),
+        # up to this cum while it stays unconfirmed. None: two settlements' worth; 0: never (open at minConf)
+        self.rollover_zero_conf_max = (2 * self.settle_multiple * int(close_fee) if rollover_zero_conf_max is None
+                                       else int(rollover_zero_conf_max))
         self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
                                   + ".routes.json")
 
@@ -318,15 +324,79 @@ class XbtChannelProvider:
         with self.ledger.lock:
             if p.channel_id in self.ledger.channels:
                 raise ChannelError("duplicate_channel")
-            confs = check_funding(self.rpc, p, self.policy)
+            zc = None
+            try:
+                confs = check_funding(self.rpc, p, self.policy)
+            except ChannelError as e:
+                zc = self._zero_conf_child(p, hub) if e.code == "unconfirmed" else None
+                if zc is None:
+                    raise
+                confs = check_funding(self.rpc, p, replace(self.policy, zero_conf_max=p.capacity))
             st = self.ledger.channels[p.channel_id] = ChannelState(p)
             if hub:
                 st.extra = {"hub": hub}
+            if zc:
+                st.extra["zero_conf"] = zc
             self.ledger.save(st)
         out = {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
         if p.close_fee_payer != "payer":
             out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
+        if zc:
+            out["zeroConf"] = {"parent": zc["parent"], "maxCum": str(zc["maxCum"]), "until": zc["until"]}
         return out
+
+    def _zero_conf_child(self, p: ChannelParams, hub: str) -> Optional[dict]:
+        """AGP-053: the unconfirmed channel `p` is the rollover child of one of our hub-bound channels
+        (the tx we co-signed and broadcast, `rollover_to`), bound to the same hub, whose own funding is
+        confirmed (conf_for) and which is before its close margin: take it now, bounded (`zero_conf` on
+        the child). Before the parent's expiry only this provider can sign a spend of the parent other
+        than that rollover, so the child exists unless we replace it ourselves, or the rollover is still
+        unconfirmed at the parent's expiry (the payer's refund): locks are taken until `until` only."""
+        if not hub or self.rollover_zero_conf_max <= 0:
+            return None
+        cid = p.channel_id
+        parent = next((s for s in self.ledger.channels.values()
+                       if (s.extra or {}).get("rollover_to") == cid and (s.extra or {}).get("hub") == hub), None)
+        if parent is None:
+            return None
+        pp = parent.params
+        need = self.policy.conf_for(pp.capacity)
+        until = pp.expiry - self.close_margin
+        if self.height() >= until or not self._confirmed(pp.funding_txid, pp.funding_vout, need):
+            return None
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
+            return None
+        return {"parent": pp.channel_id, "need": need, "maxCum": self.rollover_zero_conf_max, "until": until,
+                "confirmed": False}
+
+    def _confirmed(self, txid: str, vout: int, need: int) -> bool:
+        """The output is in a block with `need` confirmations (spent in the mempool or not)."""
+        utxo = self.rpc.gettxout(txid, vout, False)
+        return utxo is not None and utxo.get("confirmations", 0) >= need
+
+    def _zc_confirmed(self, st: ChannelState, live: bool = False) -> bool:
+        """Not an unconfirmed rollover child (AGP-053): a plain channel, or a child that confirmed (as
+        the watcher last saw it, or `live` from the node now; the caller holds the ledger lock)."""
+        zc = (st.extra or {}).get("zero_conf")
+        if not zc or zc.get("confirmed"):
+            return True
+        if live and self._confirmed(st.params.funding_txid, st.params.funding_vout, self.policy.conf_for(st.params.capacity)):
+            st.extra = {**st.extra, "zero_conf": {**zc, "confirmed": True}}
+            self.ledger.save(st)
+            return True
+        return False
+
+    def _zero_conf_ok(self, st: ChannelState, h: int) -> bool:
+        """An unconfirmed rollover child (AGP-053) is served while it is in the mempool, its parent
+        still has its confirmations (a reorg of the parent ends it), and before the parent's margin."""
+        zc = (st.extra or {}).get("zero_conf")
+        if not zc or h >= zc["until"]:
+            return False
+        p = st.params
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
+            return False
+        ptxid, pvout = zc["parent"].split(":")
+        return self._confirmed(ptxid, int(pvout), zc["need"])
 
     def settle_due(self, p: ChannelParams, cum: int, tip: int = None, margin: int = 0) -> bool:
         """This provider's settlement policy (cmp CONTRACT "Settlement policy", AGP-023): settle once
@@ -541,6 +611,13 @@ class XbtChannelProvider:
                 return
         utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
         st.suspended = utxo is None or utxo.get("confirmations", 0) < self.policy.conf_for(p.capacity)
+        zc = (st.extra or {}).get("zero_conf")
+        if zc:
+            # AGP-053: confirmed (again, after a reorg) or not; unconfirmed, it is served under its rules
+            zc = {**zc, "confirmed": not st.suspended}
+            st.extra = {**st.extra, "zero_conf": zc}
+            if st.suspended and self._zero_conf_ok(st, h):
+                st.suspended = False
         if (st.best_sig or st.cond_sig) and h >= p.expiry - self.close_margin:
             out.append(self._close_locked(st))
             if st.extra.get("cond_close"):
@@ -717,6 +794,9 @@ class XbtChannelProvider:
         confirms."""
         st = self._channel(req["chan"])
         p = st.params
+        with self.ledger.lock:
+            if not self._zc_confirmed(st, live=True):
+                raise ChannelError("unconfirmed", "the channel's funding (a rollover) is not confirmed yet")
         amount, nxt = int(req["amount"]), req["next"]
         payer_pub = bytes.fromhex(nxt["payerPub"])
         ecc._decode_pub(payer_pub)
@@ -789,6 +869,18 @@ class XbtChannelProvider:
                 return err("channel_closing")
             if st.suspended:
                 return err("unconfirmed")
+            if not self._zc_confirmed(st):
+                # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
+                zc = st.extra["zero_conf"]
+                try:
+                    cum = int(pl.get("cum"))
+                except (TypeError, ValueError):
+                    return err("bad_payload")
+                # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
+                if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
+                    if self.height() >= zc["until"]:
+                        return err("unconfirmed", "rollover unconfirmed at the parent's close margin")
+                    return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed")
             try:
                 out = self.routes.complete_lock(st, pl, route)
             except ChannelError as e:

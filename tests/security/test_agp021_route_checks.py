@@ -561,12 +561,16 @@ class Rollover(_World):
         self.assertEqual(tx.outputs[1].value, p.capacity - oc.signed)
         self.assertEqual(tx.inputs[0].txid[::-1].hex() + f":{tx.inputs[0].vout}", first)
         new = self.hub.out.chans[self.origin]
-        self.assertEqual((new.state, new.p().funding_txid), ("funded", roll["txid"]))
+        # make-before-break (AGP-053): the next ch2 is open at once, unconfirmed, under the provider's cap
+        self.assertEqual((new.state, new.p().funding_txid), ("open", roll["txid"]))
+        self.assertEqual(new.zero_conf["confirmed"], False)
+        R.stream(self.pay, self.sh, 5)
+        self.assertEqual(self.pay.lock(self.sh)["status"], "paid")   # routing goes on over the new ch2 unconfirmed
         self.node.confirm_all()
         self.hub.watch_tick()
-        self.assertEqual(new.state, "open")
+        self.assertEqual((new.state, new.zero_conf["confirmed"]), ("open", True))
         R.stream(self.pay, self.sh, 5)
-        self.assertEqual(self.pay.lock(self.sh)["status"], "paid")   # routing goes on over the new ch2
+        self.assertEqual(self.pay.lock(self.sh)["status"], "paid")   # and once it confirmed
         st_new = next(s for s in self.prov.ledger.channels.values() if s.params.channel_id == new.p().channel_id)
         self.assertGreater(st_new.best_cum, 0)
 
