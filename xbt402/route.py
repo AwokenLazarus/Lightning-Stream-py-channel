@@ -265,7 +265,8 @@ class RouteWal:
 
     Invariants (tests/security/test_agp054_route_wal.py):
       * every ROUTE-STATE that left is covered by a durable snapshot: after a restart, seq, calls
-        and accrued are >= what any answer carried;
+        and accrued are >= what any answer carried. A state carries the session's current meter,
+        so it waits for the session's latest snapshot, not only its own call's (RouteSeller._covering);
       * a restart can count more only for calls that were authenticated and not answered (in
         flight at the crash), each at its projected charge: the in-doubt chunk a client already
         accounts for (cmp: MAX_IN_DOUBT per route session); the projection is exact, so it is
@@ -515,8 +516,15 @@ class RouteSeller:
         self._keys: Dict[str, bytes] = {}
         self._invoices: Dict[str, tuple] = {}   # session -> ((lockId, validUntil), signed invoice): one sign per window
         self._inflight: Dict[str, list] = {}    # session -> [calls, amsat] reserved and not yet ended (AGP-054)
+        # session -> (v, seq, calls, accrued): the meter its latest snapshot holds, v 0 for a completed
+        # routes-file save (durable already). An answer waits for a snapshot that covers it (AGP-054 rework)
+        self._snap: Dict[str, tuple] = {}
+        self._states: Dict[str, int] = {}       # session -> ROUTE-STATEs built so far (a failed call's take-back guard)
         self.wal = RouteWal(wal_path) if wal_path else None
         if self.wal is not None:
+            # a log that lost its lines (deleted, replaced) must not restart below walV: replay would
+            # take the routes file over every snapshot written since
+            self.wal.v = max(self.wal.v, self._saved_v)
             self._replay()
         self.no_reveal = False        # tests/demo: take locks, never reveal t (a withholding provider)
         self.held: list = []
@@ -554,6 +562,11 @@ class RouteSeller:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        if self.wal is not None:
+            # every caller holds self.lock: the file is durable and covers each session as it is now
+            for sid, s in self.sessions.items():
+                seq, calls, acc, _ = self._projected(s)
+                self._snap[sid] = (0, seq, calls, acc)
 
     # offers -------------------------------------------------------------------------------------
     def offer(self, path: str, **kw) -> RouteOffer:
@@ -675,7 +688,22 @@ class RouteSeller:
         return s.seq, s.calls + n, s.accrued_amsat + amt, us
 
     def _submit(self, s: RouteSession) -> int:
-        return self.wal.submit(s.session, *self._projected(s))
+        seq, calls, acc, us = self._projected(s)
+        v = self.wal.submit(s.session, seq, calls, acc, us)
+        self._snap[s.session] = (v, seq, calls, acc)
+        return v
+
+    def _covering(self, s: RouteSession) -> int:
+        """Under self.lock, as a state is built from the session's meter: the version of a snapshot
+        that covers it (seq, calls and accrued each >= the state's), queuing a fresh one if the
+        latest does not. The state carries the session's CURRENT meter, which may already hold a
+        concurrent call metered in memory whose own snapshot is still queued, or a seq taken by
+        begin_call and not reserved yet: waiting only for this call's own reserved snapshot could
+        let a state leave that a crash would take back (AGP-054 rework 1)."""
+        snap = self._snap.get(s.session)
+        if snap is not None and snap[1] >= s.seq and snap[2] >= s.calls and snap[3] >= s.accrued_amsat:
+            return snap[0]
+        return self._submit(s)
 
     def reserve(self, s: RouteSession, expect_amsat: int) -> Optional[tuple]:
         """Before the handler runs (AGP-054): count the call in flight at `expect_amsat` and queue its
@@ -724,21 +752,43 @@ class RouteSeller:
             state = self.state(s, charge_amsat)
             if self.wal is None:
                 return state
+            gen = self._states[s.session] = self._states.get(s.session, 0) + 1
             if ticket is None or ticket[1] != charge_amsat:
-                # a reserved snapshot (or a routes-file save after it, which projects the same way)
-                # already covers this state; any other charge needs its own
+                # the durable meter must not keep a projection the call did not bill
                 v = self._submit(s)
             else:
-                v = ticket[0]
+                # the session's latest snapshot, not only this call's own: the state carries the
+                # session's meter as it is now (sequentially, that is the reserved one)
+                v = self._covering(s)
         try:
             self.wal.wait(v)
         except OSError as e:
             with self.lock:
-                s.accrued_amsat -= charge_amsat
-                s.calls -= 1
-                if s.owed_amsat() <= 0:
-                    s.unpaid_since = 0.0
+                # taken back only while no later state carries it (a later answer's snapshot may be
+                # durable and hold it: taking it back would make the next state go backwards; it
+                # then stays billed, like a call in flight at a crash)
+                if self._states.get(s.session) == gen:
+                    s.accrued_amsat -= charge_amsat
+                    s.calls -= 1
+                    if s.owed_amsat() <= 0:
+                        s.unpaid_since = 0.0
             raise ChannelError("route_wal_failed", str(e))
+        return state
+
+    def refusal_state(self, s: RouteSession) -> Optional[dict]:
+        """The ROUTE-STATE a refused call's 402 carries, once a snapshot covering it is durable (the
+        refused call's seq was taken, and a concurrent call may be metered in memory). None when the
+        RouteWal cannot make it durable: the 402 then carries no state."""
+        with self.lock:
+            state = self.state(s)
+            if self.wal is None:
+                return state
+            self._states[s.session] = self._states.get(s.session, 0) + 1
+            v = self._covering(s)
+        try:
+            self.wal.wait(v)
+        except OSError:
+            return None
         return state
 
     # adaptor-locked ch2 states (from the hub) ----------------------------------------------------

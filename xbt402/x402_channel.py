@@ -905,8 +905,9 @@ class XbtChannelProvider:
             doc = json.loads(b)
             doc["accepts"][0]["extra"]["route"] = self.routes.route_extra(path_key)
             if s is not None:
-                with self.routes.lock:
-                    doc["routeState"] = self.routes.state(s)
+                rs = self.routes.refusal_state(s)
+                if rs is not None:
+                    doc["routeState"] = rs
             h["PAYMENT-REQUIRED"] = b64json(doc)
             return 402, h, json.dumps(doc).encode()
         ticket = None

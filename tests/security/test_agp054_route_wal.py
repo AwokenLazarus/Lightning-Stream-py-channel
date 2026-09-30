@@ -7,6 +7,10 @@ before its ROUTE-STATE leaves, and its fsync is written ahead while the handler 
   * a seq is durable before its handler runs: no ROUTE-AUTH is served twice across a crash;
   * a charge other than the projected one is corrected before its answer leaves;
   * a routes-file save during a call (a lock completing) covers that call's reservation;
+  * rework 1: a state carries the session's CURRENT meter, so with concurrent calls on one session
+    (or a seq a later begin_call took) it waits for a snapshot covering THAT, and so does a 402's
+    routeState; a failed call is not taken back once a later state carries it; versions resume
+    above the routes file's walV if the log was lost;
   * a write failure answers 500 route_wal_failed with no ROUTE-STATE and bills nothing;
   * the fsync overlaps the handler, and concurrent calls share one (group commit);
   * compaction keeps the latest snapshot per session.
@@ -237,6 +241,171 @@ class TestReplay(_Tmp):
         self.assertEqual(int(c.states[-1]["accruedAmsat"]), 2 * PRICE)
         box.start()
         self.assertEqual(meter(box.p, c.session), (3, 2, 2 * PRICE))
+
+    def test_a_wal_failure_is_not_taken_back_once_a_later_state_carries_it(self):
+        """Rework 1: A fails its write while B (metered after A) answers from a durable snapshot that
+        holds A's charge. Taking A back would make the next state go below B's."""
+        box = Box(self.d)
+        c = Client(box)
+        rs, wal = box.p.routes, box.p.routes.wal
+        s = rs.sessions[c.session]
+        tA = rs.reserve(s, PRICE)
+        wal.wait(tA[0])
+        gate, orig = threading.Event(), wal._write
+
+        def slow(batch):
+            if any(v == tA[0] + 1 for v, _, _ in batch):
+                gate.wait(10)
+                raise OSError(5, "EIO (test)")
+            return orig(batch)
+        wal._write = slow
+        tB = rs.reserve(s, PRICE)                                  # v2: its batch will fail
+        out = {}
+
+        def run(k, charge, t):
+            try:
+                out[k] = rs.end_call(s, charge, t)
+            except route_mod.ChannelError as e:
+                out[k] = e.code
+        a = threading.Thread(target=run, args=("A", PRICE, tA)); a.start()
+        time.sleep(0.2)                                            # A metered, waiting on v2
+        b = threading.Thread(target=run, args=("B", PRICE // 2, tB)); b.start()
+        time.sleep(0.2)                                            # B corrected: its own v3
+        gate.set(); a.join(5); b.join(5)
+        self.assertEqual(out["A"], "route_wal_failed")
+        self.assertEqual(out["B"]["calls"], 2)
+        self.assertEqual(int(out["B"]["accruedAmsat"]), PRICE + PRICE // 2)
+        self.assertEqual((s.calls, s.accrued_amsat), (2, PRICE + PRICE // 2))   # A stays billed
+        box.start()
+        self.assertGreaterEqual(meter(box.p, c.session)[2], PRICE + PRICE // 2)
+
+
+class TestCoveringSnapshot(_Tmp):
+    """Rework 1 (agp-lead repro tests/security/lead_wal_race_repro.py): a ROUTE-STATE carries the
+    session's CURRENT meter, so it may leave only once a snapshot covering THAT is durable, not
+    merely the call's own reserved one. Each test holds the writer on the later snapshot and checks,
+    at the moment a state is returned, that the durable log already covers it."""
+
+    def _hold(self, wal, from_v):
+        gate, orig = threading.Event(), wal._write
+
+        def slow(batch):
+            if any(v >= from_v for v, _, _ in batch):
+                gate.wait(10)
+            return orig(batch)
+        wal._write = slow
+        return gate
+
+    def _covered(self, box, sid, state):
+        d = box.p.routes.wal.read()[sid]
+        return (d["seq"] >= int(state["seq"]) and d["calls"] >= int(state["calls"])
+                and int(d["acc"]) >= int(state["accruedAmsat"]))
+
+    def _answer_then_release(self, box, sid, fn):
+        """Run fn (returns a state) in a thread; while the writer is held it must not return; at
+        its return the durable log must cover what it returned."""
+        res = {}
+
+        def go():
+            st = fn()
+            res["covered"] = st is None or self._covered(box, sid, st)
+            res["state"] = st
+        th = threading.Thread(target=go)
+        th.start()
+        th.join(0.3)
+        early = not th.is_alive()
+        return th, res, early
+
+    def test_concurrent_calls_on_one_session_wait_for_the_later_snapshot(self):
+        box = Box(self.d)
+        c = Client(box)
+        rs, wal = box.p.routes, box.p.routes.wal
+        s = rs.sessions[c.session]
+        tA = rs.reserve(s, PRICE)
+        wal.wait(tA[0])                                            # A's snapshot v1 durable
+        gate = self._hold(wal, tA[0] + 1)
+        tB = rs.reserve(s, PRICE)                                  # B's snapshot v2: writer held
+        thB = threading.Thread(target=lambda: rs.end_call(s, PRICE, tB)); thB.start()
+        time.sleep(0.2)                                            # B metered in memory, waiting on v2
+        thA, res, early = self._answer_then_release(box, c.session, lambda: rs.end_call(s, PRICE, tA))
+        gate.set(); thA.join(5); thB.join(5)
+        self.assertFalse(early, "A's state (calls 2) left while only v1 (calls 1) was durable")
+        self.assertTrue(res["covered"])
+        self.assertEqual(res["state"]["calls"], 2)
+        self.assertEqual(int(res["state"]["accruedAmsat"]), 2 * PRICE)
+
+    def test_a_seq_taken_by_a_concurrent_begin_call_is_durable_before_a_state_carries_it(self):
+        box = Box(self.d)
+        c = Client(box)
+        rs, wal = box.p.routes, box.p.routes.wal
+        s = rs.sessions[c.session]
+        h, b = c.request()                                         # A: seq 1
+        sA, err = rs.begin_call(PATH, h["ROUTE-AUTH"], "POST", PATH, b)
+        self.assertIsNone(err)
+        tA = rs.reserve(sA, PRICE)
+        wal.wait(tA[0])
+        h, b = c.request()                                         # C: seq 2, authenticated, not reserved yet
+        rs.begin_call(PATH, h["ROUTE-AUTH"], "POST", PATH, b)
+        gate = self._hold(wal, tA[0] + 1)
+        thA, res, early = self._answer_then_release(box, c.session, lambda: rs.end_call(s, PRICE, tA))
+        gate.set(); thA.join(5)
+        self.assertFalse(early, "A's state carried seq 2 while the durable seq was 1")
+        self.assertTrue(res["covered"])
+        self.assertEqual(res["state"]["seq"], 2)
+        box.start()                                                # C's ROUTE-AUTH is not served again
+        self.assertEqual(meter(box.p, c.session)[0], 2)
+
+    def test_a_refusal_state_is_durable_before_the_402_carries_it(self):
+        box = Box(self.d)
+        c = Client(box)
+        rs, wal = box.p.routes, box.p.routes.wal
+        s = rs.sessions[c.session]
+        self.assertEqual(c.call()[0], 200)
+        h, b = c.request()                                         # a refused call still takes its seq
+        rs.begin_call(PATH, h["ROUTE-AUTH"], "POST", PATH, b)
+        gate = self._hold(wal, wal.v + 1)
+        th, res, early = self._answer_then_release(box, c.session, lambda: rs.refusal_state(s))
+        gate.set(); th.join(5)
+        self.assertFalse(early)
+        self.assertTrue(res["covered"])
+        self.assertEqual(res["state"]["seq"], 2)
+
+    def test_a_refusal_402_carries_a_covered_state(self):
+        box = Box(self.d)
+        c = Client(box)
+        self.assertEqual(c.call()[0], 200)
+        box.p.routes.sessions[c.session].unpaid_since = time.time() - 60   # past window + lock_wait
+        st, rh, _ = c.call()
+        self.assertEqual(st, 402)
+        doc = unb64json(rh["PAYMENT-REQUIRED"])
+        self.assertEqual(doc["routeState"]["seq"], 2)
+        self.assertTrue(self._covered(box, c.session, doc["routeState"]))
+        box.start()
+        self.assertEqual(meter(box.p, c.session), (2, 1, PRICE))
+
+    def test_sequential_calls_still_answer_from_their_reserved_snapshot(self):
+        """The rule keeps the overlap: one snapshot per call when calls do not overlap."""
+        box = Box(self.d)
+        c = Client(box)
+        v0 = box.p.routes.wal.v
+        for _ in range(10):
+            self.assertEqual(c.call()[0], 200)
+        self.assertEqual(box.p.routes.wal.v - v0, 10)
+
+    def test_a_lost_log_does_not_restart_below_walv(self):
+        box = Box(self.d)
+        c = Client(box)
+        for _ in range(3):
+            c.call()
+        box.p.routes._save()
+        saved = box.p.routes._saved_v
+        self.assertGreater(saved, 0)
+        os.remove(os.path.join(self.d, "prov.route-wal"))
+        box.start()
+        self.assertGreaterEqual(box.p.routes.wal.v, saved)
+        self.assertEqual(c.call()[0], 200)
+        box.start()                                                # the new line wins over the file
+        self.assertEqual(meter(box.p, c.session), (4, 4, 4 * PRICE))
 
     def test_compaction_keeps_the_latest_snapshot_per_session(self):
         box = Box(self.d, compact_bytes=400)

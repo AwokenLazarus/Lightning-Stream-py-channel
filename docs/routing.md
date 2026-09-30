@@ -71,13 +71,19 @@ guarantee the rails' own, with the fsync off the critical path:
   `{s, v, seq, calls, acc, us}`;
 * one writer thread appends what is queued and fdatasyncs it (group commit), while the handler
   computes;
-* `end_call` returns the ROUTE-STATE only once a snapshot covering it is durable: the reserved one
-  when the charge is as projected, else a corrected one (one more fsync);
-* a write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed;
+* `end_call` returns the ROUTE-STATE only once a snapshot covering it is durable. The state
+  carries the session's *current* meter (seq, calls, accrued), which can already hold a concurrent
+  call metered in memory, or a seq a later `begin_call` took. So it waits for the session's
+  *latest* snapshot when that covers the state (sequentially, that is the call's own reserved
+  one), else queues a fresh one. A charge other than the projection always writes a corrected
+  snapshot (one more fsync). A refused call's 402 `routeState` waits the same way;
+* a write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed, unless a
+  later state of the session already carries the call (then it stays billed, like a call in
+  flight at a crash, so no state goes backwards);
 * the routes file keeps each session projected over its calls in flight, plus `walV`. A save during
   a call (a lock completing) therefore covers that call's reservation. At start, a WAL snapshot wins
-  over the routes file when its `v` is above `walV`. The log is compacted to one line per session
-  past 1 MiB.
+  over the routes file when its `v` is above `walV`, and versions resume above `walV` even if the
+  log was lost. The log is compacted to one line per session past 1 MiB.
 
 What a crash can do now:
 * every answered state survives it;
@@ -94,5 +100,6 @@ shows as paid now resolves it through the provider, instead of voiding it.
 **ROUTE-STATE.** The window's invoice is signed once per window, not on every call. The bytes are
 identical because ECDSA signing is deterministic.
 
-Tests: `tests/security/test_agp054_route_wal.py` (16). In Rust: `crates/xbt402-interop/tests/route_wal.rs`
-(12) and `routing_checks.rs` `agp054_*` (2).
+Tests: `tests/security/test_agp054_route_wal.py` (23, 7 from rework 1: concurrent calls on one
+session with the writer held on the later snapshot). In Rust: `crates/xbt402-interop/tests/route_wal.rs`
+(19) and `routing_checks.rs` `agp054_*` (2).
