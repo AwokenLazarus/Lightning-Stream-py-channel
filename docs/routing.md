@@ -38,9 +38,9 @@ provider completes ch2 with t (plain 0x21 state, saved write-ahead) -> t -> hub 
 2. **Sub-sat.** Provider and client meter in amsat (1e-18 msat) and agree exactly. Each lock pays `ceil(accrued) - paid`. The hub fee is carried in 1e-6 msat units and charged as the ceil of its running total. Nothing is rounded per chunk.
 3. **Fan-out.** Per-provider serial locks on one ch1: one outstanding lock per channel, as AGP-019 found multi-provider locks unsafe for the hub. A client that needs more parallelism opens a second ch1 (a lane) to the same hub. Loss bound: at most one lock is ever at risk on a ch1, and it is one provider's accrual since its last lock (≤ (window + lockWait) × rate × price, because the provider stops serving after that).
 4. **Market fees.** No fixed fee. The hub signs expiring `FeeQuote`s, and its fee strategy is config (`flat`, `utilization`, or a callable). The provider's `PriceQuote`, invoices and ROUTE-STATE are payTo-signed and checked by the client. `lockAuth` binds (session, lockId, amount, T, hub) with a key the hub does not have, so the hub can neither reprice nor redirect a lock.
-5. **Small providers.** The hub funds ch2 (`connect`), bound to its payTo at open. It rolls ch2 over when the provider's net payout reaches `settleMultiple × closeFee` (or near the provider's close margin), never while a lock is pending. `liquidity_cap_sat` bounds the hub's coins. The provider pays its own ch2 close fee (payee-pays, AGP-023), so it alone decides when a settlement is worth it.
+5. **Small providers.** The hub funds ch2 (`connect`), bound to its payTo at open. It rolls ch2 over when the provider's net payout reaches `settleMultiple × closeFee` and the ch2 has taken `settle_lock_multiple` × the largest lock routed to that provider (AGP-056, below), or near the provider's close margin, never while a lock is pending. `liquidity_cap_sat` bounds the hub's coins. The provider pays its own ch2 close fee (payee-pays, AGP-023), so it alone decides when a settlement is worth it.
 6. **Withholding.** The provider serves a session while its unpaid charges are younger than `window + lockWait`. The hub's stall costs the provider at most that, and the client at most its one outstanding lock, which it gives up when the invoice expires unanswered. A hub that keeps receipts back does not stall anything: the client takes t from the provider's signed ROUTE-STATE.
-7. **Identity.** One payTo per operator. Each device has its own ch2 (the per-channel payee keys differ). Invoices and quotes of all devices verify under the same payTo.
+7. **Identity.** One payTo per operator. Each device (provider process: its own origin, ledger and sessions) has its own ch2 (the per-channel payee keys differ). Invoices and quotes of all devices verify under the same payTo. One key holds at most `ch2_max_per_pay_to` live ch2s (AGP-056).
 
 ## For xbt-compute (cmp)
 ```python
@@ -103,3 +103,52 @@ identical because ECDSA signing is deterministic.
 Tests: `tests/security/test_agp054_route_wal.py` (23, 7 from rework 1: concurrent calls on one
 session with the writer held on the later snapshot). In Rust: `crates/xbt402-interop/tests/route_wal.rs`
 (19) and `routing_checks.rs` `agp054_*` (2).
+
+## ch2 identity, rollover relay and the settle floor (AGP-056)
+**ch2 identity: one per provider process.** A ch2 lives in ONE provider process's ledger, with that
+process's route sessions. AGP-044 kept one live ch2 per payTo and sent the locks of a second origin
+under that key to the origin that opened the ch2: with two provider processes on one operator key (cmp
+merchants) that process has no session for them (`unknown_session`, the client sees `route_failed`).
+The hub now keys a ch2 by the canonical origin again:
+
+- `connect(origin)` funds that origin's own ch2; an origin that already has a live one gets it back and
+  nothing is funded (racing connects fund one).
+- A lock goes to the origin the client named, on that origin's ch2.
+- One payTo key holds at most `ch2_max_per_pay_to` live ch2s (default 8, 0: no bound): the next
+  `connect` is refused `pay_to_limit` and nothing is funded. `liquidity_cap_sat` counts every ch2.
+- A refusal says why: `route_blocked` "no open channel to that provider: its payTo has a ch2 at
+  <origin>, another provider process ...".
+
+An operator who serves ONE provider process at two URLs should give the hub one of them: each URL would
+get its own ch2 (they work, the capital is split).
+
+**Rollover relay.** The provider broadcasts a rollover on its own node. A hub on another node sees it
+only after P2P relay, so the hub no longer blocks the child as vanished (`ch2_rollover_vanished`) unless
+its node showed the rollover before (`fund_seen`), or still does not `rollover_relay_grace` seconds
+(default 60) after the rollover. Before, a hub with its own node blocked every rollover child until
+the next block.
+
+**Settle floor.** `settleMultiple × closeFee` (12,600 sat at the defaults) is when a settlement is
+worth its fee to the provider. With locks larger than that, the ch2 rolled over on every lock.
+
+- Hub: a due rollover waits until the ch2 has taken `settle_lock_multiple` (k, default 4) × the largest
+  lock routed to that provider (`max_lock`, carried over rollovers). It never waits past the point
+  where another lock of that size would not fit, and not at all once the ch2 has had no lock for
+  `settle_idle` seconds (default 600). `settle_lock_multiple: 0` restores the old rule.
+- A rollover child that could not take one more lock of that size is not made: the ch2 is closed and
+  refilled instead (before, such a child sat exhausted and unsigned until its expiry).
+- Provider: the default zero-conf cap of a rollover child is now
+  `max(2 × settleMultiple × closeFee, 2 × settle_lock_multiple × largest lock on the parent's line)`,
+  so the first lock on an unconfirmed child is not above the cap. An explicit
+  `rollover_zero_conf_max` is used as it is.
+- Why k = 4: at most one rollover per four of the largest locks (the provider's close fees and the
+  unconfirmed windows fall by the same factor), and with a ch2 capacity of five such locks, the usual
+  sizing (100k / 20k, 200k / 40k), it is the largest k that still leaves room for one more lock when
+  the rollover is due.
+
+**Refusal detail.** `RoutePayer.lock` returns `{"status": "refused", "error", "detail"}`, as the Rust
+client does. A provider's refusal reaches the client as `route_failed` with detail
+`provider refused the lock: <code> (<the provider's detail, printable ASCII, bounded>)`.
+
+No wire change: no new field or message. Tests: `tests/security/test_agp056_multi_process.py` (21); in
+Rust `crates/xbt402-interop/tests/hub_multi_process.rs`.

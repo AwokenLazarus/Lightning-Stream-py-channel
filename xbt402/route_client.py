@@ -348,7 +348,8 @@ class RoutePayer:
                     if doc.get("lockId") != p["lockId"] or adaptor.point_of(y) != adaptor.dec(p["T1"]):
                         self._void(p, "hub answer does not open this lock")
                         self.events.append({"event": "stale_answer", "lockId": p["lockId"], "cum1": doc.get("cum")})
-                        return {"status": "refused", "error": "stale_answer"}
+                        return {"status": "refused", "error": "stale_answer",
+                                "detail": "hub answer does not open this lock"}
                     t = self.signer.resolve_lock(self.chan, doc["secret"])
                 self.pending = {}
                 self._commit(p, t, "hub")
@@ -364,7 +365,9 @@ class RoutePayer:
                     return {"status": "paid", "amount": d, "fee": f, "lockId": p["lockId"], "via": "provider"}
                 self.stats["refused"][code] = self.stats["refused"].get(code, 0) + 1
                 self._void(p, f"hub: {code}")
-                return {"status": "refused", "error": code}
+                # the hub's reason, as the Rust RoutePayer returns it (AGP-056): free text, for logs
+                detail = doc.get("detail")
+                return {"status": "refused", "error": code, "detail": detail if isinstance(detail, str) else ""}
             return {"status": "pending", "http": st}
 
     # --- background locking ------------------------------------------------------------------------

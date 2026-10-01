@@ -860,7 +860,8 @@ class RouteSeller:
             locks[lock_id] = rec
             if sig:
                 st.best_cum, st.best_sig = cum, sig.hex()
-            st.extra = {**(st.extra or {}), "route_locks": locks, "routed_sat": routed + amount}
+            st.extra = {**(st.extra or {}), "route_locks": locks, "routed_sat": routed + amount,
+                        "max_lock": max(int((st.extra or {}).get("max_lock", 0)), amount)}
             self.p.ledger.save(st)
             s.paid_sat += amount
             s.locks += 1

@@ -2,7 +2,7 @@
 transport). One class per item:
     1 a stuck ch2 refund is re-signed at a higher fee (RBF: the hub holds the payer key, its refunds signal
       replaceability), capped by refund_max_fee_sat, and whichever version confirms is the refund;
-    2 one live ch2 per payTo (two origins, one operator key), the cap accounting unchanged.
+    2 one live ch2 per origin (AGP-056 replaced one per payTo: test_agp056_multi_process.py).
 The Rust port has the same tests (xbt-rs crates/xbt402-interop/tests/hub_leftovers.rs)."""
 import os
 import sys
@@ -253,28 +253,12 @@ class RefundBump(unittest.TestCase):
         self.assertEqual((d.refund_bump_blocks, d.refund_max_fee_sat), (3, 5000))
 
 
-# --- 2 one live ch2 per payTo ---------------------------------------------------------------------------
+# --- 2 one live ch2 per origin ---------------------------------------------------------------------------
+# AGP-044 kept one live ch2 per payTo and routed a second origin of that key over it. That broke operators
+# who run several provider processes on one key (each has its own ledger): AGP-056 keys the ch2 by origin
+# again. What is left of item 2 here is the guard on ONE origin; the rest is in test_agp056_multi_process.py.
 
-class OneCh2PerPayTo(unittest.TestCase):
-    def test_payto_two_origins_one_operator_get_one_ch2_and_the_cap_is_unchanged(self):
-        w = W([0xA1, 0xA1], True, liquidity_cap_sat=100_000)    # the cap holds exactly one ch2
-        a, b = w.origins
-        oa, ob = w.hub.connect(a), w.hub.connect(b)
-        self.assertEqual(oa.p().channel_id, ob.p().channel_id)
-        self.assertEqual((w.funds, w.hub.committed_sat(), w.live()), (1, 100_000, 1))
-        reuse = w.events("ch2_reuse")
-        self.assertEqual((len(reuse), reuse[0]["provider"], reuse[0]["ch2"]), (1, b, a))
-        w.node.confirm_all()
-        w.hub.watch_tick()
-        self.assertEqual(w.providers(), [a, b])                  # the hub's 402 lists both origins as routable
-        sa, sb = w.pay.shard(a + "/v1/chunk"), w.pay.shard(b + "/v1/chunk")
-        for sh in (sa, sb, sa):
-            R.stream(w.pay, sh, 6)
-            self.assertEqual(w.pay.lock(sh)["status"], "paid")
-        self.assertEqual(w.oc(a).routed, sa.locked_sat + sb.locked_sat)
-        self.assertNotIn(b, w.hub.out.chans)
-        self.assertEqual(w.hub.committed_sat(), 100_000)
-
+class OneCh2PerOrigin(unittest.TestCase):
     def test_payto_a_second_connect_to_the_same_origin_funds_nothing(self):
         w = W([0xA1], False)
         o = w.origins[0]
@@ -286,26 +270,27 @@ class OneCh2PerPayTo(unittest.TestCase):
         self.assertEqual((w.funds, len(w.hub.out.archived)), (1, 0))
         self.assertEqual(w.oc(o).state, "open")
 
-    def test_payto_while_funding_a_second_origin_is_refused_not_funded(self):
-        w = W([0xA1, 0xA1], True)
-        a, b = w.origins
+    def test_payto_while_funding_the_same_origin_is_refused_not_funded(self):
+        w = W([0xA1], False)
+        a = w.origins[0]
         w.hub.connect(a)
         w.oc(a).state = "funding"                                # the wallet call still out
         with self.assertRaises(ChannelError) as e:
-            w.hub.connect(b)
+            w.hub.connect(a + "/")
         self.assertEqual(e.exception.code, "ch2_funding")
         self.assertEqual(w.funds, 1)
 
-    def test_payto_racing_connects_fund_one_ch2(self):
-        w = W([0xA1, 0xA1], True, delay=0.15)
+    def test_payto_racing_connects_to_one_origin_fund_one_ch2(self):
+        w = W([0xA1], False, delay=0.15)
+        a = w.origins[0]
         res = {}
 
-        def go(o):
+        def go(i, o):
             try:
-                res[o] = ("ok", w.hub.connect(o).p().channel_id)
+                res[i] = ("ok", w.hub.connect(o).p().channel_id)
             except ChannelError as e:
-                res[o] = ("err", e.code)
-        ths = [threading.Thread(target=go, args=(o,)) for o in w.origins]
+                res[i] = ("err", e.code)
+        ths = [threading.Thread(target=go, args=(i, o)) for i, o in enumerate((a, a + "/"))]
         for t in ths:
             t.start()
         for t in ths:
@@ -314,72 +299,6 @@ class OneCh2PerPayTo(unittest.TestCase):
         self.assertTrue(any(r[0] == "ok" for r in res.values()), res)
         self.assertTrue(all(r[0] == "ok" or r[1] == "ch2_funding" for r in res.values()), res)
         self.assertEqual(w.live(), 1)
-
-    def test_payto_rollover_keeps_both_origins_on_the_next_ch2(self):
-        w = W([0xA1, 0xA1], True)
-        w.connect_all()
-        a, b = w.origins
-        sb = w.pay.shard(b + "/v1/chunk")
-        R.stream(w.pay, sb, 6)
-        self.assertEqual(w.pay.lock(sb)["status"], "paid")
-        before = w.oc(a)
-        before_chan = before.p().channel_id
-        w.node.height = before.p().expiry - 40                   # near its close margin: the provider co-signs
-        w.hub.rollover(before)
-        after = w.oc(a)
-        self.assertNotEqual(after.p().channel_id, before_chan)
-        w.node.confirm_all()
-        w.hub.watch_tick()
-        self.assertEqual(w.oc(a).state, "open")
-        R.stream(w.pay, sb, 6)
-        self.assertEqual(w.pay.lock(sb)["status"], "paid")
-        self.assertEqual(w.oc(a).p().channel_id, after.p().channel_id)
-        self.assertGreater(w.oc(a).routed, 0)
-        self.assertEqual(w.live(), 1)
-
-    def test_payto_after_a_close_the_next_origin_funds_the_one_new_ch2(self):
-        w = W([0xA1, 0xA1], True)
-        w.connect_all()
-        a, b = w.origins
-        sa = w.pay.shard(a + "/v1/chunk")
-        R.stream(w.pay, sa, 6)
-        self.assertEqual(w.pay.lock(sa)["status"], "paid")
-        w.hub.close_ch2(w.oc(a))
-        self.assertEqual(w.live(), 0)
-        nb = w.hub.connect(b)                                    # not live any more: a new ch2, under b
-        self.assertEqual((nb.origin, w.funds, w.live()), (b, 2, 1))
-        self.assertEqual(w.hub.connect(a).p().channel_id, nb.p().channel_id)   # a reuses it
-        self.assertEqual(w.funds, 2)
-        w.node.confirm_all()
-        w.hub.watch_tick()
-        R.stream(w.pay, sa, 6)
-        self.assertEqual(w.pay.lock(sa)["status"], "paid")       # a's locks go over b's ch2
-        self.assertGreater(w.oc(b).routed, 0)
-
-    def test_payto_the_origin_map_survives_a_restart(self):
-        w = W([0xA1, 0xA1], True)
-        w.connect_all()
-        a, b = w.origins
-        h2 = w.new_hub()
-        self.assertEqual(w.providers(h2), [a, b])
-        self.assertEqual(h2.connect(b).origin, a)
-
-    def test_payto_separate_backends_under_one_key_share_the_ch2_and_the_other_device_is_refused(self):
-        # two provider processes with one operator key and separate ledgers: the second origin reuses the
-        # first's ch2, so its locks reach a provider that has no session for them: refused, and only that
-        # lock (nothing is blocked; the first origin keeps routing)
-        w = W([0xA1, 0xA1], False)
-        w.connect_all()
-        a, b = w.origins
-        self.assertEqual((w.funds, w.live()), (1, 1))
-        sb = w.pay.shard(b + "/v1/chunk")
-        R.stream(w.pay, sb, 6)
-        r = w.pay.lock(sb)
-        self.assertEqual((r["status"], r.get("error")), ("refused", "route_failed"), r)
-        self.assertEqual(w.oc(a).blocked, "")
-        sa = w.pay.shard(a + "/v1/chunk")
-        R.stream(w.pay, sa, 6)
-        self.assertEqual(w.pay.lock(sa)["status"], "paid")
 
     def test_payto_canonical_origins(self):
         for i, o in [("HTTP://Host.Test:80/", "http://host.test"), ("https://h.test:443", "https://h.test"),

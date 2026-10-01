@@ -57,10 +57,25 @@ Leftovers (AGP-044, as the Rust hub):
     is re-signed at a higher fee (the estimate, at least 2x and + 1 sat/vB) to the same destination, up
     to refund_max_fee_sat; every version is kept (refund_prev) until one confirms, and whichever does
     is the refund;
-  * one live ch2 per payTo: a provider is the payTo its /terms name, not the URL it was reached at
-    (origins are canonical: canon_origin). A second origin with the payTo of a live ch2 reuses it
-    (event ch2_reuse; its locks go over that ch2, to the origin that opened it), so one operator never
-    splits the hub's capital over several ch2s; the cap accounting is unchanged.
+  * origins are canonical (canon_origin), and one origin never has two live ch2s.
+
+ch2 identity (AGP-056, replacing AGP-044's one live ch2 per payTo): a ch2 belongs to one provider
+PROCESS, the origin it was funded at, because that process's ledger is the only one that holds the
+channel and its route sessions. An operator may run several provider processes on one payTo key (cmp
+merchants), each with its own ledger and origin: each gets its own ch2, and a lock is forwarded to the
+origin the client named, on that origin's ch2. One key takes at most ch2_max_per_pay_to live ch2s
+(refused pay_to_limit beyond it), so an operator cannot spread the hub's capital without bound.
+
+Settle floor (AGP-056, as the Rust hub): the provider's threshold (settleMultiple x closeFee) says when
+a settlement is worth its fee; with locks larger than it, every lock would roll the ch2 over. A due
+rollover therefore waits until the ch2 has taken settle_lock_multiple x the largest lock routed to
+that provider, but never past the point where another lock of that size would not fit, and never
+once the ch2 has had no lock for settle_idle seconds.
+
+Rollover relay (AGP-056): the provider broadcasts the rollover on ITS node. A hub on another node sees
+it only after P2P relay, so "not in my mempool" right after a rollover is not "vanished": the child is
+blocked only if the hub's node showed the rollover before, or still does not rollover_relay_grace
+seconds after it.
 
 Close fees (xbt402 v1.2 closeFeePayer, AGP-023): ch2 is payee-pays by default (Mike, 2026-09-28): the
 provider pays its own settlement's close fee out of its output, so the hub's fees price only liquidity
@@ -93,7 +108,7 @@ from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, 
                     fee_due, find_spend, hub_channel_message, next_cum, route_ok)
 from .tx import Tx, address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, request_auth, request_digest,
-                           unb64json)
+                           safe_code, unb64json)
 from .channel import channel_auth_key
 
 
@@ -130,6 +145,10 @@ class OutChannel:
     fund_vout: int = 0
     rolled_from: str = ""        # the ch2 whose rollover funds this one (AGP-053)
     zero_conf: dict = field(default_factory=dict)   # the provider took it unconfirmed (AGP-053): {parent, maxCum, until, confirmed}
+    max_lock: int = 0            # the largest lock routed over this ch2 and the ones it was rolled from (AGP-056)
+    last_lock_at: float = 0.0    # when the last lock on it completed (the settle floor holds only while locks come)
+    rolled_at: float = 0.0       # when the rollover that funds it was co-signed (AGP-056: relay grace)
+    fund_seen: bool = False      # the hub's node has shown that rollover (mempool or a block)
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
@@ -158,8 +177,9 @@ def refund_booked(r: dict) -> bool:
 class OutBook:
     """The hub's ch2s, fsynced JSON (keys included: regtest only; the production hub signs with B2).
 
-    One live ch2 per payTo (AGP-044): `origins` maps every origin the hub connected (canonical) to the
-    payTo its /terms named; a second origin with the payTo of a live ch2 routes over that ch2."""
+    One ch2 per origin (AGP-056): `chans` is keyed by the canonical origin, one provider process.
+    `origins` maps every origin the hub connected to the payTo its /terms named (a record, and the
+    per-payTo count)."""
 
     def __init__(self, path: str):
         self.path, self.lock = path, threading.RLock()
@@ -174,21 +194,16 @@ class OutBook:
             self.origins = {k: str(v) for k, v in raw.get("origins", {}).items()}
         self.mutex: Dict[str, threading.Lock] = {}
 
-    def live_for_pay_to(self, pay_to: str) -> Optional[str]:
-        """The key of the live ch2 (funding, funded or open) to `pay_to`."""
+    def live_keys(self, pay_to: str) -> list:
+        """The origins with a live ch2 (funding, funded or open) to `pay_to`."""
         with self.lock:
-            return next((k for k, c in self.chans.items() if c.pay_to.lower() == pay_to.lower() and c.state in LIVE), None)
+            return [k for k, c in self.chans.items() if c.pay_to.lower() == pay_to.lower() and c.state in LIVE]
 
     def key_for(self, origin: str) -> Optional[str]:
-        """The key of the ch2 that serves `origin` (canonical): its own record while live, else the live
-        ch2 of the payTo it was connected under, else its own record (closed, refunded, ...)."""
+        """The key of the ch2 that serves `origin` (canonical): its own, and no other (AGP-056: the
+        ch2 of another origin under the same payTo is in another process's ledger)."""
         with self.lock:
-            own = self.chans.get(origin)
-            if own is not None and own.state in LIVE:
-                return origin
-            pt = self.origins.get(origin) or (own.pay_to if own is not None else None)
-            k = self.live_for_pay_to(pt) if pt else None
-            return k or (origin if own is not None else None)
+            return origin if origin in self.chans else None
 
     def save(self):
         with self.lock:
@@ -229,7 +244,16 @@ class HubConfig:
     wallet, the mempool nor the chain shows is dropped after funding_timeout_blocks (a known send is
     still watched: AGP-045). zero_conf_rollover (AGP-053, default on): open a rollover's next ch2 at
     once, unconfirmed, where the provider takes it (its /open reply carries zeroConf), so routing to the
-    provider never pauses for a block (make-before-break); a provider that refuses is opened at minConf."""
+    provider never pauses for a block (make-before-break); a provider that refuses is opened at minConf.
+
+    AGP-056: ch2_max_per_pay_to bounds the live ch2s one payTo key may hold over its origins (provider
+    processes; 0: no bound). settle_lock_multiple (k) delays a due rollover until the ch2 has taken k x
+    the largest lock routed to that provider (0: roll over at the provider's threshold, as before), for
+    as long as locks keep coming (settle_idle seconds without one: roll over). k = 4: at most one
+    rollover per four of the largest locks, and with the usual capacity of five such locks (100k / 20k,
+    200k / 40k) it is the largest k that still leaves room for one more lock when the rollover is due.
+    rollover_relay_grace: seconds a rollover the hub's own node has not shown yet is given to arrive
+    over P2P before its ch2 is blocked as vanished."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -261,6 +285,10 @@ class HubConfig:
     refund_bump_blocks: int = 3
     refund_max_fee_sat: int = 5_000
     zero_conf_rollover: bool = True
+    ch2_max_per_pay_to: int = 8
+    settle_lock_multiple: int = 4
+    settle_idle: float = 600.0
+    rollover_relay_grace: float = 60.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -379,20 +407,14 @@ class RouteHub:
                 "providers": self._routable()}
 
     def _routable(self) -> list:
-        """Every origin whose ch2 (its own, or its payTo's) is open and not blocked."""
+        """Every origin whose own ch2 is open and not blocked."""
         with self.out.lock:
-            def ok(o):
-                k = self.out.key_for(o)
-                c = self.out.chans.get(k) if k else None
-                return c is not None and c.state == "open" and not c.blocked
-            return sorted({o for o in list(self.out.chans) + list(self.out.origins) if ok(o)})
+            return sorted(o for o, c in self.out.chans.items() if c.state == "open" and not c.blocked)
 
     def ch2_for(self, origin: str) -> Optional[OutChannel]:
-        """The ch2 that serves `origin` (AGP-044: the live ch2 of its payTo, which may have been opened
-        at another origin of the same operator)."""
+        """The ch2 that serves `origin`: its own (AGP-056)."""
         with self.out.lock:
-            k = self.out.key_for(canon_origin(origin))
-            return self.out.chans.get(k) if k else None
+            return self.out.chans.get(canon_origin(origin))
 
     def body_limit(self, path: str, max_body: int = None) -> int:
         return self.inbound.body_limit(path, max_body)
@@ -499,14 +521,14 @@ class RouteHub:
             if f < f_due:
                 return self._err("route_fee", f"fee {f} < {f_due} due under quote {q.seq}", feeDue=f_due)
             # 6 expiry rule --------------------------------------------------------------------
-            # the provider is its payTo: an origin sharing a live ch2's payTo routes over that ch2
-            key = self.out.key_for(provider) or provider
+            # the provider is the origin the client named: its own ch2, in that process's ledger (AGP-056)
+            key = provider
             oc = self.out.chans.get(key)
             # a rollover's next ch2 is opened (AGP-053) under the mutex the lock takes below: it is checked
             # again there, once it is open
             opening = oc is not None and oc.state == "funded" and oc.rolled_from and self.zero_conf_rollover
             if oc is None or (oc.state != "open" and not opening):
-                return self._err("route_blocked", "no open channel to that provider")
+                return self._err("route_blocked", self._no_channel(provider, oc))
             if oc.blocked:
                 return self._err("route_blocked", oc.blocked)
             try:
@@ -553,7 +575,7 @@ class RouteHub:
         if oc is None or oc.pending:
             return "lock_outstanding", "a lock on this provider's ch2 is pending"
         if oc.state != "open":
-            return "route_blocked", "no open channel to that provider"
+            return "route_blocked", self._no_channel(oc.origin, oc)
         if oc.blocked:
             return "route_blocked", oc.blocked
         p2, tip = oc.p(), self.inbound.height()
@@ -569,6 +591,20 @@ class RouteHub:
                                          f"zero-conf cap {zc.get('maxCum', 0)}")
         return None
 
+    def _no_channel(self, origin: str, oc: Optional[OutChannel]) -> str:
+        """Why there is no open ch2 to `origin`, for the client (AGP-056: a refusal names its cause)."""
+        if oc is None:
+            with self.out.lock:
+                pt = self.out.origins.get(origin)
+                other = [k for k in (self.out.live_keys(pt) if pt else []) if k != origin]
+            if other:
+                return (f"no open channel to that provider: its payTo has a ch2 at {other[0]}, another provider "
+                        f"process (a ch2 serves the origin it was opened at)")
+            return "no open channel to that provider"
+        if oc.state == "funded" and oc.rolled_from:
+            return "no open channel to that provider: its ch2 is a rollover the provider takes once it confirms"
+        return f"no open channel to that provider: its ch2 is {oc.state}"
+
     def _forward(self, st1, oc: OutChannel, lock1: dict, rt: dict, pl: dict, t0: float):
         """Pre-sign ch2 under T (only now), send it to the provider, settle ch1 with t + r."""
         d, provider = lock1["d"], lock1["provider"]
@@ -580,6 +616,9 @@ class RouteHub:
         pre2 = None
         if need2 > oc.signed:
             if need2 > p2.max_amount:
+                with self.out.lock:                   # the settle floor counts it (AGP-056): this ch2 is rolled
+                    oc.max_lock = max(oc.max_lock, int(d))        # over (or refilled) as soon as it is due
+                    self.out.save()
                 self._void(st1, oc, lock1, "ch2 exhausted", block="")
                 return self._err("route_failed", "the hub's channel to that provider is exhausted")
             pre2 = adaptor.presign(int(oc.secret, 16), p2.sighash(p2.state_tx(need2)), T)
@@ -603,7 +642,9 @@ class RouteHub:
         if "error" in ans:
             self._void(st1, oc, lock1, f"provider refused: {ans['error']}", block="")
             self.stats["refused"][ans["error"]] = self.stats["refused"].get(ans["error"], 0) + 1
-            return self._err("route_failed", "provider refused the lock", providerError=ans["error"], status=502)
+            code = ans["error"] if safe_code(ans["error"]) else "provider_error"
+            return self._err("route_failed", f"provider refused the lock: {code}"
+                             + (f" ({ans['detail']})" if ans.get("detail") else ""), providerError=ans["error"], status=502)
         out = self._settled(st1.params.channel_id, oc, ans)
         self.stats["lock_ms"].append((time.perf_counter() - t0) * 1000)
         if out is None:
@@ -638,7 +679,13 @@ class RouteHub:
         if st == 200 and isinstance(doc, dict) and doc.get("secret"):
             return doc
         if st in (400, 401, 403) and isinstance(doc, dict) and isinstance(doc.get("error"), str):
-            return {"error": doc["error"][:40]}
+            # the detail is the provider's free text (untrusted): printable ASCII only, bounded
+            det = doc.get("detail")
+            det = "".join(ch for ch in det[:160] if " " <= ch <= "~") if isinstance(det, str) else ""
+            code = doc["error"][:40]
+            if det.startswith(code):                      # str(ChannelError) leads with its code
+                det = det[len(code):].lstrip(": ")
+            return {"error": code, "detail": det}
         return None
 
     def _settled(self, ch1: str, oc: OutChannel, ans: dict) -> Optional[dict]:
@@ -655,6 +702,7 @@ class RouteHub:
         with self.out.lock:
             oc.signed = max(oc.signed, pend["cum"])
             oc.routed += pend["d"]
+            oc.max_lock, oc.last_lock_at = max(oc.max_lock, int(pend["d"])), round(time.time(), 3)
             oc.pending = {}
             self.out.save()
         return self._complete_ch1(ch1, pend["lockId"], t, via="provider")
@@ -765,9 +813,10 @@ class RouteHub:
         """Fund a ch2 to `origin` from the hub's own wallet. It opens (watch_tick / open_pending) once
         the funding has the provider's minConf.
 
-        One live ch2 per payTo (AGP-044): if the provider's payTo already has a live ch2 (under this
-        origin or another), nothing is funded: `origin` is recorded under that payTo and the live ch2 is
-        returned (event ch2_reuse); its rollovers and refills go on as usual."""
+        One live ch2 per origin (AGP-056): if this origin already has a live ch2 to the payTo its /terms
+        name, nothing is funded and that ch2 is returned. Another origin under the same payTo is another
+        provider process with its own ledger: it gets its own ch2, up to ch2_max_per_pay_to live ch2s
+        for that key (ChannelError pay_to_limit beyond it; nothing is funded)."""
         origin = canon_origin(origin)
         cur = self.out.chans.get(origin)
         if cur is not None and cur.state == "funding":
@@ -787,16 +836,12 @@ class RouteHub:
         pay_to = str(terms["payTo"]).lower()
         with self.out.lock:
             self.out.origins[origin] = pay_to
-            k = self.out.live_for_pay_to(pay_to)
-            reused = self.out.chans[k] if k else None
+            own = self.out.chans.get(origin)
             self.out.save()
-        if reused is not None:
-            if reused.state == "funding":
-                raise ChannelError("ch2_funding", f"a ch2 to payTo {pay_to[:16]}... is being funded (the watcher reconciles it)")
-            if reused.origin != origin:
-                self.events.append({"event": "ch2_reuse", "provider": origin, "ch2": reused.origin, "payTo": pay_to,
-                                    "chan": reused.p().channel_id})
-            return reused
+        if own is not None and own.state in LIVE and own.pay_to.lower() == pay_to:
+            if own.state == "funding":
+                raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
+            return own
         return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks)
 
     def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int) -> OutChannel:
@@ -815,9 +860,15 @@ class RouteHub:
             old = self.out.chans.get(origin)
             if old is not None and old.state == "funding":
                 raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded")
-            live = self.out.live_for_pay_to(terms["payTo"])
-            if live is not None:                    # one live ch2 per payTo, checked with the insert (racing connects)
-                raise ChannelError("ch2_funding", f"a live ch2 to that payTo exists ({live})")
+            pay_to = str(terms["payTo"]).lower()
+            if old is not None and old.state in LIVE and old.pay_to.lower() == pay_to:
+                # one live ch2 per origin, checked with the insert (racing connects)
+                raise ChannelError("ch2_funding", f"a live ch2 to {origin} exists")
+            others = [k for k in self.out.live_keys(pay_to) if k != origin]
+            limit = int(self.config.ch2_max_per_pay_to)
+            if limit and len(others) >= limit:
+                raise ChannelError("pay_to_limit", f"payTo {pay_to[:16]}... has {len(others)} live ch2s "
+                                                   f"({', '.join(others[:3])}): ch2_max_per_pay_to {limit}")
             if self.liquidity_cap_sat:
                 freed = old.p().capacity if old is not None and old.state in LIVE else 0
                 if self.committed_sat() - freed + cap > self.liquidity_cap_sat:
@@ -826,6 +877,7 @@ class RouteHub:
             if old is not None:
                 self.out.archived.append(asdict(old))
             self.out.chans[origin] = oc
+            self.out.origins[origin] = pay_to           # also for an embedder that funds without connect
             self.out.save()
         try:
             txid, vout = self.fund(segwit_address(self.hrp, p.spk), cap)
@@ -1020,7 +1072,9 @@ class RouteHub:
         tip = self.rpc.getblockcount()
         _, blocks = self.ch2_terms(oc.terms)
         expiry = tip + blocks
-        if next_cap < max(min_cap, p.min_amount):
+        # too small to keep: under the provider's minimum, or (AGP-056) it could not take one more lock of
+        # the size this provider is paid in (it would sit exhausted and unsigned until its expiry)
+        if next_cap < max(min_cap, p.min_amount) or (oc.max_lock and next_cap - p.payer_fee < max(oc.max_lock, p.min_amount)):
             return self.close_ch2(oc, refill=True)
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
@@ -1031,7 +1085,8 @@ class RouteHub:
         nxt.funding_txid, nxt.funding_vout, nxt.capacity = txid, 1, next_cap
         new = OutChannel(oc.origin, oc.pay_to, nxt.to_dict(), f"{secret:064x}", "funded",
                          settle_multiple=oc.settle_multiple, terms=oc.terms, refund_hex=nxt.refund_tx(secret).hex(),
-                         opened_at=tip, scanned_to=tip, rolled_from=p.channel_id)
+                         opened_at=tip, scanned_to=tip, rolled_from=p.channel_id, max_lock=oc.max_lock,
+                         last_lock_at=oc.last_lock_at, rolled_at=round(time.time(), 3))
         with self.out.lock:
             oc.next = asdict(new)                     # write-ahead: the next ch2's key before the request
             self.out.save()
@@ -1054,6 +1109,15 @@ class RouteHub:
         if not isinstance(doc, dict) or str(doc.get("txid", "")).lower() != txid:
             raise ChannelError("bad_rollover_reply", f"rollover reply {str(doc)[:120]} is not tx {txid}")
         ev = self._finish_rollover(oc, amount)
+        new = self.out.chans.get(oc.origin)
+        if new is not None and new.rolled_from == p.channel_id and not new.fund_seen:
+            try:                                      # a hub on the provider's node sees it at once (AGP-056)
+                if self.rpc.gettxout(txid, 1, True) is not None:
+                    with self.out.lock:
+                        new.fund_seen = True
+                        self.out.save()
+            except Exception:  # noqa: BLE001 - the watcher's reconcile looks again
+                pass
         # make-before-break (AGP-053): open the next ch2 now, still under this provider's mutex, so the
         # next lock goes over it; a provider that wants confirmations first refuses, and the watcher
         # opens it at minConf
@@ -1357,7 +1421,7 @@ class RouteHub:
         # close fee is the provider's, so it counts against the payout), or near ch2's close margin as
         # the provider counts it (it co-signs only then): roll over. Past expiry the refund took over.
         ex = oc.terms.get("extra", {})
-        due = settle_due(p, oc.signed, oc.settle_multiple)
+        due = self._settle_due(oc, p)
         margin = int(ex.get("closeMarginBlocks", self.close_margin))
         grace = min(self.rollover_margin, int(ex.get("rolloverGraceBlocks", self.rollover_margin)))
         near = tip >= p.expiry - margin - grace
@@ -1366,6 +1430,21 @@ class RouteHub:
         if (due or near) and oc.signed >= p.min_amount and not oc.pending and tip < p.expiry and not unconfirmed:
             out.append(self.rollover(oc))
         return out
+
+    def _settle_due(self, oc: OutChannel, p: ChannelParams) -> bool:
+        """The ch2 is due to roll over: the provider's net payout is at its threshold (settleMultiple x
+        closeFee: the least it co-signs) and, while locks keep coming (AGP-056), the ch2 has taken
+        settle_lock_multiple x the largest lock routed to it, so a provider whose locks are larger than
+        its threshold is not rolled over on every lock. Never later than the point where another lock of that size would not
+        fit (the ch2 would be exhausted), and at once after settle_idle seconds without a lock."""
+        if not settle_due(p, oc.signed, oc.settle_multiple):
+            return False
+        k, big = int(self.config.settle_lock_multiple), int(oc.max_lock)
+        if k <= 0 or big <= 0:
+            return True
+        if time.time() - oc.last_lock_at >= float(self.config.settle_idle):
+            return True
+        return oc.signed >= k * big or oc.signed + big > p.max_amount
 
     def _zero_conf_tick(self, oc: OutChannel, p: ChannelParams) -> list:
         """A ch2 the provider took unconfirmed (AGP-053): confirmed with minConf, or unconfirmed again (a
@@ -1399,6 +1478,10 @@ class RouteHub:
             return []
         out = []
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+            if oc.rolled_from and not oc.fund_seen:          # our node shows the rollover (AGP-056)
+                with self.out.lock:
+                    oc.fund_seen = True
+                    self.out.save()
             if oc.blocked == ROLLOVER_GONE:                  # the rollover is back (AGP-053)
                 with self.out.lock:
                     oc.blocked = ""
@@ -1498,11 +1581,19 @@ class RouteHub:
         parent was spent by another tx (the provider's own close): this ch2 never existed; it is dropped
         (final) and any secrets of the parent's written-off locks are read off that close."""
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is not None or self._in_mempool(p.funding_txid):
+            if not oc.fund_seen:
+                with self.out.lock:
+                    oc.fund_seen = True
+                    self.out.save()
             return None
         ptxid, pvout = oc.rolled_from.split(":")
         pvout = int(pvout)
         if self.rpc.gettxout(ptxid, pvout, True) is not None:
             if oc.blocked == ROLLOVER_GONE:
+                return []
+            # the provider broadcast it on ITS node: ours may not have it yet (AGP-056). Vanished only if
+            # our node showed it before, or still does not after the relay grace
+            if not oc.fund_seen and time.time() - oc.rolled_at < float(self.config.rollover_relay_grace):
                 return []
             with self.out.lock:
                 oc.blocked = ROLLOVER_GONE
@@ -1561,6 +1652,7 @@ class RouteHub:
                 oc.signed = max(oc.signed, lk["cum"])
                 if oc.pending and oc.pending.get("lockId") == lk["lockId"]:
                     oc.routed += lk["d"]
+                    oc.max_lock = max(oc.max_lock, int(lk["d"]))
                     oc.pending = {}
                 oc.stale = [s for s in oc.stale if s["lockId"] != lk["lockId"]]
                 self.out.save()

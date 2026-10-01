@@ -356,17 +356,17 @@ class Constraints(_World):
             self.pay.call(sh, "POST", b"x")
         self.assertEqual(getattr(e.exception, "code", ""), "bad_receipt")
 
-    def test_c7_one_payee_key_for_two_origins_one_ch2(self):
-        # AGP-044: one live ch2 per payTo. One operator key behind two origins (CMP-023: one paid provider
-        # per operator) gets ONE hub-funded ch2; both origins route over it.
+    def test_c7_one_payee_key_for_two_origins_a_ch2_each(self):
+        # AGP-056: one operator key behind two origins. Each origin is a provider process the hub pays on
+        # its own ch2 (AGP-044 routed both over one, which only one process's ledger held).
         net, node, h = self.net, self.node, self.hub
-        a = R.provider(node, net, "http://dev-a.test", 0xA0A0)
-        net.apps["http://dev-b.test"] = a
+        R.provider(node, net, "http://dev-a.test", 0xA0A0)
+        R.provider(node, net, "http://dev-b.test", 0xA0A0)
         cap0 = h.committed_sat()
         oa = h.connect("http://dev-a.test")
         ob = h.connect("http://DEV-B.test:80/")                  # canonicalized
-        self.assertEqual(oa.p().channel_id, ob.p().channel_id)
-        self.assertEqual(h.committed_sat(), cap0 + oa.p().capacity)
+        self.assertNotEqual(oa.p().channel_id, ob.p().channel_id)
+        self.assertEqual(h.committed_sat(), cap0 + oa.p().capacity + ob.p().capacity)
         node.confirm_all()
         h.watch_tick()
         sa, sb = self.pay.shard("http://dev-a.test/v1/chunk"), self.pay.shard("http://dev-b.test/v1/chunk")
@@ -374,8 +374,8 @@ class Constraints(_World):
         for sh in (sa, sb):
             R.stream(self.pay, sh, 5)
             self.assertEqual(self.pay.lock(sh)["status"], "paid")
-        self.assertNotIn("http://dev-b.test", h.out.chans)
-        self.assertEqual(h.out.chans["http://dev-a.test"].routed, sa.locked_sat + sb.locked_sat)
+        self.assertEqual(h.out.chans["http://dev-a.test"].routed, sa.locked_sat)
+        self.assertEqual(h.out.chans["http://dev-b.test"].routed, sb.locked_sat)
 
 
 class Withholding(_World):
@@ -428,7 +428,8 @@ class Withholding(_World):
         self.pay.pending["until"] = time.time() - 1
         self.pay._check_pending()                                  # given up; no ROUTE-STATE seen since
         self.assertEqual(self.pay.stats["voided"], 1)
-        self.assertEqual(self.pay.lock(self.sh), {"status": "refused", "error": "stale_answer"})
+        self.assertEqual(self.pay.lock(self.sh), {"status": "refused", "error": "stale_answer",
+                                                  "detail": "hub answer does not open this lock"})
         R.stream(self.pay, self.sh, 3)                             # a fresh invoice (and lastLock) arrives
         self.assertEqual(self.pay.lock(self.sh)["status"], "resynced")
         R.stream(self.pay, self.sh, 3)
@@ -442,7 +443,8 @@ class Withholding(_World):
         self.hub.reveal_timeout = 0.3
         best1, best2 = self.st1().best_cum, self.st2().best_cum
         r = self.pay.lock(self.sh)
-        self.assertEqual(r, {"status": "refused", "error": "route_failed"})
+        self.assertEqual(r, {"status": "refused", "error": "route_failed",
+                             "detail": "provider did not reveal within revealTimeoutSec"})
         self.assertEqual((self.st1().best_cum, self.st2().best_cum), (best1, best2))
         oc = self.hub.out.chans[self.origin]
         self.assertTrue(oc.blocked)

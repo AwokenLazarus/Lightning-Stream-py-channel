@@ -177,13 +177,16 @@ class Net:
 
 
 def provider(node, net, origin, secret=None, *, window=0.3, lock_wait=0.6, invoice_ttl=8.0,
-             amsat_per_call=370 * 10 ** 18, settle_multiple=20, hubs="any", rollover_zero_conf_max=None):
+             amsat_per_call=370 * 10 ** 18, settle_multiple=20, hubs="any", rollover_zero_conf_max=None,
+             settle_lock_multiple=0, ledger=None):
+    """`settle_lock_multiple` 0 (and the hub's, below): the settle floor (AGP-056) is off unless a test
+    asks for it, so the older tests still roll over at exactly the provider's threshold."""
     secret = secret or secrets.randbelow(ecc.N - 1) + 1
     pol = FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640, close_margin=36)
-    p = XbtChannelProvider(node, secret, NET, tempfile.mktemp(suffix=".sqlite"), lambda m, pth: 1000,
+    p = XbtChannelProvider(node, secret, NET, ledger or tempfile.mktemp(suffix=".sqlite"), lambda m, pth: 1000,
                            lambda m, pth, b: (200, {"Content-Type": "application/json"}, b'{"ok":1}'),
                            close_margin=36, policy=pol, settle_multiple=settle_multiple, height_ttl=0,
-                           rollover_zero_conf_max=rollover_zero_conf_max)
+                           rollover_zero_conf_max=rollover_zero_conf_max, settle_lock_multiple=settle_lock_multiple)
     p.offer_route("/v1/chunk", window=window, lock_wait=lock_wait, invoice_ttl=invoice_ttl,
                   amsat_per_call=amsat_per_call, hubs=hubs)
     net.apps[origin] = p
@@ -194,6 +197,7 @@ def hub(node, net, secret=0x4B4B, **kw):
     d = tempfile.mkdtemp(prefix="hub-")
     opts = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
                 reveal_timeout=1.0, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
+                settle_lock_multiple=0,
                 policy=FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640,
                                      close_margin=36))
     opts.update({k: v for k, v in kw.items() if v is not None})

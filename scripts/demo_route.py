@@ -119,7 +119,7 @@ def make_signer(chain):
 
 
 def mount(n):
-    """Each provider's metered mount (A and B are two mounts of operator 1's one provider)."""
+    """Each provider's metered mount (A and B are two provider processes of operator 1)."""
     return "/v1/chunk-b" if n == "B" else "/v1/chunk"
 
 
@@ -146,14 +146,11 @@ def main():
     print(f"== node: height {chain.rpc.getblockcount()}, rpc {RPCPORT}, network {NET}")
     op1, op3, op4, hub_key = 0xA0A0, 0xC0C0, 0xD0D0, 0x4B4B
     provs = {}
-    for name, sec, port, mult in (("A", op1, PROV_PORTS[0], 20), ("C", op3, PROV_PORTS[2], 20), ("D", op4, PROV_PORTS[3], 2)):
+    # operator 1 runs two provider processes on one payTo key, A and B: each has its own ledger, origin
+    # and sessions (AGP-056: the hub pays each on its own ch2)
+    for name, sec, port, mult in (("A", op1, PROV_PORTS[0], 20), ("B", op1, PROV_PORTS[1], 20),
+                                  ("C", op3, PROV_PORTS[2], 20), ("D", op4, PROV_PORTS[3], 2)):
         provs[name] = provider(chain, name, sec, port, mult)
-    # operator 1's second mount, on its own port: the same provider (one payTo, one ledger)
-    pa = provs["A"][0]
-    pa.offer_route(mount("B"), window=WINDOW, lock_wait=LOCK_WAIT, invoice_ttl=INVOICE_TTL, amsat_per_call=PRICES["B"])
-    srv_b = pa.http_server(PROV_PORTS[1])
-    threading.Thread(target=srv_b.serve_forever, daemon=True).start()
-    provs["B"] = (pa, srv_b, provs["A"][2])
     urls = {n: f"http://127.0.0.1:{PROV_PORTS[i]}" for i, n in enumerate("ABCD")}
     check("operator 1 runs A and B under one payTo key", provs["A"][0].pay_to == provs["B"][0].pay_to
           and provs["A"][0].pay_to != provs["C"][0].pay_to, provs["A"][0].pay_to[:18] + "...")
@@ -164,22 +161,23 @@ def main():
     hsrv = hub.http_server(HUB_PORT)
     threading.Thread(target=hsrv.serve_forever, daemon=True).start()
     hub_url = f"http://127.0.0.1:{HUB_PORT}"
-    print("== hub funds one channel per payTo from its own wallet (providers open nothing)")
+    print("== hub funds one channel per provider process from its own wallet (providers open nothing)")
     committed0 = hub.committed_sat()
     for n in "ABCD":
         cap = 30_000 if n == "D" else 150_000
         oc = hub.connect(urls[n], capacity=cap)
-        print(f"   ch2 hub->{n}: {oc.p().channel_id[:20]}... capacity {oc.p().capacity}"
-              + (" (A's: one ch2 per payTo)" if oc.origin != urls[n] else ""))
+        print(f"   ch2 hub->{n}: {oc.p().channel_id[:20]}... capacity {oc.p().capacity}")
     hub.watch_tick()
 
     def ch2(n):
         return hub.ch2_for(urls[n])
     opened = [n for n in "ABCD" if ch2(n).state == "open"]
     check("hub-funded ch2 open to all 4 providers", len(opened) == 4, ",".join(opened))
-    check("one live ch2 per payTo: A and B share one ch2, 3 funded for 4 origins, the cap counts it once",
-          ch2("A").p().channel_id == ch2("B").p().channel_id and len(hub.out.chans) == 3
-          and hub.committed_sat() - committed0 == 150_000 * 2 + 30_000,
+    check("one ch2 per provider process: A and B (one payTo key, two ledgers) have a ch2 each, 4 funded",
+          ch2("A").p().channel_id != ch2("B").p().channel_id and len(hub.out.chans) == 4
+          and hub.committed_sat() - committed0 == 150_000 * 3 + 30_000
+          and ch2("B").p().channel_id in provs["B"][0].ledger.channels
+          and ch2("B").p().channel_id not in provs["A"][0].ledger.channels,
           f"{len(hub.out.chans)} ch2s, {hub.committed_sat() - committed0} sat committed")
     _, h402, _ = hub.serve("GET", "/x402/route", {}, b"", f"http://127.0.0.1:{HUB_PORT}/x402/route")
     routing = unb64json(h402["PAYMENT-REQUIRED"])["accepts"][0]["extra"]["routing"]
@@ -342,11 +340,11 @@ def main():
               s.paid_sat == sh.locked_sat <= ceil_div(s.accrued_amsat, AMSAT_PER_SAT),
               f"paid {s.paid_sat}, ceil {ceil_div(s.accrued_amsat, AMSAT_PER_SAT)}")
 
-    ab = ch2("A")
     la, lb = shards["A"].locked_sat, shards["B"].locked_sat
-    check("one ch2 per payTo: A's and B's locks all went over operator 1's one ch2",
-          ch2("B").p().channel_id == ab.p().channel_id and ab.routed == la + lb and la > 0 and lb > 0,
-          f"ch2 routed {ab.routed} = A {la} + B {lb}")
+    check("one key, two processes: A's locks went over A's ch2 and B's over B's, none sent to the other",
+          ch2("A").routed == la > 0 and ch2("B").routed == lb > 0
+          and "unknown_session" not in hub.stats["refused"],
+          f"ch2 A routed {ch2('A').routed} = {la}, ch2 B routed {ch2('B').routed} = {lb}")
 
     # --- settlement --------------------------------------------------------------------------------
     print("== settle: client closes ch1, hub closes every ch2; check on-chain")
@@ -357,8 +355,8 @@ def main():
     closes = {}
     for n in "ABCD":
         oc = ch2(n)
-        if oc is not None and oc.state == "open":        # B's ch2 is A's: closed once
-            closes["A+B" if n == "A" else n] = hub.close_ch2(oc)
+        if oc is not None and oc.state == "open":
+            closes[n] = hub.close_ch2(oc)
     chain.mine()
     confs, paid1 = chain.payee_out(c1["txid"], st1.params.payee_spk)
     check("ch1 close confirmed, pays the hub its best state", confs >= 1 and paid1 == best1 == int(c1["cum"]),

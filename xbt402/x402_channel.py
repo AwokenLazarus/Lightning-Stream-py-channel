@@ -201,7 +201,7 @@ class XbtChannelProvider:
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
                  max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
                  close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36,
-                 rollover_zero_conf_max: int = None, route_wal: str = None):
+                 rollover_zero_conf_max: int = None, route_wal: str = None, settle_lock_multiple: int = 4):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
         if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
@@ -233,6 +233,11 @@ class XbtChannelProvider:
         # up to this cum while it stays unconfirmed. None: two settlements' worth; 0: never (open at minConf)
         self.rollover_zero_conf_max = (2 * self.settle_multiple * int(close_fee) if rollover_zero_conf_max is None
                                        else int(rollover_zero_conf_max))
+        # AGP-056: a hub rolls a ch2 over at settle_lock_multiple x the largest lock when that is above
+        # our threshold (locks larger than settleMultiple x closeFee), so the default cap follows it: two
+        # such settlements' worth. An explicit rollover_zero_conf_max is used as it is
+        self._zc_max_fixed = rollover_zero_conf_max is not None
+        self.settle_lock_multiple = int(settle_lock_multiple)
         # AGP-054 route_wal: a path makes each routed session's meter (seq, calls, accrued) durable
         # before its ROUTE-STATE leaves, written ahead while the handler runs (offer_route precharge)
         self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
@@ -353,6 +358,12 @@ class XbtChannelProvider:
             st = self.ledger.channels[p.channel_id] = ChannelState(p)
             if hub:
                 st.extra = {"hub": hub}
+                # a rollover child carries its line's largest lock on (AGP-056: the next child's cap)
+                big = max((int((s.extra or {}).get("max_lock", 0)) for s in self.ledger.channels.values()
+                           if (s.extra or {}).get("rollover_to") == p.channel_id and (s.extra or {}).get("hub") == hub),
+                          default=0)
+                if big:
+                    st.extra["max_lock"] = big
             if zc:
                 st.extra["zero_conf"] = zc
             self.ledger.save(st)
@@ -384,8 +395,17 @@ class XbtChannelProvider:
             return None
         if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
             return None
-        return {"parent": pp.channel_id, "need": need, "maxCum": self.rollover_zero_conf_max, "until": until,
+        return {"parent": pp.channel_id, "need": need, "maxCum": self.zero_conf_max_for(parent), "until": until,
                 "confirmed": False}
+
+    def zero_conf_max_for(self, parent: ChannelState) -> int:
+        """The most a rollover child of `parent` takes while unconfirmed: rollover_zero_conf_max, and by
+        default (AGP-056) at least 2 x settle_lock_multiple x the largest lock the parent's line took, so
+        a provider paid in locks larger than its settle threshold is not capped below one lock."""
+        if self._zc_max_fixed:
+            return self.rollover_zero_conf_max
+        big = int((parent.extra or {}).get("max_lock", 0))
+        return max(self.rollover_zero_conf_max, 2 * self.settle_lock_multiple * big)
 
     def _confirmed(self, txid: str, vout: int, need: int) -> bool:
         """The output is in a block with `need` confirmations (spent in the mempool or not)."""
