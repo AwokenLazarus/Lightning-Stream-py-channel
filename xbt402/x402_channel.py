@@ -242,6 +242,35 @@ class XbtChannelProvider:
         # before its ROUTE-STATE leaves, written ahead while the handler runs (offer_route precharge)
         self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
                                   + ".routes.json", wal_path=route_wal)
+        # AGP-059: direct calls between their reservation and their settlement, per channel; and the
+        # (chan, msat) reservations refunded now, which a crash mid-call left recorded: never charged
+        self._in_call: dict = {}
+        self.recovered_reservations = self._recover_reservations()
+
+    def _recover_reservations(self) -> list:
+        out = []
+        with self.ledger.lock:
+            for chan, st in self.ledger.channels.items():
+                resv = (st.extra or {}).get("resv")
+                if not resv:
+                    continue
+                msat = sum(int(v) for v in resv.values())
+                st.spent_msat = max(0, st.spent_msat - msat)
+                st.extra = {k: v for k, v in st.extra.items() if k != "resv"}
+                self.ledger.save(st)
+                out.append((chan, msat))
+        return out
+
+    def _release(self, st: ChannelState, seq: int):
+        """Call `seq` settled (ledger lock held): drop its reservation record and its in-flight mark."""
+        resv = {k: v for k, v in ((st.extra or {}).get("resv") or {}).items() if k != str(seq)}
+        st.extra = {**{k: v for k, v in (st.extra or {}).items() if k != "resv"}, **({"resv": resv} if resv else {})}
+        chan = st.params.channel_id
+        left = self._in_call.get(chan, 0) - 1
+        if left > 0:
+            self._in_call[chan] = left
+        else:
+            self._in_call.pop(chan, None)
 
     def offer_route(self, path: str, window: float = 1.0, lock_wait: float = 2.0, invoice_ttl: float = 15.0,
                     hubs="any", amsat_per_call: int = 0, unit: str = "call", credit_msat: int = 0,
@@ -519,6 +548,45 @@ class XbtChannelProvider:
             report = self._close_report(st)
         return {"chan": st.params.channel_id, "txid": txid, **report}
 
+    def close_channel(self, chan: str) -> dict:
+        """Close one channel now with the best signed state (AGP-059), exactly as the watcher does at
+        the close margin (write-ahead intent, broadcast, record, hash-lock claim). Returns the
+        cooperative close's answer: chan, txid, cum, unpaidMsat (and payeeFee/payeeNet under payee-pays).
+
+        Refused with a ChannelError, nothing changed: unknown_channel; channel_closed (already closed
+        or rolled over); lock_pending (a routed lock is open on it); hub_channel (a hub-funded ch2:
+        its hub rolls it over or closes it, and the margin close still protects it); call_in_flight
+        (a paid call is being served: the best state does not cover it yet); no_state (nothing
+        signed)."""
+        st = self._channel(chan)
+        with self.ledger.lock:
+            ex = st.extra or {}
+            if st.closed_txid:
+                raise ChannelError("channel_closed", f"closed by {st.closed_txid}")
+            if ex.get("route_lock") or ex.get("stale_locks"):
+                raise ChannelError("lock_pending", "a routed lock is open on this channel")
+            if ex.get("hub"):
+                raise ChannelError("hub_channel", "a hub-funded channel is rolled over or closed by its hub")
+            if self._in_call.get(st.params.channel_id):
+                raise ChannelError("call_in_flight", "a paid call is being served on this channel")
+            if not (st.best_sig or st.cond_sig):
+                raise ChannelError("no_state", "the payer has signed no state to close with")
+            txid = st.closed_txid if self._adopt_intent(st) else self._close_locked(st)
+            report = self._close_report(st)
+        return {"chan": st.params.channel_id, "txid": txid, **report}
+
+    def _adopt_intent(self, st: ChannelState) -> bool:
+        """A close this provider sent and never recorded (M8: the intent is written ahead): record it.
+        True when the channel is now closed by it."""
+        intent = (st.extra or {}).get("close_intent")
+        if not intent:
+            return False
+        from .tx import Tx
+        if not self._tx_known(intent["txid"], Tx.parse(bytes.fromhex(intent["hex"]))):
+            return False
+        self._closed(st, intent["hex"], intent["txid"], intent["cond"])
+        return True
+
     # hash-locked conditional state (XBT-061 M6) ---------------------------------------------
     def _cond_state(self, st: ChannelState):
         """The stored conditional state as (ConditionalParams, uncond, k), or None."""
@@ -638,15 +706,11 @@ class XbtChannelProvider:
             if st.extra.get("cond_close"):
                 self._claim(st)           # the hash lock is ours only until csvDelta: retry every tick
             return
-        intent = (st.extra or {}).get("close_intent")
-        if intent:
-            from .tx import Tx
-            if self._tx_known(intent["txid"], Tx.parse(bytes.fromhex(intent["hex"]))):
-                self._closed(st, intent["hex"], intent["txid"], intent["cond"])   # sent, never recorded (M8)
-                out.append(st.closed_txid)
-                if intent["cond"]:
-                    self._claim(st)
-                return
+        if self._adopt_intent(st):               # sent, never recorded (M8)
+            out.append(st.closed_txid)
+            if st.extra.get("cond_close"):
+                self._claim(st)
+            return
         utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
         st.suspended = utxo is None or utxo.get("confirmations", 0) < self.policy.conf_for(p.capacity)
         zc = (st.extra or {}).get("zero_conf")
@@ -1115,30 +1179,51 @@ class XbtChannelProvider:
                     return refuse("insufficient_payment")
             if st.spent_msat + price * 1000 > st.params.max_amount * 1000:
                 return refuse("channel_exhausted")
+            seq, metered = st.seq, self.charge is not None
             st.spent_msat += price * 1000        # reserve the max; refunded below if metered lower
+            if metered:
+                # AGP-059: the charge is not known yet. Recorded, so a restart refunds a call that
+                # never settled; an unmetered call's reservation is its exact charge already
+                st.extra = {**(st.extra or {}), "resv": {**((st.extra or {}).get("resv") or {}), str(seq): price * 1000}}
             self.ledger.save(st)
-        status, hdrs, out = self.handler(method, path, body)
-        if unsafe_headers(hdrs):                 # no header injection, whatever the transport
-            status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
-        if path_key in getattr(self, "_cond", {}) and pl.get("hashlock"):
-            offer = self._cond[path_key]
-            out = json.dumps({"cipher": offer["cipher"].hex(), "preimage": offer["k"].hex(),
-                              "hash": offer["h"].hex()}).encode()
-            hdrs = {"Content-Type": "application/json"}
-            status = 200
-            # one k per sale: the ciphertext is public in the 402 and a claim publishes k on-chain, so
-            # the next payer must get a new k (M7)
-            self.offer_conditional(path_key, offer["price"], offer["plain"])
-        charged = price
-        if self.charge:
-            charged = max(0, min(price, int(self.charge(method, path, status, out))))
+            self._in_call[st.params.channel_id] = self._in_call.get(st.params.channel_id, 0) + 1
+        try:
+            status, hdrs, out = self.handler(method, path, body)
+            if unsafe_headers(hdrs):                 # no header injection, whatever the transport
+                status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
+            if path_key in getattr(self, "_cond", {}) and pl.get("hashlock"):
+                offer = self._cond[path_key]
+                out = json.dumps({"cipher": offer["cipher"].hex(), "preimage": offer["k"].hex(),
+                                  "hash": offer["h"].hex()}).encode()
+                hdrs = {"Content-Type": "application/json"}
+                status = 200
+                # one k per sale: the ciphertext is public in the 402 and a claim publishes k on-chain, so
+                # the next payer must get a new k (M7)
+                self.offer_conditional(path_key, offer["price"], offer["plain"])
+            charged = price
+            if self.charge:
+                charged = max(0, min(price, int(self.charge(method, path, status, out))))
+        except BaseException:
+            # the handler or the charge raised: nothing was charged, so the reservation goes back
+            with self.ledger.lock:
+                self._release(st, seq)
+                st.spent_msat -= price * 1000
+                self.ledger.save(st)
+            raise
         with self.ledger.lock:
+            self._release(st, seq)
             st.spent_msat -= (price - charged) * 1000
             if status >= 500:                   # don't bill failed calls
                 st.spent_msat -= charged * 1000
                 charged = 0
-            if charged != price:
-                self.ledger.save(st)
+            if metered or charged != price:
+                # a metered call's charge is durable before its answer leaves: the row on disk held
+                # the reservation, which a restart refunds (AGP-059)
+                try:
+                    self.ledger.save(st)
+                except BaseException:
+                    st.spent_msat -= charged * 1000
+                    raise
             r = {"scheme": SCHEME, "chan": st.params.channel_id, "seq": st.seq, "cum": str(st.best_cum), "charged": str(charged), "spentMsat": str(st.spent_msat),
                  "owedMsat": str(max(0, st.spent_msat - st.best_cum * 1000)),
                  "creditMsat": str(max(0, st.best_cum * 1000 - st.spent_msat)), "expiry": st.params.expiry,
@@ -1325,12 +1410,15 @@ class XbtChannelClient:
             pl["auth"] = request_auth(ch.auth_key, pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
         return pl
 
-    def _payload(self, ch: ClientChannel, price: int, method: str = "", path: str = "", body: bytes = b"") -> dict:
+    def _payload(self, ch: ClientChannel, price: int, method: str = "", path: str = "", body: bytes = b"",
+                 chosen: int | None = None) -> dict:
         billing = ch.accepted["extra"].get("billing", "postpay")
         need_msat = ch.spent_msat + (price * 1000 if billing == "prepay" else 0)
         cum = max(-(-need_msat // 1000), ch.payer.signed)
         if 0 < cum < ch.payer.params.min_amount:
             cum = ch.payer.params.min_amount
+        if chosen is not None:
+            cum = self._chosen_cum(ch, chosen)
         self._check_daily(cum - ch.payer.signed)
         remaining = ch.payer.params.max_amount - max(ch.payer.signed, ch.spent_msat // 1000)
         if remaining < price and ch.payer.signed:
@@ -1348,22 +1436,59 @@ class XbtChannelClient:
             pl["sig"] = ch.last_sig        # signed (a conditional upgrade) but not yet seen to arrive
         return self._auth(ch, pl, method, path, body)
 
+    @staticmethod
+    def _chosen_cum(ch: ClientChannel, c: int) -> int:
+        """A caller-chosen cumulative amount (AGP-059), bounded: never below the last signed state,
+        above the channel's capacity, or above the receipted spend plus one call at the pinned price.
+        Under the channel's minimum state (nothing signed yet) the call goes unsigned: never rounded up."""
+        if isinstance(c, bool) or not isinstance(c, int) or c < 0:
+            raise ChannelError("bad_amount", "cum is a non-negative integer of sats")
+        signed, p = ch.payer.signed, ch.payer.params
+        if c < signed:
+            raise ChannelError("bad_amount", f"cum {c} is below the last signed state {signed}")
+        if c > p.max_amount:
+            raise ChannelError("exhausted", f"cum {c} is above the channel's capacity for states {p.max_amount}")
+        most = max(-(-ch.spent_msat // 1000) + (ch.price or int(ch.accepted["amount"])), signed)
+        if c > most:
+            raise ChannelError("too_expensive", f"cum {c} is above the receipted spend plus one call ({most} sat)")
+        return 0 if c < p.min_amount else c
+
+    @staticmethod
+    def _extra_headers(headers) -> dict:
+        """The caller's own request headers (AGP-059): never the payment header, never a split line."""
+        out = dict(headers or {})
+        for k, v in out.items():
+            if not isinstance(k, str) or not isinstance(v, str) or not k or k.upper() == "PAYMENT-SIGNATURE" \
+                    or unsafe_headers({k: v}):
+                raise ChannelError("bad_header", f"extra header {k!r} is not allowed")
+        return out
+
     def _check_daily(self, sats: int):
         if self.daily_budget and time.time() - self.day_start > 86400:
             self.day_spent, self.day_start = 0, time.time()
         if self.daily_budget and self.day_spent + sats > self.daily_budget:
             raise ChannelError("budget", "daily budget exhausted")
 
-    def request(self, method: str, url: str, body: bytes = b""):
+    def request(self, method: str, url: str, body: bytes = b"", headers: dict | None = None,
+                cum: int | None = None):
+        """One paid HTTP request; opens a channel on the first 402 from an origin.
+
+        AGP-059, for an embedder: `headers` are its own request headers, sent with every request of
+        the call (the first try and the paid retry); `cum` is the cumulative sats to sign when it
+        meters the channel itself. A chosen cum replaces only the amount; every check still applies.
+        Refused: below the last signed state (bad_amount), above the channel's capacity (exhausted),
+        above the receipted spend plus one call at the pinned price (too_expensive), over the daily
+        budget (budget). Under the channel's minimum state with nothing signed, the call goes unsigned."""
         origin = "/".join(url.split("/")[:3])
         path = "/" + "/".join(url.split("/")[3:])
+        own = self._extra_headers(headers)
         ch = self.channels.get(origin)
         hdrs = {}
         if ch:
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": ch.accepted,
                                                   "payload": self._payload(ch, int(ch.accepted["amount"]),
-                                                                          method, path, body)})}
-        status, rh, out = self.http(method, url, body, hdrs)
+                                                                          method, path, body, cum)})}
+        status, rh, out = self.http(method, url, body, {**own, **hdrs})
         if status == 402:
             pr = unb64json(rh["PAYMENT-REQUIRED"])
             acc = self._pick(pr)
@@ -1381,8 +1506,9 @@ class XbtChannelClient:
                 ch.slack_msat += max(0, extra)
                 ch.spent_msat = max(ch.spent_msat, claimed)
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc,
-                                                  "payload": self._payload(ch, int(acc["amount"]), method, path, body)})}
-            status, rh, out = self.http(method, url, body, hdrs)
+                                                  "payload": self._payload(ch, int(acc["amount"]), method, path, body,
+                                                                          cum)})}
+            status, rh, out = self.http(method, url, body, {**own, **hdrs})
         if "PAYMENT-RESPONSE" in rh:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body)
         return status, rh, out
@@ -1408,10 +1534,11 @@ class XbtChannelClient:
         ch.acked_cum = max(ch.acked_cum, int(r["cum"]))
         ch.receipts.append(r)
 
-    def close(self, origin: str) -> dict:
-        """Cooperative close; in postpay the final state pays exactly what is owed."""
+    def close(self, origin: str, cum: int | None = None) -> dict:
+        """Cooperative close; in postpay the final state pays exactly what is owed. `cum` (AGP-059):
+        the caller's own final amount, under the bounds of `request`."""
         ch = self.channels[origin]
-        pl = self._payload(ch, 0)
+        pl = self._payload(ch, 0, chosen=cum)
         if self.signer:
             sig = self.signer.sign_close(ch.payer.params.channel_id)
         else:

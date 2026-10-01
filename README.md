@@ -24,6 +24,7 @@ pure-Python test oracle.
 | `xbt402/mcp_server.py` | `xbt402_pay`, `xbt_channels`, `xbt_close`, `xbt_refunds_due` |
 | `xbt402/x402_channel.py` | provider + SDK (facilitator `/x402/verify` `/x402/settle` `/x402/supported`) |
 | `demo.sh` | units + chain rules + 1,000 calls + conditional + MCP + close + refund |
+| `docs/embedders.md` | AGP-059: client `headers=`/`cum=`, `provider.close_channel`, a call in flight at a crash |
 
 Ports **30100–30199**, datadirs under `~/xbt-rnd/xbt-060/run/`. Isolated Knots 29.4.2 with RDTS
 and `#419` (`-testcoinbasematuritylong=200:200:6680`). No miners.
