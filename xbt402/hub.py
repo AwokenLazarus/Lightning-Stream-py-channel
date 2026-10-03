@@ -89,6 +89,22 @@ confirmed hub-bound channel, up to maxCum and before `until`), so routing never 
 hub keeps within those bounds itself, never rolls an unconfirmed child over, and blocks or drops a child
 whose rollover left the mempool or was replaced. A watcher tick waits (bounded) for a provider that
 streams locks, so its rollover is not starved.
+
+Make-before-break refill (AGP-057, as the Rust hub): a rollover adds no coins, so a ch2 line carries its
+capacity in locks and is then closed and replaced by a ch2 funded from the wallet, which opens only at
+minConf (the provider cannot take a wallet funding unconfirmed: its payer could spend it again). The hub
+therefore funds the origin's NEXT ch2 ahead: once the live ch2's room is under refill_ahead_locks x the
+largest lock routed to that provider (`OutBook.next_chans`, at most one per origin, counted by
+liquidity_cap_sat with the live one). The live ch2 keeps taking locks, rollovers included; the next one
+takes over (`ch2_switch`) with the first lock the live one cannot take (exhausted, closed, or an
+unconfirmed rollover child at the provider's bounds), when the live one is closed as too small to roll
+over (not before the next one is open, while the live one still takes a lock), or once the live one has
+had no lock for settle_idle seconds. The replaced ch2 is `retired`: the
+watcher asks the provider to close it and reconciles it like any archived ch2.
+
+The zero-conf cap and the watcher (AGP-057): the hub's `confirmed` flag of a rollover child is the
+watcher's last look. Before a lock is refused on the provider's bounds the hub looks at the chain itself,
+so a child that confirmed since the last tick is never refused.
 """
 import contextlib
 import json
@@ -151,6 +167,7 @@ class OutChannel:
     last_lock_at: float = 0.0    # when the last lock on it completed (the settle floor holds only while locks come)
     rolled_at: float = 0.0       # when the rollover that funds it was co-signed (AGP-056: relay grace)
     fund_seen: bool = False      # the hub's node has shown that rollover (mempool or a block)
+    retired: bool = False        # replaced by the origin's next ch2 (AGP-057): the watcher has it closed
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
@@ -179,27 +196,33 @@ def refund_booked(r: dict) -> bool:
 class OutBook:
     """The hub's ch2s, fsynced JSON (keys included: regtest only; the production hub signs with B2).
 
-    One ch2 per origin (AGP-056): `chans` is keyed by the canonical origin, one provider process.
-    `origins` maps every origin the hub connected to the payTo its /terms named (a record, and the
-    per-payTo count)."""
+    One LIVE ch2 per origin (AGP-056): `chans` is keyed by the canonical origin, one provider process.
+    `next_chans` (AGP-057) holds at most one more per origin: the ch2 funded ahead of the live one
+    running out, which takes its place in `chans` at the switch. `origins` maps every origin the hub
+    connected to the payTo its /terms named (a record, and the per-payTo count)."""
 
     def __init__(self, path: str):
         self.path, self.lock = path, threading.RLock()
         self.chans: Dict[str, OutChannel] = {}
+        self.next_chans: Dict[str, OutChannel] = {}
         self.archived: list = []
         self.origins: Dict[str, str] = {}
         if os.path.exists(path):
             with open(path) as f:
                 raw = json.load(f)
             self.chans = {k: OutChannel(**v) for k, v in raw.get("chans", {}).items()}
+            self.next_chans = {k: OutChannel(**v) for k, v in raw.get("next_chans", {}).items()}
             self.archived = raw.get("archived", [])
             self.origins = {k: str(v) for k, v in raw.get("origins", {}).items()}
         self.mutex: Dict[str, threading.Lock] = {}
 
     def live_keys(self, pay_to: str) -> list:
-        """The origins with a live ch2 (funding, funded or open) to `pay_to`."""
+        """The origins with a live ch2 (funding, funded or open) to `pay_to`: their own, or the next
+        one funded ahead of it (AGP-057: an origin counts once)."""
         with self.lock:
-            return [k for k, c in self.chans.items() if c.pay_to.lower() == pay_to.lower() and c.state in LIVE]
+            keys = [k for k, c in self.chans.items() if c.pay_to.lower() == pay_to.lower() and c.state in LIVE]
+            return keys + [k for k, c in self.next_chans.items()
+                           if k not in keys and c.pay_to.lower() == pay_to.lower() and c.state in LIVE]
 
     def key_for(self, origin: str) -> Optional[str]:
         """The key of the ch2 that serves `origin` (canonical): its own, and no other (AGP-056: the
@@ -212,7 +235,8 @@ class OutBook:
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
                 json.dump({"chans": {k: asdict(v) for k, v in self.chans.items()}, "archived": self.archived,
-                           "origins": self.origins}, f)
+                           "origins": self.origins,
+                           "next_chans": {k: asdict(v) for k, v in self.next_chans.items()}}, f)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
@@ -255,7 +279,15 @@ class HubConfig:
     rollover per four of the largest locks, and with the usual capacity of five such locks (100k / 20k,
     200k / 40k) it is the largest k that still leaves room for one more lock when the rollover is due.
     rollover_relay_grace: seconds a rollover the hub's own node has not shown yet is given to arrive
-    over P2P before its ch2 is blocked as vanished."""
+    over P2P before its ch2 is blocked as vanished.
+
+    AGP-057: refill_ahead_locks (N) funds an origin's next ch2 while the live one still has room: once
+    that room is under N x the largest lock routed to the provider (0: never; the ch2 is closed and then
+    refilled, and routing to the provider waits for the refill's minConf). N locks must cover what the
+    provider is paid while a funding confirms and opens: about (locks per block interval + locks per
+    watcher tick). The live and the next ch2 both count against liquidity_cap_sat, so a hub that should
+    never pause needs room for one more ch2_capacity than it has origins; without that room nothing is
+    funded ahead (`ch2_refill_ahead_failed`, liquidity_cap) and the refill follows the close as before."""
     fee_base_msat: int = 1_000
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
@@ -291,6 +323,7 @@ class HubConfig:
     settle_lock_multiple: int = 4
     settle_idle: float = 600.0
     rollover_relay_grace: float = 60.0
+    refill_ahead_locks: int = 4
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -311,13 +344,16 @@ class RouteHub:
     def __init__(self, rpc, pay_to_secret: int, network: str, datadir: str, fund: Callable[[str, int], tuple],
                  config: HubConfig = None, *, http: Callable = None, policy: FundingPolicy = None,
                  fee_strategy: Callable = None, refill: Callable[[str], "OutChannel"] = None,
-                 refund_to: Callable[[], str] = None, wallet=None, **overrides):
+                 refund_to: Callable[[], str] = None, wallet=None,
+                 refill_ahead: Callable[[str], "OutChannel"] = None, **overrides):
         """`config` (a HubConfig) holds the operator's choices; keyword `overrides` set single fields
         (fee_ppm=..., liquidity_cap_sat=...). `fee_strategy`, if given, is a callable(hub) ->
         (fee_base_msat, fee_ppm) that replaces the configured one. `refill(origin)` funds the ch2 that
         replaces a closed one (default `connect`: an embedder passes its own path, with its lock and
         cap); it is looked up at each call, so assigning `hub.refill` or `hub.connect` later takes effect
-        (AGP-045). `refund_to()` gives the address a ch2 refund pays (default: the ch2's payer key).
+        (AGP-045). `refill_ahead(origin)` funds the origin's NEXT ch2 while its live one still routes
+        (AGP-057; default `connect_next`, or nothing when the embedder passed its own `refill`: see the
+        `refill_ahead` property). `refund_to()` gives the address a ch2 refund pays (default: the ch2's payer key).
         `wallet` is an RPC handle on the fund wallet (default `rpc`): listtransactions/gettransaction,
         how the watcher finds a funding send whose fund call failed (AGP-045)."""
         cfg = config or HubConfig()
@@ -341,9 +377,12 @@ class RouteHub:
         self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap_sat
         self.zero_conf_rollover = bool(cfg.zero_conf_rollover)
         self._zc_tried: set = set()  # (chan, tip): a rollover child's unconfirmed open, tried once a block
+        self._ahead_tried: set = set()    # (origin, tip): an ahead refill that failed, tried once a block (AGP-057)
+        self._retire_tried: set = set()   # (chan, tip): a retired ch2's close, asked once a block
         self.fee_strategy = fee_strategy or self._configured_fees
         self.http = http or XbtChannelClient.http
         self._refill = refill
+        self._refill_ahead = refill_ahead
         self.refund_to = refund_to
         self.wallet = wallet if wallet is not None else rpc
         self._quote: Optional[FeeQuote] = None
@@ -362,11 +401,28 @@ class RouteHub:
     def refill(self, f):
         self._refill = f
 
+    @property
+    def refill_ahead(self) -> Optional[Callable[[str], "OutChannel"]]:
+        """The hook that funds an origin's next ch2 ahead of exhaustion (AGP-057), looked up at call time:
+        the embedder's; else `connect_next` as it is now. An embedder that passed its own `refill` (its
+        path, lock and cap) and no `refill_ahead` gets None: the hub funds nothing on its own, and the
+        refill follows the close as before."""
+        if self._refill_ahead is not None:
+            return self._refill_ahead
+        return None if self._refill is not None else self.connect_next
+
+    @refill_ahead.setter
+    def refill_ahead(self, f):
+        self._refill_ahead = f
+
     # ---------------------------------------------------------------------------------------------
     def committed_sat(self) -> int:
-        """The hub's own coins in live ch2s (funding, funded or open)."""
+        """The hub's own coins in live ch2s (funding, funded or open): every origin's live one, its next
+        one funded ahead (AGP-057), and a retired one until its close is out."""
         with self.out.lock:
-            return sum(c.p().capacity for c in self.out.chans.values() if c.state in LIVE)
+            live = [c for c in list(self.out.chans.values()) + list(self.out.next_chans.values()) if c.state in LIVE]
+            return sum(c.p().capacity for c in live) + sum(
+                int(r["params"]["capacity"]) for r in self.out.archived if r.get("retired") and r.get("state") in LIVE)
 
     def refund_fees_sat(self) -> int:
         """Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings."""
@@ -409,9 +465,15 @@ class RouteHub:
                 "providers": self._routable()}
 
     def _routable(self) -> list:
-        """Every origin whose own ch2 is open and not blocked."""
+        """Every origin whose own ch2 is open and not blocked, or whose next one is open to take over
+        (AGP-057) unless the hub stopped routing to the provider."""
         with self.out.lock:
-            return sorted(o for o, c in self.out.chans.items() if c.state == "open" and not c.blocked)
+            ok = {o for o, c in self.out.chans.items() if c.state == "open" and not c.blocked}
+            for o, n in self.out.next_chans.items():
+                c = self.out.chans.get(o)
+                if n.state == "open" and (c is None or not c.blocked or c.blocked == ROLLOVER_GONE):
+                    ok.add(o)
+            return sorted(ok)
 
     def ch2_for(self, origin: str) -> Optional[OutChannel]:
         """The ch2 that serves `origin`: its own (AGP-056)."""
@@ -529,10 +591,16 @@ class RouteHub:
             # a rollover's next ch2 is opened (AGP-053) under the mutex the lock takes below: it is checked
             # again there, once it is open
             opening = oc is not None and oc.state == "funded" and oc.rolled_from and self.zero_conf_rollover
-            if oc is None or (oc.state != "open" and not opening):
+            # the origin's next ch2, funded ahead (AGP-057), takes the lock its live one cannot: decided
+            # under the mutex below
+            nxt = self.out.next_chans.get(key)
+            spare = nxt is not None and nxt.state == "open"
+            if (oc is None or (oc.state != "open" and not opening)) and not spare:
                 return self._err("route_blocked", self._no_channel(provider, oc))
-            if oc.blocked:
+            if oc is not None and oc.blocked and not (spare and oc.blocked == ROLLOVER_GONE):
                 return self._err("route_blocked", oc.blocked)
+            if oc is None:
+                oc = nxt
             try:
                 inv = Invoice.from_dict(rt["invoice"])
             except (ChannelError, KeyError):
@@ -542,7 +610,7 @@ class RouteHub:
                     or (inv.hubs != "any" and self.pay_to not in inv.hubs)):
                 return self._err("bad_invoice", "invoice not signed by the provider for this point, or expiring")
             p2 = oc.p()
-            if not route_ok(ib.height(), st1.params.expiry, p2.expiry, self.close_margin, self.delta) \
+            if not spare and not route_ok(ib.height(), st1.params.expiry, p2.expiry, self.close_margin, self.delta) \
                     and d > self.max_unguarded_lock_sat:
                 return self._err("route_expiry", f"ch2 outlives ch1 and {d} > maxUnguardedLockSat")
             # 7 one lock per channel -----------------------------------------------------------
@@ -555,6 +623,11 @@ class RouteHub:
             # the checks that depend on the channel are made again on the one the lock will use
             oc = self.out.chans.get(key)
             why = self._ch2_refusal(oc, st1, d)
+            if oc is None or why or self._exhausted(oc, d):
+                # AGP-057: the next ch2, funded ahead, takes over with this lock (make-before-break refill)
+                alt = self._switch_for(key, oc, st1, d, why)
+                if alt is not None:
+                    oc, why = alt, None
             if why:
                 mtx.release()
                 return self._err(*why)
@@ -585,13 +658,67 @@ class RouteHub:
             return "route_expiry", f"ch2 outlives ch1 and {d} > maxUnguardedLockSat"
         zc = oc.zero_conf
         if zc and not zc.get("confirmed"):
-            if tip >= int(zc.get("until", 0)):
-                return "route_blocked", "the rollover funding this ch2 is unconfirmed at the parent's close margin"
             need2 = max(next_cum(oc.routed, d, p2.min_amount), oc.signed)
-            if need2 > int(zc.get("maxCum", 0)):
-                return "route_blocked", (f"the rollover funding this ch2 is unconfirmed: cum {need2} > the provider's "
-                                         f"zero-conf cap {zc.get('maxCum', 0)}")
+            late, over = tip >= int(zc.get("until", 0)), need2 > int(zc.get("maxCum", 0))
+            if late or over:
+                # AGP-057: `confirmed` is the watcher's last look, which a block or a busy tick can be behind.
+                # Past a bound, look at the chain before refusing (the provider does the same)
+                try:
+                    self._zero_conf_tick(oc, p2)
+                except Exception as e:  # noqa: BLE001 - the node did not answer: the bounds stand
+                    self._watch_error(oc.origin, "zero_conf", e)
+            if not oc.zero_conf.get("confirmed"):
+                if late:
+                    return "route_blocked", "the rollover funding this ch2 is unconfirmed at the parent's close margin"
+                if over:
+                    return "route_blocked", (f"the rollover funding this ch2 is unconfirmed: cum {need2} > the provider's "
+                                             f"zero-conf cap {zc.get('maxCum', 0)}")
         return None
+
+    @staticmethod
+    def _exhausted(oc: OutChannel, d: int) -> bool:
+        """A lock of `d` needs a state above the ch2's capacity."""
+        p2 = oc.p()
+        need2 = next_cum(oc.routed, d, p2.min_amount)
+        return need2 > oc.signed and need2 > p2.max_amount
+
+    def _switch_for(self, key: str, oc: Optional[OutChannel], st1, d: int, why: Optional[tuple]) -> Optional[OutChannel]:
+        """AGP-057: the origin's live ch2 (`oc`, as read under its mutex) cannot take a lock of `d`: `why`
+        is its refusal, None when it is only exhausted. If the origin's next ch2 is open and can take the
+        lock, it becomes the live one (`_promote`) and is returned. Never while a lock is pending on the
+        live one, and never when the hub stopped routing to the PROVIDER (a lock it did not reveal): a
+        fresh channel does not mend that."""
+        with self.out.lock:
+            nxt = self.out.next_chans.get(key)
+        if nxt is None or nxt.state != "open":
+            return None
+        if oc is not None and (oc.pending or (oc.blocked and oc.blocked != ROLLOVER_GONE)):
+            return None
+        if self._ch2_refusal(nxt, st1, d) or self._exhausted(nxt, d):
+            return None
+        return self._promote(key, why[1] if why else "exhausted")
+
+    def _promote(self, origin: str, why: str) -> Optional[OutChannel]:
+        """AGP-057: the origin's next ch2 becomes its live one. The caller holds the origin's mutex, or the
+        live one takes no lock any more. The ch2 it replaces goes to the archive; while its coins are
+        still committed (funded, open) it is `retired`: the watcher has the provider close it."""
+        with self.out.lock:
+            nxt = self.out.next_chans.pop(origin, None)
+            if nxt is None:
+                return None
+            old = self.out.chans.get(origin)
+            if old is not None:
+                if old.state in LIVE:
+                    old.retired = True
+                nxt.max_lock = max(nxt.max_lock, old.max_lock)
+                nxt.last_lock_at = max(nxt.last_lock_at, old.last_lock_at)
+                self.out.archived.append(asdict(old))
+            self.out.chans[origin] = nxt
+            self.out.save()
+        ev = {"event": "ch2_switch", "provider": origin, "from": old.p().channel_id if old is not None else "",
+              "to": nxt.p().channel_id, "why": why}
+        self.events.append(ev)
+        return nxt
 
     def _no_channel(self, origin: str, oc: Optional[OutChannel]) -> str:
         """Why there is no open ch2 to `origin`, for the client (AGP-056: a refusal names its cause)."""
@@ -816,13 +943,36 @@ class RouteHub:
         the funding has the provider's minConf.
 
         One live ch2 per origin (AGP-056): if this origin already has a live ch2 to the payTo its /terms
-        name, nothing is funded and that ch2 is returned. Another origin under the same payTo is another
+        name, nothing is funded and that ch2 is returned; if its next ch2 was funded ahead (AGP-057), that
+        one takes the place of a ch2 that is no longer live. Another origin under the same payTo is another
         provider process with its own ledger: it gets its own ch2, up to ch2_max_per_pay_to live ch2s
         for that key (ChannelError pay_to_limit beyond it; nothing is funded)."""
         origin = canon_origin(origin)
         cur = self.out.chans.get(origin)
         if cur is not None and cur.state == "funding":
             raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
+        terms = self._terms(origin)
+        cap, blocks = self.ch2_terms(terms, capacity, expiry_blocks)
+        pay_to = str(terms["payTo"]).lower()
+        with self.out.lock:
+            self.out.origins[origin] = pay_to
+            own = self.out.chans.get(origin)
+            ahead = self.out.next_chans.get(origin)
+            self.out.save()
+        if own is not None and own.state in LIVE and own.pay_to.lower() == pay_to:
+            if own.state == "funding":
+                raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
+            return own
+        if ahead is not None and ahead.pay_to.lower() == pay_to:
+            # its next ch2 is funded already (AGP-057): that one replaces the closed one, nothing is funded
+            nxt = self._promote(origin, "refill")
+            if nxt is not None:
+                return nxt
+        return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks)
+
+    def _terms(self, origin: str) -> dict:
+        """GET the provider's /terms: a JSON object with `extra` that offers the close-fee payer this hub
+        funds ch2s with."""
         st, _, raw = self.http("GET", origin + TERMS_PATH)
         if st != 200:
             raise ChannelError("provider_error", f"terms: HTTP {st}")
@@ -834,21 +984,35 @@ class RouteHub:
         if self.config.ch2_close_fee_payer == "payee" and offered != "payee":
             raise ChannelError("bad_fee_payer", f"{origin} does not offer payee-pays routed channels "
                                                 f"(closeFeePayer {offered!r}); set ch2_close_fee_payer payer to fund it")
-        cap, blocks = self.ch2_terms(terms, capacity, expiry_blocks)
-        pay_to = str(terms["payTo"]).lower()
-        with self.out.lock:
-            self.out.origins[origin] = pay_to
-            own = self.out.chans.get(origin)
-            self.out.save()
-        if own is not None and own.state in LIVE and own.pay_to.lower() == pay_to:
-            if own.state == "funding":
-                raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded (the watcher reconciles it)")
-            return own
-        return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks)
+        return terms
 
-    def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int) -> OutChannel:
+    def connect_next(self, origin: str, capacity: int = None, expiry_blocks: int = None) -> OutChannel:
+        """Fund the origin's NEXT ch2 from the hub's wallet while its live one still routes (AGP-057: the
+        default `refill_ahead` hook). It opens at the provider's minConf (the watcher) and takes over at
+        the switch. At most one per origin: an origin that has one gets it back and nothing is funded.
+
+        Refused, nothing funded: no_live_ch2 (the origin has no funded or open ch2: `connect` funds one),
+        pay_to_changed (its /terms now name another payTo than the live ch2's), liquidity_cap (the live
+        and the next ch2 both count), and connect's bad_terms / bad_fee_payer / pay_to_limit."""
+        origin = canon_origin(origin)
+        with self.out.lock:
+            cur, nxt = self.out.chans.get(origin), self.out.next_chans.get(origin)
+        if nxt is not None:
+            if nxt.state == "funding":
+                raise ChannelError("ch2_funding", f"the next ch2 to {origin} is being funded (the watcher reconciles it)")
+            return nxt
+        if cur is None or cur.state not in ("funded", "open"):
+            raise ChannelError("no_live_ch2", f"{origin} has no live ch2 to fund ahead of")
+        terms = self._terms(origin)
+        cap, blocks = self.ch2_terms(terms, capacity, expiry_blocks)
+        if str(terms["payTo"]).lower() != cur.pay_to.lower():
+            raise ChannelError("pay_to_changed", f"{origin} now names another payTo than its live ch2's")
+        return self._fund_ch2(origin, terms, cap, self.rpc.getblockcount() + blocks, ahead=True)
+
+    def _fund_ch2(self, origin: str, terms: dict, cap: int, expiry: int, ahead: bool = False) -> OutChannel:
         """Write-ahead (AGP-037): the ch2's key and params are on disk, state `funding`, before the fund
-        hook runs, and the cap check and that record are one step under the book's lock."""
+        hook runs, and the cap check and that record are one step under the book's lock. `ahead`
+        (AGP-057): the record is the origin's next ch2 (`next_chans`), beside its live one."""
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
         p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), network=self.network,
@@ -863,7 +1027,13 @@ class RouteHub:
             if old is not None and old.state == "funding":
                 raise ChannelError("ch2_funding", f"a ch2 to {origin} is being funded")
             pay_to = str(terms["payTo"]).lower()
-            if old is not None and old.state in LIVE and old.pay_to.lower() == pay_to:
+            if ahead:
+                # at most one live ch2 plus one next per origin (AGP-057), checked with the insert
+                if origin in self.out.next_chans:
+                    raise ChannelError("ch2_funding", f"a next ch2 to {origin} exists")
+                if old is None or old.state not in LIVE or old.pay_to.lower() != pay_to:
+                    raise ChannelError("no_live_ch2", f"{origin} has no live ch2 to fund ahead of")
+            elif old is not None and old.state in LIVE and old.pay_to.lower() == pay_to:
                 # one live ch2 per origin, checked with the insert (racing connects)
                 raise ChannelError("ch2_funding", f"a live ch2 to {origin} exists")
             others = [k for k in self.out.live_keys(pay_to) if k != origin]
@@ -872,13 +1042,16 @@ class RouteHub:
                 raise ChannelError("pay_to_limit", f"payTo {pay_to[:16]}... has {len(others)} live ch2s "
                                                    f"({', '.join(others[:3])}): ch2_max_per_pay_to {limit}")
             if self.liquidity_cap_sat:
-                freed = old.p().capacity if old is not None and old.state in LIVE else 0
+                freed = old.p().capacity if not ahead and old is not None and old.state in LIVE else 0
                 if self.committed_sat() - freed + cap > self.liquidity_cap_sat:
                     raise ChannelError("liquidity_cap", f"{self.committed_sat()} + {cap} sat > liquidity_cap_sat "
                                                         f"{self.liquidity_cap_sat}")
-            if old is not None:
-                self.out.archived.append(asdict(old))
-            self.out.chans[origin] = oc
+            if ahead:
+                self.out.next_chans[origin] = oc
+            else:
+                if old is not None:
+                    self.out.archived.append(asdict(old))
+                self.out.chans[origin] = oc
             self.out.origins[origin] = pay_to           # also for an embedder that funds without connect
             self.out.save()
         try:
@@ -982,6 +1155,8 @@ class RouteHub:
             self.out.archived.append(asdict(oc))
             if self.out.chans.get(oc.origin) is oc:
                 del self.out.chans[oc.origin]
+            elif self.out.next_chans.get(oc.origin) is oc:
+                del self.out.next_chans[oc.origin]
             self.out.save()
         ev = {"event": "ch2_funding_dropped", "provider": oc.origin, "error": oc.fund_error,
               **({"watching": oc.fund_txid} if pending is not None else {})}
@@ -1029,6 +1204,9 @@ class RouteHub:
         st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["openUrl"], json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
         if st != 200:
+            # said, not only returned (AGP-057): a refused open is why a ch2 stays `funded`
+            why = "".join(ch for ch in raw[:160].decode("latin-1") if " " <= ch <= "~")
+            sys.stderr.write(f"hub: open {p.channel_id} at {oc.origin}: HTTP {st} {why}\n")
             return False
         try:
             doc = json.loads(raw)
@@ -1077,6 +1255,11 @@ class RouteHub:
         # too small to keep: under the provider's minimum, or (AGP-056) it could not take one more lock of
         # the size this provider is paid in (it would sit exhausted and unsigned until its expiry)
         if next_cap < max(min_cap, p.min_amount) or (oc.max_lock and next_cap - p.payer_fee < max(oc.max_lock, p.min_amount)):
+            nxt = self.out.next_chans.get(oc.origin)
+            if nxt is not None and nxt.state in ("funding", "funded") and not self._exhausted(oc, max(oc.max_lock, 1)):
+                # AGP-057: its next ch2 is funded but not open yet, and this one still takes a lock: it is
+                # kept until the next one is usable or it is drained (closing it now would pause routing)
+                return {"event": "ch2_wait_next", "provider": oc.origin, "chan": p.channel_id}
             return self.close_ch2(oc, refill=True)
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
@@ -1189,7 +1372,12 @@ class RouteHub:
         ev = {"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "amount": cum,
               "payeeFee": p.payee_fee, "payeeNet": max(0, cum - p.payee_fee)}
         self.events.append(ev)
-        if refill:
+        if refill and self.out.next_chans.get(oc.origin) is not None:
+            # funded ahead (AGP-057): the next ch2 takes over, nothing more to fund
+            nxt = self._promote(oc.origin, "closed")
+            if nxt is not None:
+                ev["next"] = nxt.p().channel_id
+        elif refill:
             try:
                 self.refill(oc.origin)
             except Exception as e:  # noqa: BLE001 - the close stands; the refill is reported
@@ -1343,12 +1531,29 @@ class RouteHub:
                 actions += self._watch_out(oc, tip, wait=max(0.0, min(WATCH_WAIT_ONE, until - time.time()))) or []
             except Exception as e:  # noqa: BLE001
                 self._watch_error(origin, "watch", e)
+        # AGP-057: every origin's next ch2 (reconciled, opened at minConf, taking over from a live one that
+        # is gone or idle), then the ones due to be funded ahead. Neither needs the origin's mutex until a
+        # switch: a next ch2 takes no lock before it
+        with self.out.lock:
+            nexts = list(self.out.next_chans.items())
+        for origin, oc in nexts:
+            try:
+                actions += self._watch_next(origin, oc, tip)
+            except Exception as e:  # noqa: BLE001
+                self._watch_error(origin, "next", e)
+        for origin in list(self.out.chans):
+            try:
+                actions += self._refill_ahead_due(origin, tip)
+            except Exception as e:  # noqa: BLE001
+                self._watch_error(origin, "refill_ahead", e)
         with self.out.lock:
             archived = [(i, r) for i, r in enumerate(self.out.archived) if watched(r)]
         for i, rec in archived:                             # replaced ch2s are still the hub's coins
             try:
                 oc = OutChannel(**rec)
                 acts = self._reconcile_dropped(oc, tip) if oc.state == "dropped" else self._reconcile(oc, tip)
+                if oc.retired:
+                    acts += self._close_retired(oc, tip)
                 with self.out.lock:
                     self.out.archived[i] = asdict(oc)
                     self.out.save()
@@ -1360,6 +1565,106 @@ class RouteHub:
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"hub watcher ch1: {e}\n")
         return actions
+
+    def _watch_next(self, origin: str, oc: OutChannel, tip: int) -> list:
+        """AGP-057: one origin's next ch2. A `funding` one is reconciled like any (the fund hook failed); a
+        funded one is checked against the chain and opened at the provider's minConf (never unconfirmed: a
+        wallet funding is the hub's to spend again). One that is no longer live (refunded at its expiry,
+        its funding spent) leaves for the archive. It takes over, under the origin's mutex, when the live
+        ch2 is gone (closing, closed, refunded, dropped), or when both are open and the live one has had no
+        lock for settle_idle seconds, so two ch2s do not stay committed to an idle provider."""
+        if self.out.next_chans.get(origin) is not oc:
+            return []
+        if oc.state == "funding":
+            return self._reconcile_funding(oc, tip)
+        out = []
+        try:
+            out += self._reconcile(oc, tip)
+        except Exception as e:  # noqa: BLE001
+            self._watch_error(origin, "reconcile", e)
+        if oc.state == "funded":
+            p = oc.p()
+            utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
+            if utxo and utxo.get("confirmations", 0) >= int(oc.terms["extra"].get("minConf", 1)) and self._open(oc):
+                out.append({"event": "ch2_open", "provider": origin, "next": True})
+        if oc.state not in LIVE:
+            with self.out.lock:
+                if self.out.next_chans.get(origin) is oc:
+                    del self.out.next_chans[origin]
+                    self.out.archived.append(asdict(oc))
+                    self.out.save()
+            return out
+
+        def due():
+            cur = self.out.chans.get(origin)
+            if cur is None or cur.state not in LIVE:
+                return "the live ch2 is " + (cur.state if cur is not None else "gone")
+            idle = time.time() - cur.last_lock_at >= float(self.config.settle_idle)
+            return "idle" if cur.state == "open" and oc.state == "open" and not cur.pending and idle else ""
+        if due():
+            mtx = self.out.mutex_for(origin)
+            if mtx.acquire(timeout=WATCH_WAIT_ONE):
+                try:
+                    why = due()                              # again, under the mutex
+                    if why and self._promote(origin, why) is not None:
+                        out.append({"event": "ch2_switch", "provider": origin, "why": why})
+                finally:
+                    mtx.release()
+        return out
+
+    def _refill_ahead_due(self, origin: str, tip: int) -> list:
+        """AGP-057: fund the origin's next ch2 once its live one's room is under refill_ahead_locks x the
+        largest lock routed to that provider (the room is what a rollover child keeps, less the provider's
+        minCapacity: a rollover adds no coins). Not for a provider the hub stopped routing to, nor for one with no lock for settle_idle
+        seconds. A refusal (the liquidity cap, the provider's /terms) is an event and is tried again next
+        block; until a next ch2 is open, the refill follows the close as before."""
+        n = int(self.config.refill_ahead_locks)
+        hook = self.refill_ahead if n > 0 else None
+        if hook is None:
+            return []
+        with self.out.lock:
+            oc = self.out.chans.get(origin)
+            if oc is None or oc.state != "open" or oc.blocked or origin in self.out.next_chans or oc.max_lock <= 0:
+                return []
+            p = oc.p()
+            # what the line still takes: a rollover child keeps capacity - signed, and one under the
+            # provider's minCapacity is not made (the ch2 is closed instead)
+            room = max(0, p.max_amount - max(oc.signed, int((oc.pending or {}).get("cum", 0)))
+                       - int(oc.terms["extra"].get("minCapacity", 0)))
+            big, chan = int(oc.max_lock), p.channel_id
+        if room >= n * big or time.time() - oc.last_lock_at >= float(self.config.settle_idle):
+            return []
+        if (origin, tip) in self._ahead_tried:
+            return []
+        try:
+            nxt = hook(origin)
+        except Exception as e:  # noqa: BLE001 - reported; the live ch2 goes on, the refill follows its close
+            self._ahead_tried = {k for k in self._ahead_tried if k[1] >= tip - 1} | {(origin, tip)}
+            ev = {"event": "ch2_refill_ahead_failed", "provider": origin, "error": f"{type(e).__name__}: {e}"[:200]}
+            self.events.append(ev)
+            return [ev]
+        ev = {"event": "ch2_refill_ahead", "provider": origin, "live": chan, "room": room, "maxLock": big,
+              "next": nxt.p().channel_id if nxt is not None else "", "capacity": nxt.p().capacity if nxt is not None else 0}
+        self.events.append(ev)
+        return [ev]
+
+    def _close_retired(self, oc: OutChannel, tip: int) -> list:
+        """AGP-057: a ch2 its origin's next one replaced (an archived record: it takes no lock any more).
+        Ask the provider to close it with the best state, once a block until it answers; the close is then
+        reconciled like any (`closing`, `closed` once confirmed). With nothing signed there is nothing to
+        close: the hub's refund returns it at its expiry, as for any unused ch2."""
+        if oc.state != "open" or oc.pending or not oc.signed:
+            return []
+        key = (oc.p().channel_id, tip)
+        if key in self._retire_tried:
+            return []
+        self._retire_tried = {k for k in self._retire_tried if k[1] >= tip - 1} | {key}
+        try:
+            return [self.close_ch2(oc)]
+        except ChannelError as e:
+            ev = {"event": "ch2_retire_failed", "provider": oc.origin, "chan": key[0], "error": str(e)[:200]}
+            self.events.append(ev)
+            return [ev]
 
     def _watch_error(self, origin: str, step: str, e: Exception):
         msg = f"{type(e).__name__}: {e}"[:200]

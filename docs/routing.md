@@ -152,3 +152,83 @@ client does. A provider's refusal reaches the client as `route_failed` with deta
 
 No wire change: no new field or message. Tests: `tests/security/test_agp056_multi_process.py` (21); in
 Rust `crates/xbt402-interop/tests/hub_multi_process.rs`.
+
+## ch2 lifecycle under load: the zero-conf cap and make-before-break refill (AGP-057)
+Two things paused routing to a provider under load. Both are in the hub (and one line in the provider),
+the same in the Rust hub; no wire change.
+
+### A. The zero-conf cap of a rollover child (cmp CMP-149)
+cmp saw about 20 `route_blocked` per R14 replay: "the rollover funding this ch2 is unconfirmed: cum
+134687 > the provider's zero-conf cap 132120". The cap is the provider's bound on what it takes over a
+rollover child that is still unconfirmed (`rollover_zero_conf_max`; by default
+`max(2 × settleMultiple × closeFee, 2 × settle_lock_multiple × the largest lock)`, here 8 × 16,515).
+
+What it is not: nothing of the parent is carried into the cap. A child's cum starts at 0 (the hub's
+`routed` and `signed`, the provider's `best_cum` and `routed_sat`); `childCumCarried` is 0 in every load
+run below.
+
+What it was, reproduced at cmp's lock size (`scripts/rollover_load_regtest.sh`, kinds `cmp*`, in xbt-rs):
+
+1. **The hub's stale flag (fixed).** The hub refuses before it sends anything, on its own
+   `zero_conf.confirmed`, and that flag was only the watcher's last look. A child that confirmed since
+   the last tick was still refused until the next one. The hub now looks at the chain itself before it
+   refuses on either bound (the cap, or the parent's close margin), as the provider already did. A node
+   that does not answer leaves the bound standing (`ch2_watch_error`, step `zero_conf`).
+2. **A block that lands while the provider checks the child (fixed).** The provider read the child's
+   funding unconfirmed; then the block with the rollover came, so the parent was spent in a block and
+   the child was no "zero-conf child" any more. The open was refused `unconfirmed` although the child
+   was confirmed, and it stayed `funded` until the hub's next tick. The provider now reads the funding
+   once more before it refuses. A refused open is also written to the hub's stderr now.
+3. **The provider's own stale look at a lock (fixed).** The provider's watcher can meet the block the
+   same way and leave a confirmed child `suspended` until its next tick: a lock in between was refused
+   `unconfirmed` (two `route_failed` in a `high-nofloor` load run). Before it refuses a lock on a
+   suspended rollover child the provider now reads the chain, as the hub does before it sends one. Any
+   other suspended channel is refused as before.
+4. **A child that really is unconfirmed (sizing, not a bug).** With more than the cap's worth of locks
+   per block interval, the hub still refuses: that is the provider's risk bound. A provider that is paid
+   faster than `2 × settle_lock_multiple` of its largest locks per block sets
+   `rollover_zero_conf_max` to what it earns from one hub in a block interval or two. What it risks on
+   an unconfirmed child is bounded: before the parent's expiry only the provider can sign another spend
+   of the parent, so the child exists unless the rollover is still unconfirmed at the parent's close
+   margin (`until`).
+
+### B. Make-before-break refill
+A rollover adds no coins, so a ch2 line carries its capacity in locks and was then closed and refilled.
+The refill is a wallet funding, which the provider cannot take unconfirmed (its payer could spend it
+again), so it opened at minConf: a block without routing to that provider.
+
+- **Funded ahead.** Once the live ch2's room is under `refill_ahead_locks` (N, default 4) × the largest
+  lock routed to that provider, the watcher funds the origin's NEXT ch2 (`OutBook.next_chans`, at most
+  one per origin; `connect_next`). Room is what the line still takes: `max_amount − signed`, less the
+  provider's `minCapacity` (a rollover child under it is not made). Not for a provider the hub stopped
+  routing to, nor for one with no lock for `settle_idle` seconds.
+- **Usable** means open at the provider, at its minConf. The live ch2 keeps taking locks meanwhile,
+  rollovers included.
+- **The switch** (`ch2_switch`): with the first lock the live ch2 cannot take (exhausted, no longer
+  open, or an unconfirmed rollover child at the provider's bounds); when the live ch2 is closed as too
+  small to roll over (`close_ch2(refill=True)` hands over instead of funding; while the next one is
+  funded but not open yet and the live one still takes a lock, it is kept: `ch2_wait_next`); or once the live ch2
+  has had no lock for `settle_idle` seconds, so two ch2s do not stay committed to an idle provider.
+  Never while a lock is pending on the live ch2, and never because the hub stopped routing to the
+  provider (a lock it did not reveal).
+- **The old ch2** is `retired`: the watcher asks the provider to close it on its best state (once a
+  block until it answers), and it is reconciled like any archived ch2. One with nothing signed has
+  nothing to close and is refunded at its expiry, as an unused ch2 always was.
+- **Bounds.** Per origin: one live ch2 plus at most one next (the AGP-056 guard, widened). An origin
+  counts once for `ch2_max_per_pay_to`. `committed_sat` counts the live ch2, the next one and a retired
+  one until its close is out, so `liquidity_cap_sat` needs room for one more `ch2_capacity` than the
+  hub has origins. Without that room nothing is funded ahead (`ch2_refill_ahead_failed`, tried again
+  next block) and the refill follows the close as before.
+- **Sizing N.** N locks must cover what the provider is paid while a funding confirms and opens: the
+  locks of one block interval plus one watcher tick. `refill_ahead_locks: 0` is the old behaviour.
+- **Embedders.** The hook is `refill_ahead(origin)` (constructor argument and property, like
+  `refill`). Its default is `connect_next`; an embedder that passed its own `refill` and no
+  `refill_ahead` gets none, so its own path, lock and cap are never bypassed (cmp: unchanged until it
+  passes one). `ch2.json` has a new key `next_chans`, and a record a new field `retired`.
+
+Events: `ch2_refill_ahead` {live, next, room, maxLock, capacity}, `ch2_refill_ahead_failed`,
+`ch2_switch` {from, to, why}, `ch2_wait_next`, `ch2_retire_failed`.
+
+Tests: `tests/security/test_agp057_refill_ahead.py` (25; 12 of 13 mutations of the hub caught, the
+13th is equivalent); in Rust `crates/xbt402-interop/tests/hub_refill_ahead.rs` (25). Load runs and
+their numbers: xbt-rs `README.md`, "ch2 lifecycle under load (AGP-057)".

@@ -381,9 +381,15 @@ class XbtChannelProvider:
                 confs = check_funding(self.rpc, p, self.policy)
             except ChannelError as e:
                 zc = self._zero_conf_child(p, hub) if e.code == "unconfirmed" else None
-                if zc is None:
+                if zc is not None:
+                    confs = check_funding(self.rpc, p, replace(self.policy, zero_conf_max=p.capacity))
+                elif e.code == "unconfirmed" and hub:
+                    # AGP-057: not a child we take unconfirmed. A block that came while we looked makes it
+                    # neither: the funding read above had no confirmation yet, and the parent is now spent
+                    # in that block. Look at the funding once more (still unconfirmed: the same refusal)
+                    confs = check_funding(self.rpc, p, self.policy)
+                else:
                     raise
-                confs = check_funding(self.rpc, p, replace(self.policy, zero_conf_max=p.capacity))
             st = self.ledger.channels[p.channel_id] = ChannelState(p)
             if hub:
                 st.extra = {"hub": hub}
@@ -970,7 +976,15 @@ class XbtChannelProvider:
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
                 return err("channel_closing")
             if st.suspended:
-                return err("unconfirmed")
+                # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
+                # leaves a rollover child suspended although it confirmed (the parent was then spent in a
+                # block, so it was no zero-conf child either). A hub looks at the chain itself before it
+                # sends a lock: so do we before refusing one on an unconfirmed child
+                zc = (st.extra or {}).get("zero_conf")
+                if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
+                    return err("unconfirmed")
+                st.suspended = False
+                self.ledger.save(st)
             if not self._zc_confirmed(st):
                 # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
                 zc = st.extra["zero_conf"]

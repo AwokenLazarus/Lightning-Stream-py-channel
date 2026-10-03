@@ -197,7 +197,7 @@ def hub(node, net, secret=0x4B4B, **kw):
     d = tempfile.mkdtemp(prefix="hub-")
     opts = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
                 reveal_timeout=1.0, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
-                settle_lock_multiple=0,
+                settle_lock_multiple=0, refill_ahead_locks=0,   # AGP-057 too: off unless a test asks for it
                 policy=FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640,
                                      close_margin=36))
     opts.update({k: v for k, v in kw.items() if v is not None})
