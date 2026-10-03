@@ -90,6 +90,7 @@ hub keeps within those bounds itself, never rolls an unconfirmed child over, and
 whose rollover left the mempool or was replaced. A watcher tick waits (bounded) for a provider that
 streams locks, so its rollover is not starved.
 """
+import contextlib
 import json
 import math
 import os
@@ -106,6 +107,7 @@ from .channel import (DUST, FEE_PAYERS, RBF_SEQUENCE, SIGHASH_ALL_UNIFIED, Chann
 from .funding import FundingPolicy
 from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
                     fee_due, find_spend, hub_channel_message, next_cum, route_ok)
+from .rpc import RPCError
 from .tx import Tx, address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, request_auth, request_digest,
                            safe_code, unb64json)
@@ -1111,13 +1113,12 @@ class RouteHub:
         ev = self._finish_rollover(oc, amount)
         new = self.out.chans.get(oc.origin)
         if new is not None and new.rolled_from == p.channel_id and not new.fund_seen:
-            try:                                      # a hub on the provider's node sees it at once (AGP-056)
+            # a hub on the provider's node sees it at once (AGP-056); the watcher's reconcile looks again
+            with contextlib.suppress(OSError, ValueError, KeyError, RPCError):
                 if self.rpc.gettxout(txid, 1, True) is not None:
                     with self.out.lock:
                         new.fund_seen = True
                         self.out.save()
-            except Exception:  # noqa: BLE001 - the watcher's reconcile looks again
-                pass
         # make-before-break (AGP-053): open the next ch2 now, still under this provider's mutex, so the
         # next lock goes over it; a provider that wants confirmations first refuses, and the watcher
         # opens it at minConf

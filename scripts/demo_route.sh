@@ -2,7 +2,7 @@
 # AGP-021 demo: xbt402 hub routing on regtest. 1 client, 1 hub, 4 providers (A and B: two provider processes
 # under one payee key), ~10 s of streamed chunks at >= 10 updates/s per provider, rollover, a non-revealing provider
 # and a withholding hub. Prints PASS/FAIL and latency numbers (scripts/demo_route.py).
-# Ports XBT402_TEST_PORT_BASE + 1/2 (node), + 10..14 (hub, providers); default base 34800.
+# Ports XBT402_TEST_PORT_BASE + 1/2 (node), + 10..14 (hub, providers); default base 32300.
 # Own Knots 29.4.2 regtest node (RDTS + #419) in run/agp021-demo-<pid>, wiped on exit. No miners.
 # Runs under the soak cap (systemd-run --user --scope CPUQuota=200% MemoryMax=4G, nice 19) when it can.
 set -euo pipefail
@@ -14,7 +14,7 @@ if [ -z "${DEMO_ROUTE_SCOPED:-}" ] && command -v systemd-run >/dev/null 2>&1 \
 fi
 PY=${PYTHON:-$HOME/xbt-rnd/b1/.venv/bin/python}
 [ -x "$PY" ] || PY=python3
-PB=${XBT402_TEST_PORT_BASE:-34800}
+PB=${XBT402_TEST_PORT_BASE:-32300}
 export XBT402_TEST_PORT_BASE=$PB
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
 export DEMO_RUN="$PWD/run/agp021-demo-$$"
