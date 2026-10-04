@@ -54,8 +54,8 @@ Why a channel and not one on-chain payment per call:
   funding and one close, whatever the number of calls.
 - **Latency.** Verifying a state costs one ECDSA verification and one HMAC. The reference provider
   answers a paid call in about 4 ms (p50) on commodity hardware. XBT blocks arrive every 7–10 minutes.
-- **No facilitator and no custody.** The chain has no stablecoin, no Lightning network and no
-  facilitator service. The client's timelocked refund protects the client, and the client's
+- **No facilitator and no custody.** The chain has no stablecoin and no facilitator service,
+  and its Lightning network (since September 2026) needs a node and a watchtower on each side. The client's timelocked refund protects the client, and the client's
   signatures protect the provider. Neither side trusts the other beyond one call.
 
 What it costs:
