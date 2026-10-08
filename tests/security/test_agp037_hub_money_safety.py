@@ -117,7 +117,7 @@ class WriteAheadFunding(unittest.TestCase):
         oc = h.connect(self.origin)
         rec = seen[self.origin]
         self.assertEqual(rec["state"], "funding")
-        self.assertEqual(rec["secret"], oc.secret)
+        self.assertEqual(h.out.wrap.open(rec["secret_sealed"]), oc.secret)   # sealed at rest (AGP-073)
         self.assertEqual(rec["params"]["payer_pub"], oc.params["payer_pub"])
         self.assertEqual(oc.state, "funded")
 
@@ -196,7 +196,8 @@ class WriteAheadRollover(_World):
         nxt = OutChannel(**oc.next)
         self.assertTrue(nxt.secret)                              # the next ch2's key survived the lost answer
         with open(self.hub.out.path) as f:
-            self.assertEqual(json.load(f)["chans"][self.origin]["next"]["secret"], nxt.secret)
+            self.assertEqual(self.hub.out.wrap.open(json.load(f)["chans"][self.origin]["next"]["secret_sealed"]),
+                             nxt.secret)
         acts = self.hub.watch_tick()
         self.assertTrue(any(a["event"] == "ch2_rollover" for a in acts), acts)
         new = self.hub.out.chans[self.origin]
@@ -252,8 +253,11 @@ class ReconcileEveryCh2(_World):
         hubmod.find_spend = lambda *a: None
         try:
             oc.stale = [{"lockId": "x", "cum": oc.signed, "pre": None, "T": "", "d": 1, "ch1": ""}]
+            # the early close of a written-off ch2 (AGP-073) gets no answer: the chain alone decides
+            self.net.drop[self.origin] = lambda m, p: p.endswith("/close")
             self.hub.watch_tick()
             self.assertEqual(oc.state, "open")
+            self.net.drop.pop(self.origin)
             oc.stale = []
             self.hub.watch_tick()
             self.assertEqual((oc.state, oc.close_txid), ("closing", ""))     # the spend is in the mempool

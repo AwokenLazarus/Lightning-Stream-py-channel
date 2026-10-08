@@ -66,6 +66,12 @@ hub = RouteHub(rpc, pay_to_secret, network, datadir, fund, HubConfig.from_dict(c
 hub.connect(provider_url); hub.watch(5); hub.http_server(port).serve_forever()
 ```
 
+The hub seals its ch2 payer keys in `<datadir>/ch2.json` (AES-256-GCM, aad `xbt402/hub-ch2`, AGP-073).
+Pass `wrap_key=WrapKey.load_or_create(path)` (`xbt402.hub_keys`) to keep the wrap key off the data
+dir (a secrets mount); without one the hub makes `<datadir>/hub-wrap-key` (0600). A plaintext
+`ch2.json` from an older hub is read once and rewritten sealed; older copies (backups) still hold
+the keys. An older hub cannot read a sealed file. `cryptography` is needed for this.
+
 ## Routed billing throughput (AGP-054)
 cmp measured routed decode at 0.742 of unpaid (CMP-024), about 4-5 ms of billing per stage per
 token. A profile of the per-call path (`scripts/route_perf.py`, spans on cmp's operator app) put
