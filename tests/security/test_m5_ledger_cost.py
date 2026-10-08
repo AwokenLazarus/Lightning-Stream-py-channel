@@ -9,6 +9,7 @@ calls. Fixed: a call saves only its own row.
 import unittest
 
 from sechelp import FakeNode, Repro, authed, base, load, make_channel, make_provider, pay
+from sechelp import crashed
 ch, xc = base("channel"), base("x402_channel")   # unpatched wave 2: the repro tests
 
 
@@ -47,6 +48,7 @@ class LedgerCost(Repro, unittest.TestCase):
         n = rows_written(prov, lambda: st.__setitem__(0, pay(xp, prov, pl)[0]))
         self.assertEqual(st[0], 200)
         self.assertLessEqual(n, 2)
+        crashed(prov)
         self.assertEqual(xp.Ledger(prov.ledger.path).channels[p.channel_id].best_cum, 20_000)
 
 

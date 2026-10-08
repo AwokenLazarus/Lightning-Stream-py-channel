@@ -25,6 +25,7 @@ import routehelp as R  # noqa: E402
 from xbt402.channel import ChannelError  # noqa: E402
 from xbt402.hub import ROLLOVER_GONE, HubConfig, RouteHub  # noqa: E402
 from xbt402.route import AMSAT_PER_SAT, ROUTE_LOCK_PATH  # noqa: E402
+from sechelp import crashed
 
 KEY = 0x5151
 LOCK = 2_000                                   # 50 calls at 40 sat
@@ -222,6 +223,7 @@ class MultiProcessOperator(unittest.TestCase):
         w = W(2)
         a, b = w.origins
         d = os.path.dirname(w.hub.out.path)
+        crashed(d)
         h2 = RouteHub(w.node, 0x4B4B, R.NET, d, w.node.fund_address, http=w.net.http)
         self.assertEqual(h2.routing_extra()["providers"], [a, b])
         self.assertEqual((h2.connect(b).origin, h2.connect(a).origin), (b, a))

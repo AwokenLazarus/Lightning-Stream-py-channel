@@ -1,10 +1,36 @@
-"""SQLite WAL ledger: one row per channel, fsynced before a call is served."""
+"""SQLite WAL ledger: one row per channel, fsynced before a call is served. One process at a time:
+the ledger keeps its rows in memory, so a second opener would diverge from the first and each
+would overwrite the other's channels (review C5, AGP-067). `<path>.lock` holds an exclusive
+flock(2) for the ledger's life, the OS drops it with the process, and a second opener is refused."""
+import fcntl
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import asdict, dataclass, field
 
-from .channel import ChannelParams
+from .channel import ChannelError, ChannelParams
+
+
+def lock_ledger(path: str):
+    """The exclusive lock on `path + ".lock"` (the open file holds it), or ChannelError
+    `ledger_locked` naming the holder's pid. The same lock as xbt-rs (std `File::try_lock`)."""
+    lock_path = path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    f = open(lock_path, "a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.seek(0)
+        held = f.read().strip()
+        f.close()
+        who = f"pid {held}" if held.isdigit() else "another opener"
+        raise ChannelError("ledger_locked", f"{path} is open in {who} (lock {lock_path}): one provider per ledger file")
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
 
 
 @dataclass
@@ -36,6 +62,7 @@ class Ledger:
             path = path[:-5] + ".sqlite"
         self.path, self.lock = path, threading.Lock()
         self.channels = {}
+        self._file_lock = None if path == ":memory:" else lock_ledger(path)
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
@@ -62,6 +89,13 @@ class Ledger:
             if col not in have:   # a wave-2 ledger from before XBT-061
                 self._db.execute(f"ALTER TABLE channels ADD COLUMN {col} {decl}")
         self._load()
+
+    def close(self):
+        """Let go of the file and its lock (a restart in the same process)."""
+        self._db.close()
+        if self._file_lock is not None:
+            self._file_lock.close()
+            self._file_lock = None
 
     def _load(self):
         for row in self._db.execute(f"SELECT {', '.join(COLUMNS)} FROM channels"):

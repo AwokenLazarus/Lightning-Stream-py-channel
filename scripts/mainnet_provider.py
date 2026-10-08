@@ -278,6 +278,7 @@ def main(argv=None):
     if created:
         info["notice"] = "new payTo key: back up the payto key and wrap files now (a password manager), before any channel"
     if a.check:
+        prov.ledger.close()
         print(json.dumps(info, indent=1))
         return 0
     if cfg["chain"] == "main" and cfg.get("mainnet_start_approved") is not True:

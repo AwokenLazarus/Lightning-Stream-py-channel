@@ -41,6 +41,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import socket
@@ -55,7 +56,7 @@ from typing import Callable, Dict, Optional
 
 from . import ecc
 from .channel import (DERIVATION, DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
-                      canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, settle_due)
+                      canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, cpfp_child, settle_due)
 from .conditional import CSV_DELTA
 from .funding import FundingPolicy, check_funding
 from .ledger import ChannelState, Ledger
@@ -71,6 +72,7 @@ BODY_DEADLINE = 30                                          # a body that never 
 MAX_HEADER_LINE = 8 * 1024
 MAX_HEADERS = 32 * 1024
 MAX_CONNECTIONS = 64
+CPFP_CHILD_VSIZE = 110      # a CPFP child: one P2WPKH input, one P2WPKH output (109.25 vB, rounded up)
 
 
 def scheme_accepted(s) -> bool:
@@ -299,7 +301,8 @@ class XbtChannelProvider:
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
                  max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
                  close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36,
-                 rollover_zero_conf_max: int = None, route_wal: str = None, settle_lock_multiple: int = 4):
+                 rollover_zero_conf_max: int = None, route_wal: str = None, settle_lock_multiple: int = 4,
+                 close_bump_max_fee: int = 10_000, close_min_feerate: float = 1.0, close_bump_blocks: int = 3):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
         if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
@@ -318,6 +321,12 @@ class XbtChannelProvider:
         self.close_fee_payer, self.route_close_fee_payer = close_fee_payer, route_close_fee_payer
         self.rollover_grace = int(rollover_grace)   # blocks before the close margin a rollover is due anyway
         self.claim_fee = claim_fee      # sats the hash-lock claim pays out of condAmount (M6)
+        # AGP-067 (review C1): the watcher bumps a close still unconfirmed before expiry with a CPFP child
+        # from this provider's own close output, at most close_bump_max_fee sats (0: never), to a package
+        # feerate of at least close_min_feerate; doubled after close_bump_blocks without a confirmation in
+        # the second half of the close margin (an estimate that lags the market)
+        self.close_bump_max_fee, self.close_min_feerate = int(close_bump_max_fee), float(close_min_feerate)
+        self.close_bump_blocks = int(close_bump_blocks)
         self.policy = policy or FundingPolicy(min_expiry_blocks=1_008, close_margin=close_margin)
         self._height, self._height_at, self.height_ttl = 0, 0.0, height_ttl
         self._auth_keys: Dict[str, bytes] = {}
@@ -461,6 +470,8 @@ class XbtChannelProvider:
                                  network=self.network, close_fee_payer=fee_payer)
         if c["redeemScript"].lower() != p.script.hex():
             raise ChannelError("bad_funding", "redeemScript does not match payTo/payerPub/expiry")
+        if req.get("preflight") is True:
+            return self._open_preflight(p, c)
         chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
         p.funding_txid, p.funding_vout, p.capacity = chan.split(":")[0], int(c["vout"]), int(c["capacity"])
         hub = ""
@@ -505,6 +516,23 @@ class XbtChannelProvider:
             out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
         if zc:
             out["zeroConf"] = {"parent": zc["parent"], "maxCum": str(zc["maxCum"]), "until": zc["until"]}
+        return out
+
+    def _open_preflight(self, p: ChannelParams, c: dict) -> dict:
+        """AGP-067 (review C2): `"preflight": true` with no outpoint. The answer a funded open of these
+        terms would get, or its refusal, before the payer funds anything; nothing is recorded. The
+        funding checks (the output, its confirmations) wait for the funded open. Pre-067 providers
+        answer bad_request (no vout) only after the terms checks above, so a payer may fund then."""
+        pol = self.policy
+        p.capacity = int(c["capacity"])
+        if not pol.min_capacity <= p.capacity <= pol.max_capacity:
+            raise ChannelError("bad_capacity", f"capacity outside [{pol.min_capacity}, {pol.max_capacity}]")
+        left = p.expiry - self.height()
+        if not pol.min_expiry_blocks <= left <= pol.max_expiry_blocks:
+            raise ChannelError("bad_expiry", f"{left} blocks to expiry, need [{pol.min_expiry_blocks}, {pol.max_expiry_blocks}]")
+        out = {"preflight": True, "expiry": p.expiry, "maxCum": str(p.max_amount), "minConf": pol.conf_for(p.capacity)}
+        if p.close_fee_payer != "payer":
+            out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
         return out
 
     def _zero_conf_child(self, p: ChannelParams, hub: str) -> Optional[dict]:
@@ -784,10 +812,163 @@ class XbtChannelProvider:
             try:
                 self.rpc.sendrawtransaction(tx.hex())
             except Exception as e:  # noqa: BLE001 - node errors become protocol errors
-                if not self._tx_known(txid, tx):
+                # AGP-067 (C1): refused alone (below the mempool's floor), it goes in with a child
+                bumped = False
+                if self.close_bump_max_fee > 0:
+                    try:
+                        self._bump_close(st, self.height(), txid, tx, refused_alone=True)
+                        bumped = True
+                    except Exception:  # noqa: BLE001 - the close's own refusal is the one reported
+                        pass
+                if not bumped and not self._tx_known(txid, tx):
                     raise ChannelError("close_failed", str(e))
             self._closed(st, tx.hex(), txid, conditional)
         return st.closed_txid
+
+    # AGP-067 (review C1): the close-fee bump ------------------------------------------------
+    def _estimate_fee_rate(self, target: int):
+        """`estimatesmartfee` in sat/vB; None without an estimate (or a node that has no such call)."""
+        if not hasattr(self.rpc, "estimatesmartfee"):
+            return None
+        try:
+            f = (self.rpc.estimatesmartfee(target) or {}).get("feerate") or 0
+        except Exception:  # noqa: BLE001 - no estimate: the floor and the doubling still apply
+            return None
+        return f * 1e8 / 1000 if f > 0 else None
+
+    def _mempool_min_fee(self):
+        """The least feerate the node's mempool takes now (sat/vB): max(mempoolminfee, minrelaytxfee)."""
+        if not hasattr(self.rpc, "getmempoolinfo"):
+            return None
+        try:
+            r = self.rpc.getmempoolinfo() or {}
+        except Exception:  # noqa: BLE001 - unknown: the estimate and close_min_feerate still apply
+            return None
+        f = max(float(r.get("mempoolminfee") or 0), float(r.get("minrelaytxfee") or 0)) * 1e8 / 1000
+        return f if f > 0 else None
+
+    def _submit_package(self, hexes: list):
+        """`submitpackage` (a parent below the floor gets in on its child's fee); a node without it:
+        each in order, a refusal of the parent left to show as the child's missing input."""
+        if not hasattr(self.rpc, "submitpackage"):
+            for i, h in enumerate(hexes):
+                try:
+                    self.rpc.sendrawtransaction(h)
+                except Exception:  # noqa: BLE001
+                    if i + 1 == len(hexes):
+                        raise
+            return
+        r = self.rpc.submitpackage(list(hexes)) or {}
+        if r.get("package_msg") == "success":
+            return
+        errs = [t.get("error") for t in (r.get("tx-results") or {}).values() if isinstance(t, dict) and t.get("error")]
+        raise ChannelError("rpc_error", f"submitpackage: {r.get('package_msg')} {'; '.join(errs)}")
+
+    def _close_rate_wanted(self, p: ChannelParams, tip: int, last) -> float:
+        """The package feerate (sat/vB) a close needs at `tip`: the estimate for confirming within a
+        quarter of the blocks left to expiry, the mempool's floor and close_min_feerate, whichever is
+        highest; doubled from the last send once close_bump_blocks passed without a confirmation in
+        the second half of the close margin."""
+        left = max(0, p.expiry - tip)
+        want = self.close_min_feerate
+        for r in (self._estimate_fee_rate(min(max(left // 4, 1), 1008)), self._mempool_min_fee()):
+            if r:
+                want = max(want, r)
+        if last and tip >= int(last.get("at", 0)) + self.close_bump_blocks and left <= self.close_margin // 2:
+            want = max(want, float(last.get("rate", 0)) * 2)
+        return want
+
+    def _bump_close(self, st: ChannelState, tip: int, txid: str, close, refused_alone: bool = False):
+        """review C1: get the close `txid` confirmed before the payer's refund is valid. Each block (each
+        call while it is not in the mempool) the close goes out alone if its own fee meets
+        _close_rate_wanted, else with a CPFP child that spends this provider's close output back to the
+        same key and pays the difference, replacing the last child (BIP125: the new one pays at least
+        the old fee plus its own vsize). The child's fee is capped at close_bump_max_fee and at the
+        output less dust. Recorded in extra["close_bump"] (at: the last send, rate, fee, the child's
+        txid/hex, capped, replaced). `refused_alone`: the node just refused the close alone, so it is
+        not sent alone again. The same as xbt-rs Provider::bump_close."""
+        p = st.params
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None:
+            return          # spent in a block: the close confirmed, or the channel is gone
+        last = (st.extra or {}).get("close_bump")
+        last = dict(last) if isinstance(last, dict) else None
+        num = lambda k: int((last or {}).get(k) or 0)  # noqa: E731
+        child_txid = (last or {}).get("txid") or ""
+        # a node may still answer for an evicted close's txid: in the pool only while the funding is spent there
+        in_pool = self._tx_known(txid, close) and self._funding_spent_in_pool(p)
+        child_in_pool = bool(child_txid) and self._has_tx(child_txid)
+        if last is not None and in_pool and (not child_txid or child_in_pool) and num("seen") == tip:
+            return          # looked at this block already
+        close_hex = close.hex()
+        close_fee = max(0, p.capacity - sum(o.value for o in close.outputs))
+        cv = close.vsize()
+        want = self._close_rate_wanted(p, tip, last)
+        have_fee, have_vs = (close_fee + num("fee"), cv + CPFP_CHILD_VSIZE) if child_in_pool else (close_fee, cv)
+        rec = last or {"at": tip, "rate": close_fee / cv, "fee": 0}
+        rec["seen"] = tip
+
+        def put():
+            st.extra = {**(st.extra or {}), "close_bump": rec}
+
+        def send_alone():
+            if refused_alone:
+                raise ChannelError("close_failed", "the node refused the close alone")
+            try:
+                try:
+                    self.rpc.sendrawtransaction(close_hex)
+                except Exception as e:  # noqa: BLE001
+                    if not self._tx_known(txid, close):
+                        raise ChannelError("close_failed", str(e))
+                rec["at"] = tip
+            finally:
+                put()
+
+        if in_pool and have_fee >= want * have_vs:
+            put()
+            return
+        payee = bytes.fromhex(p.payee_spk)
+        vout = next((n for n, o in enumerate(close.outputs) if o.script_pubkey == payee), None)
+        swept = "payee_sweep" in (st.extra or {}) or "payee_sweep_intent" in (st.extra or {})
+        if vout is None or swept or close_fee >= want * cv:
+            return send_alone()   # nothing of ours to spend, a sweep spends it, or enough alone
+        value = close.outputs[vout].value
+        fee = max(0, math.ceil(want * (cv + CPFP_CHILD_VSIZE)) - close_fee)
+        last_fee = num("fee")
+        if last_fee > 0:
+            fee = max(fee, last_fee + CPFP_CHILD_VSIZE)
+        cap = min(self.close_bump_max_fee, max(0, value - DUST))
+        capped = fee > cap
+        fee = min(fee, cap)
+        if last_fee > 0 and fee <= last_fee:
+            child_hex, child_id = rec.get("hex") or "", child_txid   # at the cap: the last child again
+        else:
+            child = cpfp_child(txid, vout, value, payee, self._chan_secret(p), fee)
+            child_hex, child_id = child.hex(), child.txid()
+        if not child_hex or fee == 0:
+            return send_alone()
+        try:
+            self._submit_package([close_hex, child_hex])
+        except Exception as e:  # noqa: BLE001
+            put()
+            raise ChannelError("close_bump_failed", str(e))
+        if child_txid and child_id != child_txid:
+            rec["replaced"] = list(rec.get("replaced") or []) + [[child_txid, last_fee]]
+        fee = last_fee if child_id == child_txid else fee
+        rec.update(at=tip, rate=(close_fee + fee) / (cv + CPFP_CHILD_VSIZE), fee=fee, txid=child_id, hex=child_hex,
+                   capped=capped)
+        put()
+
+    def _funding_spent_in_pool(self, p) -> bool:
+        try:
+            return self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None
+        except Exception:  # noqa: BLE001 - unknown: send again (a resend of the same tx is harmless)
+            return False
+
+    def _has_tx(self, txid: str) -> bool:
+        try:
+            return bool(self.rpc.getrawtransaction(txid))
+        except Exception:  # noqa: BLE001 - "No such mempool or blockchain transaction"
+            return False
 
     def _closed(self, st: ChannelState, close_hex: str, txid: str, conditional: bool):
         """Record the close the node has, then claim the hash lock of a conditional one."""
@@ -809,9 +990,13 @@ class XbtChannelProvider:
     def _watch_one(self, st: ChannelState, h: int, out: list):
         p = st.params
         if st.closed_txid:
-            # funding still unspent even counting the mempool: the close was evicted, send it again
-            if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
-                self.rpc.sendrawtransaction(st.extra.get("close_hex") or self._close_tx(st)[0].hex())
+            from .tx import Tx
+            close_hex = st.extra.get("close_hex") or self._close_tx(st)[0].hex()
+            if self.close_bump_max_fee > 0:
+                self._bump_close(st, h, st.closed_txid, Tx.parse(bytes.fromhex(close_hex)))
+            elif self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+                # funding still unspent even counting the mempool: the close was evicted, send it again
+                self.rpc.sendrawtransaction(close_hex)
             if st.extra.get("cond_close"):
                 self._claim(st)           # the hash lock is ours only until csvDelta: retry every tick
             return
@@ -864,6 +1049,9 @@ class XbtChannelProvider:
         return w
 
     def cpfp(self, close_txid: str, fee: int) -> str:
+        """A CPFP child of this close paying `fee`, recorded in extra["close_bump"] as the watcher's own
+        bump is (AGP-067), so the next bump replaces it rather than conflicting with it."""
+        from .tx import Tx
         from .watcher import cpfp_from_close
         with self.ledger.lock:
             st = next((s for s in self.ledger.channels.values() if s.closed_txid == close_txid), None)
@@ -871,7 +1059,25 @@ class XbtChannelProvider:
                 raise ChannelError("unknown_channel", "no channel closed with that txid")
             secret = self._chan_secret(st.params)
             close_hex = (st.extra or {}).get("close_hex")
-        return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee, close_hex=close_hex)
+            if not close_hex:
+                return cpfp_from_close(self.rpc, close_txid, st.params.payee_spk, secret, fee)
+            close = Tx.parse(bytes.fromhex(close_hex))
+            payee = bytes.fromhex(st.params.payee_spk)
+            n = next((i for i, o in enumerate(close.outputs) if o.script_pubkey == payee), None)
+            if n is None:
+                raise ChannelError("no_payee_output", "the close pays nothing to the payee key")
+            last = dict((st.extra or {}).get("close_bump") or {})
+            child = cpfp_child(close_txid, n, close.outputs[n].value, payee, secret, int(fee))
+            self._submit_package([close_hex, child.hex()])
+            close_fee = max(0, st.params.capacity - sum(o.value for o in close.outputs))
+            tip = self.height()
+            if last.get("txid") and last["txid"] != child.txid():
+                last["replaced"] = list(last.get("replaced") or []) + [[last["txid"], int(last.get("fee") or 0)]]
+            last.update(at=tip, seen=tip, rate=(close_fee + int(fee)) / (close.vsize() + CPFP_CHILD_VSIZE), fee=int(fee),
+                        txid=child.txid(), hex=child.hex(), capped=False)
+            st.extra = {**st.extra, "close_bump": last}
+            self.ledger.save(st)
+            return child.txid()
 
     def sweep_payee(self, chan: str, dest_spk: bytes, fee: int) -> dict:
         """Move this channel's payee close output, P2WPKH(P) with p = payTo_secret + t, to
@@ -897,16 +1103,24 @@ class XbtChannelProvider:
             vout = next((n for n, o in enumerate(close.outputs) if o.script_pubkey == payee_spk), None)
             if vout is None:
                 raise ChannelError("no_payee_output", "the close pays nothing to the payee key")
-            value = close.outputs[vout].value
+            # AGP-067: a CPFP child (the latest, or one it replaced) moved the output to the same key
+            base = close.outputs[vout].value
+            from_txid, value = st.closed_txid, base
+            bump = (st.extra or {}).get("close_bump") or {}
+            if int(bump.get("fee") or 0) > 0:
+                kids = [(bump.get("txid") or "", int(bump.get("fee") or 0))] + [(t, int(f)) for t, f in bump.get("replaced") or []]
+                for kid, kfee in reversed([k for k in kids if k[0]]):
+                    if self.rpc.gettxout(kid, 0, True) is not None:
+                        from_txid, vout, value = kid, 0, max(0, base - kfee)
             if value - int(fee) < DUST:
                 raise ChannelError("bad_amount", f"fee {fee} leaves dust from {value}")
-            if self.rpc.gettxout(st.closed_txid, vout, True) is None:
+            if self.rpc.gettxout(from_txid, vout, True) is None:
                 raise ChannelError("payee_spent", "the payee output is spent or its close is not on this node")
-            tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(st.closed_txid)[::-1], vout, 0xFFFFFFFD)],
+            tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(from_txid)[::-1], vout, 0xFFFFFFFD)],
                     outputs=[TxOut(value - int(fee), dest_spk)], locktime=0)
             sign_p2wpkh(self._chan_secret(st.params), tx, [TxOut(value, payee_spk)])
             txid = tx.txid()
-            rec = {"txid": txid, "outpoint": f"{st.closed_txid}:{vout}", "value": value, "fee": int(fee),
+            rec = {"txid": txid, "outpoint": f"{from_txid}:{vout}", "value": value, "fee": int(fee),
                    "swept": value - int(fee), "dest_spk": dest_spk.hex()}
             st.extra = {**st.extra, "payee_sweep_intent": {**rec, "hex": tx.hex()}}   # write-ahead (M8)
             self.ledger.save(st)
@@ -1597,6 +1811,21 @@ class XbtChannelClient:
                                str(data.get("detail", "") if isinstance(data, dict) else data))
         return data
 
+    def _preflight(self, url: str, channel: dict, fee_payer: str):
+        """POST /open {"preflight": true} (no outpoint): a refusal (a stale payTo after a restart, terms
+        out of the provider's policy) costs the payer nothing on-chain. A provider from before AGP-067
+        answers bad_request (no vout) only after its terms checks passed: then fund and open as before."""
+        try:
+            r = self._post(url, {"x402Version": 2, "network": self.network, "preflight": True, "channel": channel})
+        except ChannelError as e:
+            if e.code == "bad_request":
+                return
+            raise
+        if not isinstance(r, dict) or r.get("preflight") is not True:
+            raise ChannelError("bad_open", "the provider did not answer the open preflight")
+        if r.get("closeFeePayer", "payer") != fee_payer:
+            raise ChannelError("bad_fee_payer", "the provider would open the channel with another closeFeePayer")
+
     def _pick(self, pr: dict) -> dict:
         for acc in pr.get("accepts", []):
             if scheme_accepted(acc.get("scheme")) and acc.get("network") == self.network:
@@ -1628,6 +1857,10 @@ class XbtChannelClient:
         expiry = self.height() + blocks
         p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
                                  close_fee_payer=fee_payer)
+        terms = {"capacity": cap, "expiry": expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
+                 "redeemScript": p.script.hex(), **({"closeFeePayer": fee_payer} if fee_payer != "payer" else {})}
+        # review C2 (AGP-067): the provider's answer to these exact terms before anything is funded
+        self._preflight(origin + ex["openUrl"], terms, fee_payer)
         fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
         txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
@@ -1648,10 +1881,7 @@ class XbtChannelClient:
             self.on_refund(ch.refund_hex, expiry)
         if self.on_open:
             self.on_open(ch)
-        c = {"txid": txid, "vout": vout, "capacity": cap, "expiry": expiry, "payerPub": p.payer_pub,
-             "payerSpk": p.payer_spk, "redeemScript": p.script.hex()}
-        if fee_payer != "payer":
-            c["closeFeePayer"] = fee_payer
+        c = {"txid": txid, "vout": vout, **terms}
         r = self._post(origin + ex["openUrl"], {"x402Version": 2, "network": self.network, "channel": c})
         if isinstance(r, dict) and r.get("closeFeePayer", "payer") != fee_payer:
             # a provider that did not take our terms would refuse every state we sign: stop before paying

@@ -21,6 +21,7 @@ import os
 import unittest
 
 from sechelp import ROOT, FakeNode, RegtestNode, Repro, base, load, make_provider, port_for
+from sechelp import crashed
 
 PLAIN = b"the deliverable"
 COND_PRICE = 1000
@@ -127,6 +128,7 @@ class ConditionalClose(Repro, unittest.TestCase):
         self.assertEqual(len(node.sent), 1)                                   # the close only
         node.sendrawtransaction = real
         # restart: a new provider on the same ledger (k and terms come from the ledger, not memory)
+        crashed(prov)
         prov2 = xm.XbtChannelProvider(node, 0xB0B, prov.network, prov.ledger.path, lambda m, p: 150,
                                       lambda m, p, b: (200, {}, b"ok"))
         prov2.close_due()

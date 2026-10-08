@@ -11,6 +11,7 @@ cmp-lead's M2 constraints 1-7 that a unit test can show (the regtest demo shows 
 import os
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -28,6 +29,7 @@ from xbt402.route import (AMSAT_PER_SAT, FEE_UNITS_PER_SAT, ROUTE_LOCK_PATH, Fee
                           lock_auth, next_cum, route_ok)
 from xbt402.x402_channel import b64json, request_auth, request_digest_v2  # noqa: E402
 from xbt402.channel import channel_auth_key  # noqa: E402
+from sechelp import crashed
 
 
 class _World(unittest.TestCase):
@@ -254,8 +256,14 @@ class ProviderLockChecks(_World):
         st2 = self.st2()
         rec = st2.extra["route_locks"][first["lockId"]]
         self.assertEqual((st2.best_cum, rec["secret"]), (st2.params.min_amount, first["secret"]))
+        import sqlite3
         from xbt402.ledger import Ledger
-        reloaded = Ledger(self.prov.ledger.path).channels[st2.params.channel_id]     # on disk
+        # on disk: a copy, as the live provider holds the ledger's lock (AGP-067)
+        snap = tempfile.mktemp(suffix=".sqlite")
+        src, dst = sqlite3.connect(self.prov.ledger.path), sqlite3.connect(snap)
+        src.backup(dst)
+        src.close(), dst.close()
+        reloaded = Ledger(snap).channels[st2.params.channel_id]
         self.assertEqual(reloaded.extra["route_locks"][first["lockId"]]["secret"], first["secret"])
         paid = self.prov.routes.sessions[self.sh.session].paid_sat
         st, again = self._hub_lock(route_over={"lockId": first["lockId"]},
@@ -471,6 +479,7 @@ class WatcherAndRestart(_World):
         st2 = self.st2()
         self.assertEqual(st2.best_cum, st2.params.min_amount)    # the provider did complete it
         from xbt402.hub import RouteHub
+        crashed(self.hub)
         hub2 = RouteHub(self.node, 0x4B4B, R.NET, os.path.dirname(self.hub.out.path), self.node.fund_address,
                         http=self.net.http, close_margin=36, delta=36)
         self.assertEqual(len(hub2.out.chans[self.origin].stale), 1)

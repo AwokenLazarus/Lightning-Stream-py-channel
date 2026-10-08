@@ -26,6 +26,7 @@ from sechelp import FakeNode, Repro, base  # noqa: E402
 import xbt402.x402_channel as xc  # noqa: E402
 from xbt402.channel import ChannelError  # noqa: E402
 from xbt402.tx import Tx, address_to_spk  # noqa: E402
+from sechelp import crashed
 
 ORIGIN = "http://prov.test"
 NET = "bip122:" + "11" * 16
@@ -80,6 +81,7 @@ class Rig:
 
     def restart(self, ledger=None, **kw):
         """A new provider process on `ledger` (this one's by default), the same payer."""
+        crashed(self.prov)
         r = Rig(self.xm, ledger=ledger or self.path, node=self.node, **kw)
         r.cl.channels = self.cl.channels
         return r

@@ -24,6 +24,7 @@ import routehelp as R  # noqa: E402
 from xbt402.channel import ChannelError  # noqa: E402
 from xbt402.hub import LIVE, RouteHub  # noqa: E402
 from xbt402.route import AMSAT_PER_SAT, ROUTE_LOCK_PATH  # noqa: E402
+from sechelp import crashed
 
 LOCK = 2_000                                   # 50 calls at 40 sat
 CAP = 40_000                                   # ch2 capacity in the refill tests: 20 locks
@@ -501,6 +502,7 @@ class Lifecycle(unittest.TestCase):
         w.block()
         w.block()
         d = os.path.dirname(w.hub.out.path)
+        crashed(d)
         h2 = RouteHub(w.node, 0x4B4B, R.NET, d, w.fund, http=w.net.http, **{**AHEAD, "settle_lock_multiple": 0},
                       policy=w.hub.inbound.policy, close_margin=36, delta=36, ch2_expiry_blocks=1_000, max_lock_sat=20_000)
         self.assertEqual({k: (c.state, c.p().channel_id) for k, c in h2.out.next_chans.items()},

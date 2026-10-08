@@ -21,6 +21,8 @@ import sealed_key  # noqa: E402
 from xbt402 import ecc  # noqa: E402
 from xbt402.tx import segwit_address  # noqa: E402
 from xbt402.x402_channel import XBT_MAINNET  # noqa: E402
+sys.path.insert(0, HERE)
+from sechelp import crashed  # noqa: E402
 
 MAIN_961640 = "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb"
 
@@ -58,6 +60,7 @@ class Launcher(unittest.TestCase):
 
     def build(self, node=None, **over):
         cfg = mp.load_config(self.config(**over) if over else self.cfg_path)
+        crashed(cfg["ledger"])          # each build is a new launch: the last one has exited (AGP-067)
         return mp.build(cfg, rpc=node or Node())
 
     def test_mainnet_network_is_block_961640_and_matches_the_spec(self):
