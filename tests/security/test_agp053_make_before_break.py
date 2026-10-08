@@ -273,7 +273,8 @@ class HubOff(_Roll):
     def test_hub_config_off_is_break_before_make(self):
         parent, child, _ = self.roll()
         self.assertEqual(child.state, "funded")
-        self.assertFalse([c for c in self.net.calls if c[2] == "/x402/xbt-channel/open" and c[1] == self.origin][1:])
+        # the first ch2's preflight and open (AGP-073), and none for the rollover
+        self.assertFalse([c for c in self.net.calls if c[2] == "/x402/xbt-channel/open" and c[1] == self.origin][2:])
 
 
 if __name__ == "__main__":

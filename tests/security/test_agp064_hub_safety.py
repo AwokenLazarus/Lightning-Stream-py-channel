@@ -269,13 +269,14 @@ class H2(unittest.TestCase):
         self.assertEqual(e.exception.code, "lock_pending")
         acts = w.hub.watch_tick()
         self.assertFalse(any(a.get("event") == "ch2_rollover" for a in acts), acts)
+        # AGP-073: the watcher does not wait for p0 to close that ch2 (or for its refund): it asks now
+        self.assertTrue(any(a.get("event") == "ch2_close" and a.get("why") == "written_off" for a in acts), acts)
         # the reroute is quoted above the held lock
         r = w.lock(1)
         self.assertEqual(r["status"], "paid", r)
         second = r["amount"] + r["fee"]
         self.assertGreaterEqual(w.st1().best_cum, routed0 + first + second)
-        close_now(w.provs[0].inner, w.st2(0))
-        acts = w.hub.watch_tick()
+        acts += w.hub.watch_tick()
         self.assertTrue(any(a.get("event") == "secret_from_close" for a in acts), acts)
         self.assertEqual(w.routed(), routed0 + first + second)
 
