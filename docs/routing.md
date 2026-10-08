@@ -1,5 +1,14 @@
 # xbt402 hub routing (AGP-021)
 
+> **Experimental** (AGP-064): the hub is not production-ready; do not route funds you cannot lose.
+> Since AGP-064 (external review H1, H2): a ch1 close is refused `lock_pending` while a routed lock
+> it does not cover is open; a lock completed after ch1 closed below it is not counted as routed; a
+> write-off whose ch2 pre-signature may have left stays in ch1's base (`stale_locks[].hold`) and
+> blocks routing over, and rollover of, that ch2 until the ch2 closes or is refunded (then the hold
+> is released, `released`); `max_lock_sat` defaults to 20,000 and is at most half of `ch2_capacity`.
+> The client resyncs on the `held` / `released` lists in the hub's view. Details: xbt-rs README,
+> "Hub routing safety (AGP-064)"; tests `tests/security/test_agp064_hub_safety.py`.
+
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.
 Regtest only. The script, close and watcher are those of xbt402 v1.1; the state format is v1.2's

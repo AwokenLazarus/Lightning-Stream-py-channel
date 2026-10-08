@@ -206,6 +206,11 @@ class ZeroConfCap(unittest.TestCase):
         st.suspended = True                                        # as the racing watcher tick leaves it
         r = w.lock()                                               # still unconfirmed: refused, as it must be
         self.assertEqual((r["status"], r["error"], r["detail"]), ("refused", "route_failed", "provider refused the lock: unconfirmed"), r)
+        # the provider holds that lock's pre-signature, so this ch2 takes no more routes (AGP-064 H2)
+        self.assertEqual(w.lock()["error"], "route_blocked")
+        w = self.world()
+        st = w.prov.ledger.channels[w.live.p().channel_id]
+        st.suspended = True
         w.node.mine()                                              # confirmed; no watcher tick anywhere
         time.sleep(0.35)
         w.paid()
