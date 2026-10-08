@@ -132,6 +132,21 @@ def settlement_response(receipt: dict, network: str, payer: str, success: bool) 
             "extra": {"chargedAmount": receipt["charged"], "receipt": receipt}}
 
 
+def locks_open(st) -> bool:
+    """A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
+    (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
+    have to pay on its ch2. Closing ch1 now would close below it."""
+    ex = st.extra or {}
+    if ex.get("route_lock"):
+        return True
+    def above(s) -> bool:
+        try:
+            return int(s["cum"]) > st.best_cum
+        except (KeyError, TypeError, ValueError):
+            return True
+    return any(above(s) for s in ex.get("stale_locks") or [])
+
+
 def receipt_of(resp: dict) -> dict:
     """The signed channel receipt inside a PAYMENT-RESPONSE SettlementResponse."""
     r = ((resp or {}).get("extra") or {}).get("receipt") if isinstance(resp, dict) else None
@@ -548,6 +563,10 @@ class XbtChannelProvider:
                           bytes.fromhex(req["sig"])):
             raise ChannelError("bad_sig", "close request not signed by the payer")
         with self.ledger.lock:
+            # AGP-064 (H1): a hub's route() writes its lock and lets go of the ledger before it forwards,
+            # so a close here could otherwise land between the two
+            if not st.closed_txid and locks_open(st):
+                raise ChannelError("lock_pending", "a routed lock is open on this channel")
             if req.get("payload") and not st.closed_txid:   # after the close a state changes nothing (L10)
                 self._apply(st, req["payload"])
             txid = self._close_locked(st)
@@ -569,7 +588,7 @@ class XbtChannelProvider:
             ex = st.extra or {}
             if st.closed_txid:
                 raise ChannelError("channel_closed", f"closed by {st.closed_txid}")
-            if ex.get("route_lock") or ex.get("stale_locks"):
+            if locks_open(st):
                 raise ChannelError("lock_pending", "a routed lock is open on this channel")
             if ex.get("hub"):
                 raise ChannelError("hub_channel", "a hub-funded channel is rolled over or closed by its hub")
@@ -727,6 +746,11 @@ class XbtChannelProvider:
             if st.suspended and self._zero_conf_ok(st, h):
                 st.suspended = False
         if (st.best_sig or st.cond_sig) and h >= p.expiry - self.close_margin:
+            # AGP-064: a lock in flight (seconds: the hub's revealTimeout) is let finish, in the first half
+            # of the margin only. Never for a written-off lock: a skipped margin close lets the payer
+            # refund the whole channel at expiry
+            if (st.extra or {}).get("route_lock") and h < p.expiry - (self.close_margin + 1) // 2:
+                return
             out.append(self._close_locked(st))
             if st.extra.get("cond_close"):
                 self._claim(st)           # raises (recorded in close_error) if the claim did not go out

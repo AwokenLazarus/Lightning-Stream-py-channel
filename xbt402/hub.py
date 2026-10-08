@@ -1,6 +1,8 @@
 """xbt402 routing hub (AGP-021): one client -> hub channel pays many providers through hub-funded
 hub -> provider channels, with adaptor-locked states on both hops (design: AGP-019).
 
+Experimental: not production-ready; do not route funds you cannot lose (AGP-064).
+
     client --ch1 (client pays, hub is payee)--> hub --ch2 (hub pays, provider is payee)--> provider
 
 The hub is two things at once:
@@ -187,6 +189,31 @@ def watched(r: dict) -> bool:
     return r.get("state") in NONFINAL or (r.get("state") == "dropped" and bool(r.get("fund_txid")))
 
 
+COUNTERS = (("routed_sat", "routed"), ("fee_units", "units"), ("fee_paid", "paid"))   # ch1's base, a lock's `after`
+
+
+def hold_in_base(ex: dict, lock: dict):
+    """AGP-064 (H2): a lock written off after its ch2 pre-signature left stays in ch1's base until that
+    ch2 resolves. Raise the counters to the lock's `after` and record on it what was added (`hold`),
+    so a release takes back exactly that, whatever came after."""
+    hold = {}
+    for k, a in COUNTERS:
+        cur = int(ex.get(k, 0))
+        to = max(cur, int((lock.get("after") or {}).get(a, 0)))
+        ex[k], hold[a] = to, to - cur
+    lock["hold"] = hold
+
+
+def ch1_view(st1) -> dict:
+    """ch1 as the hub counts it, for a client to resync on: the held locks, and the last ones
+    released (AGP-064)."""
+    ex = st1.extra or {}
+    return {"bestCum": st1.best_cum, "routedSat": int(ex.get("routed_sat", 0)), "feeUnits": int(ex.get("fee_units", 0)),
+            "feePaid": int(ex.get("fee_paid", 0)),
+            "held": [s["lockId"] for s in ex.get("stale_locks", []) if isinstance(s.get("hold"), dict)],
+            "released": list(ex.get("released", []))}
+
+
 def refund_booked(r: dict) -> bool:
     """The record's refund fee counts: refunded, or refunded and now `closing` on a spender that has
     not confirmed (it is un-booked only when that close confirms: AGP-045)."""
@@ -292,7 +319,7 @@ class HubConfig:
     fee_ppm: int = 2_000
     fee_strategy: dict = field(default_factory=lambda: {"kind": "flat"})
     quote_ttl: int = 600
-    max_lock_sat: int = 50_000
+    max_lock_sat: int = 20_000
     max_unguarded_lock_sat: int = 500
     delta: int = 144
     reveal_timeout: float = 10.0
@@ -335,6 +362,10 @@ class HubConfig:
     def __post_init__(self):
         if self.ch1_close_fee_payer not in FEE_PAYERS or self.ch2_close_fee_payer not in FEE_PAYERS:
             raise ValueError("ch1_close_fee_payer / ch2_close_fee_payer are payer or payee")
+        # AGP-064: a written-off lock holds the client's base and blocks its ch2 until that ch2
+        # resolves, so a lock is a small share of a ch2: at most half (the default is a fifth)
+        if self.max_lock_sat <= 0 or 2 * self.max_lock_sat > self.ch2_capacity:
+            raise ValueError(f"max_lock_sat {self.max_lock_sat} must be at most half of ch2_capacity {self.ch2_capacity}")
 
     def funding_policy(self) -> FundingPolicy:
         return FundingPolicy(**{"close_margin": self.close_margin, **self.policy})
@@ -389,7 +420,9 @@ class RouteHub:
         self._quote_seq = int(time.time())
         self.withhold = ""           # tests/demo: "" | "receipt" (keep t + r from the client) | "all"
         self.events: list = []
-        self.stats = {"routed": 0, "floor": 0, "refused": {}, "lock_ms": []}
+        # uncollected (AGP-064): locks completed after their ch1 closed below them (paid to the provider,
+        # not collected: only an operator's close or a margin close past its wait can do that)
+        self.stats = {"routed": 0, "floor": 0, "refused": {}, "lock_ms": [], "uncollected": 0}
 
     @property
     def refill(self) -> Callable[[str], "OutChannel"]:
@@ -495,7 +528,41 @@ class RouteHub:
             doc["accepts"][0]["extra"]["routing"] = self.routing_extra()
             h["PAYMENT-REQUIRED"] = b64json(doc)
             return 402, h, json.dumps(doc).encode()
+        if method == "POST" and path.split("?", 1)[0] == "/x402/xbt-channel/close":
+            try:
+                self._drop_orphan_lock(canonical_chan(json.loads(body)["chan"]))
+            except (ValueError, KeyError, TypeError, ChannelError):
+                pass                                    # the provider's close refuses it with its own error
         return self.inbound.serve(method, path, headers, body, url, max_body)
+
+    def _drop_orphan_lock(self, ch1: str):
+        """AGP-064: a ch1 lock that no route is forwarding and no ch2 holds (the hub stopped between its
+        write-ahead and the ch2 one, or the withholding test hook) can never complete: it is dropped, so
+        it does not keep ch1 from closing. Checked under the provider's mutex, which route() holds from
+        before it writes the lock until its forward ends."""
+        st1 = self.inbound.ledger.channels.get(ch1)
+        rl = (st1.extra or {}).get("route_lock") if st1 is not None else None
+        if not rl:
+            return
+        mtx = self.out.mutex_for(rl.get("provider", ""))
+        if not mtx.acquire(blocking=False):
+            return
+        try:
+            with self.out.lock:
+                held = [c for c in (self.out.chans.get(rl.get("provider")), self.out.next_chans.get(rl.get("provider")))
+                        if c is not None and c.pending.get("lockId") == rl.get("lockId")]
+            if held:
+                return
+            with self.inbound.ledger.lock:
+                ex = st1.extra or {}
+                if (ex.get("route_lock") or {}).get("lockId") != rl.get("lockId"):
+                    return
+                st1.extra = {**ex, "route_lock": None}
+                self.inbound.ledger.save(st1)
+        finally:
+            mtx.release()
+        self.events.append({"event": "orphan_lock_dropped", "chan": ch1, "lockId": rl.get("lockId"),
+                            "provider": rl.get("provider")})
 
     def http_server(self, port: int):
         return XbtChannelProvider.http_server(self, port)
@@ -554,9 +621,8 @@ class RouteHub:
                 return self._err("bad_amount", f"lock amount must be in [1, {self.max_lock_sat}]")
             floor1 = need1 <= st1.best_cum
             # our view of ch1, so a client that gave up a lock we later completed (t read off a ch2
-            # close) can resync: it adopts it only if bestCum is a state it pre-signed itself
-            view = {"bestCum": st1.best_cum, "routedSat": routed1, "feeUnits": int(ex1.get("fee_units", 0)),
-                    "feePaid": int(ex1.get("fee_paid", 0))}
+            # close), held or released can resync: it adopts only states and counters it implied itself
+            view = ch1_view(st1)
             if floor1:
                 if cum != st1.best_cum or pl.get("adaptor"):
                     return self._err("bad_amount", f"the dust floor covers this lock: cum {st1.best_cum}, no adaptor",
@@ -649,6 +715,10 @@ class RouteHub:
         unconfirmed rollover child past the provider's zero-conf bounds."""
         if oc is None or oc.pending:
             return "lock_outstanding", "a lock on this provider's ch2 is pending"
+        # AGP-064 (H2): a written-off lock's pre-signature may be out. Nothing more over this ch2 until it
+        # resolves: its close shows whether t was used, its refund that it was not
+        if oc.stale:
+            return "route_blocked", "a written-off lock on this ch2 is unresolved"
         if oc.state != "open":
             return "route_blocked", self._no_channel(oc.origin, oc)
         if oc.blocked:
@@ -765,15 +835,16 @@ class RouteHub:
                 break
             time.sleep(0.1)
         if ans is None:
-            self._void(st1, oc, lock1, "no reveal within revealTimeoutSec",
-                       block="the provider did not reveal a lock in time")
-            return self._err("route_failed", "provider did not reveal within revealTimeoutSec", status=502)
+            view = self._void(st1, oc, lock1, "no reveal within revealTimeoutSec",
+                              block="the provider did not reveal a lock in time")
+            return self._err("route_failed", "provider did not reveal within revealTimeoutSec", status=502, **view)
         if "error" in ans:
-            self._void(st1, oc, lock1, f"provider refused: {ans['error']}", block="")
+            view = self._void(st1, oc, lock1, f"provider refused: {ans['error']}", block="")
             self.stats["refused"][ans["error"]] = self.stats["refused"].get(ans["error"], 0) + 1
             code = ans["error"] if safe_code(ans["error"]) else "provider_error"
             return self._err("route_failed", f"provider refused the lock: {code}"
-                             + (f" ({ans['detail']})" if ans.get("detail") else ""), providerError=ans["error"], status=502)
+                             + (f" ({ans['detail']})" if ans.get("detail") else ""), providerError=ans["error"],
+                             status=502, **view)
         out = self._settled(st1.params.channel_id, oc, ans)
         self.stats["lock_ms"].append((time.perf_counter() - t0) * 1000)
         if out is None:
@@ -849,6 +920,9 @@ class RouteHub:
             if lock1 is None:
                 return None
             s1 = (t + int(lock1["r"], 16)) % adaptor.N
+            # ch1 closed below this lock (an operator's close, or the margin close past its wait): the
+            # provider is paid and the client is not charged. Never counted as routed (AGP-064 H1)
+            closed_below = bool(st1.closed_txid) and st1.best_cum < lock1["cum"]
             if not lock1["floor"]:
                 pre1 = adaptor.PreSig.from_json(lock1["pre"])
                 sig1 = adaptor.adapt(pre1, s1) + bytes([SIGHASH_ALL_UNIFIED])
@@ -860,11 +934,14 @@ class RouteHub:
             if stale:
                 ex["stale_locks"] = [s for s in ex.get("stale_locks", []) if s["lockId"] != lock_id]
                 ex.setdefault("recovered", []).append({**ans, "at": round(time.time(), 3)})
+                # a held lock is in the base already (AGP-064); one written off before that is counted
+                # once it is our best state
                 aft = lock1.get("after")
-                if aft and st1.best_cum == lock1["cum"]:        # it is our best state now: count it
-                    ex["routed_sat"] = max(int(ex.get("routed_sat", 0)), aft["routed"])
-                    ex["fee_units"] = max(int(ex.get("fee_units", 0)), aft["units"])
-                    ex["fee_paid"] = max(int(ex.get("fee_paid", 0)), aft["paid"])
+                if aft and not isinstance(lock1.get("hold"), dict) and st1.best_cum == lock1["cum"]:
+                    for k, a in COUNTERS:
+                        ex[k] = max(int(ex.get(k, 0)), aft[a])
+            elif closed_below:
+                ex["route_lock"] = None
             else:
                 ex["route_lock"] = None
                 ex["routed_sat"] = int(ex.get("routed_sat", 0)) + lock1["d"] + lock1["f"]
@@ -877,32 +954,93 @@ class RouteHub:
                 ex["route_done"] = done
             st1.extra = ex
             ib.ledger.save(st1)
+        if closed_below:
+            self.stats["uncollected"] += 1
+            self.events.append({"event": "lock_uncollected", "chan": ch1, "lockId": lock_id, "cum": lock1["cum"],
+                                "closedAt": st1.best_cum, "close": st1.closed_txid})
+            return ans
         self.stats["routed"] += 1
         if lock1["floor"]:
             self.stats["floor"] += 1
         return ans
 
-    def _void(self, st1, oc: OutChannel, lock1: dict, why: str, block: str):
-        """Write both locks off (kept for on-chain recovery). A later plain or locked state above them
-        dominates them; until then a late completion costs the hub at most this one lock."""
+    def _void(self, st1, oc: OutChannel, lock1: dict, why: str, block: str) -> dict:
+        """Write both locks off. If the ch2 pre-signature may have left (the lock was pending on ch2),
+        they are kept for on-chain recovery, and ch1's lock stays in its base until that ch2 resolves
+        (AGP-064 H2): a later lock is quoted above it, so a t read off the ch2 close later still
+        collects, and routing over that ch2 or rolling it over waits. Otherwise nothing can complete
+        the lock and ch1's is dropped. Returns ch1's view for the client when the lock is held."""
         ib = self.inbound
         with self.out.lock:
+            pend_id = None
             if oc.pending:
+                # a ch2 already resolved for good (its close or refund confirmed) can pay nothing more
+                pend_id = None if oc.final else oc.pending.get("lockId")
                 oc.stale.append({**oc.pending, "voided": round(time.time(), 3), "why": why})
                 oc.pending = {}
             if block:
                 oc.blocked = block
             self.out.save()
+        view, held = {}, False
         with ib.ledger.lock:
             st1 = ib.ledger.channels[st1.params.channel_id]
             ex = st1.extra or {}
-            if ex.get("route_lock"):
-                ex.setdefault("stale_locks", []).append({**ex["route_lock"], "voided": round(time.time(), 3)})
+            rl = ex.get("route_lock")
+            if rl:
                 ex["route_lock"] = None
+                if pend_id is not None and rl.get("lockId") == pend_id:
+                    rl = {**rl, "voided": round(time.time(), 3)}
+                    hold_in_base(ex, rl)
+                    ex.setdefault("stale_locks", []).append(rl)
+                    held = True
             st1.extra = ex
             ib.ledger.save(st1)
+            if held:
+                view = ch1_view(st1)
         self.events.append({"event": "void", "provider": oc.origin, "lockId": lock1.get("lockId"), "why": why,
-                            "blocked": bool(block)})
+                            "blocked": bool(block), "held": held})
+        return view
+
+    def _release_unpaid(self, locks: list) -> list:
+        """AGP-064: written-off locks whose ch2 resolved without paying them (a confirmed refund, a
+        confirmed close that does not reveal their t). Each (ch1, lockId) leaves ch1's stale_locks, and
+        its hold leaves the base: the client is quoted below its best state again (the floor), so what
+        it paid ahead for that lock pays its next ones. The lockId goes on ch1's `released` list, the
+        last 64, for the client to resync on."""
+        out, ib = [], self.inbound
+        with ib.ledger.lock:
+            for ch1, lid in locks:
+                st1 = ib.ledger.channels.get(ch1)
+                if st1 is None:
+                    continue
+                ex = st1.extra or {}
+                gone = next((s for s in ex.get("stale_locks", []) if s.get("lockId") == lid), None)
+                if gone is None:
+                    continue
+                ex["stale_locks"] = [s for s in ex["stale_locks"] if s is not gone]
+                ev = {"event": "lock_released", "chan": ch1, "lockId": lid, "held": False}
+                hold = gone.get("hold")
+                if isinstance(hold, dict):
+                    for k, a in COUNTERS:
+                        ex[k] = max(0, int(ex.get(k, 0)) - int(hold.get(a, 0)))
+                    ex["released"] = (list(ex.get("released", [])) + [lid])[-64:]
+                    ev.update(held=True, hold=hold)
+                st1.extra = ex
+                ib.ledger.save(st1)
+                out.append(ev)
+        self.events.extend(out)
+        return out
+
+    def _release_stale(self, oc: OutChannel) -> list:
+        """Release the written-off locks still on `oc` (its ch2 resolved without revealing them) and
+        clear them from the ch2 record."""
+        with self.out.lock:
+            locks = [(s.get("ch1"), s.get("lockId")) for s in oc.stale]
+            if not locks:
+                return []
+            oc.stale = []
+            self.out.save()
+        return self._release_unpaid(locks)
 
     # --- hub-funded ch2 -----------------------------------------------------------------------------
     def ch2_terms(self, terms: dict, capacity: int = None, expiry_blocks: int = None) -> tuple:
@@ -1245,6 +1383,10 @@ class RouteHub:
         """One tx pays the provider its balance and funds the next ch2 (rollover instead of close). The
         next ch2's key is written ahead (`oc.next`), and its funding txid is known before the request
         leaves, so a lost answer is finished by the watcher when that tx spends the funding."""
+        # AGP-064 (H2): a rollover spends the funding a written-off lock's pre-signature is on, and its
+        # secret could no longer be read off a close
+        if oc.pending or oc.stale:
+            raise ChannelError("lock_pending", "a lock on this ch2 is pending or written off and unresolved")
         p = oc.p()
         amount = oc.signed
         next_cap = p.rollover_next_capacity(amount)      # payee-pays: capacity - amount, the fee is the provider's
@@ -1723,6 +1865,8 @@ class RouteHub:
                                block="the provider did not reveal a lock in time")
                     out.append({"event": "lock_written_off", "provider": oc.origin})
             return out
+        if oc.stale:
+            return out          # AGP-064: no rollover until the written-off locks resolve (the provider's close, or the refund)
         # settlement: the provider's net payout >= its settleMultiple x closeFee (on a payee-pays ch2 the
         # close fee is the provider's, so it counts against the payout), or near ch2's close margin as
         # the provider counts it (it co-signs only then): roll over. Past expiry the refund took over.
@@ -1847,6 +1991,7 @@ class RouteHub:
                       "txid": spender, "fee": fee, "versions": len(oc.refund_prev) + 1}
                 self.events.append(ev)
                 out.append(ev)
+                out += self._release_stale(oc)              # the refund proves the written-off locks unpaid
             elif self._bump_due(oc, tip):                   # stuck in the mempool: replace it at a higher fee
                 out += self._refund(oc, tip)
             return out
@@ -1877,6 +2022,7 @@ class RouteHub:
               **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
         self.events.append(ev)
         out.append(ev)
+        out += self._release_stale(oc)          # a confirmed close that did not reveal a written-off lock's t did not pay it
         return out
 
     def _rollover_gone(self, oc: OutChannel, p: ChannelParams) -> Optional[list]:

@@ -87,7 +87,9 @@ class RoutePayer:
         self.shards: Dict[str, Shard] = {}
         self.routed = self.fee_units = self.fee_paid = self.signed = 0
         self.pending: dict = {}
-        self.given_up: list = []          # recent voided locks: {cum, after: (routed, units, paid)}
+        # recent voided locks: {cum, lockId, before/after: (routed, units, paid), floor, held}; `held`: the
+        # hub keeps it in ch1's base until its ch2 resolves (AGP-064), our counters are its `after`
+        self.given_up: list = []
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
@@ -247,30 +249,68 @@ class RoutePayer:
     def _void(self, p: dict, why: str):
         if not p["floor"]:
             self.signer.void_lock(self.chan)
-            self.given_up = (self.given_up + [{"cum": p["cum"], "lockId": p["lockId"], "d": p["d"], "f": p["f"],
-                                               "after": (self.routed + p["d"] + p["f"], p["units"],
-                                                         self.fee_paid + p["f"])}])[-16:]
+        self.given_up.append({"cum": p["cum"], "lockId": p["lockId"], "d": p["d"], "f": p["f"], "floor": p["floor"],
+                              "held": False, "before": (self.routed, self.fee_units, self.fee_paid),
+                              "after": (self.routed + p["d"] + p["f"], p["units"], self.fee_paid + p["f"])})
+        if len(self.given_up) > 16:
+            # a held lock is kept until its release or completion: without it a release could not be adopted
+            i = next((i for i, g in enumerate(self.given_up) if not g.get("held")), 0)
+            del self.given_up[i]
         self.pending = {}
         self.stats["voided"] += 1
         self.events.append({"event": "void", "provider": p["shard"].origin, "lockId": p["lockId"], "amount": p["d"],
                             "why": why})
 
     def _resync(self, doc: dict) -> bool:
-        """The hub completed a lock we had given up (it read t off the provider's ch2 close). Adopt
-        its view only if its best state is one of those locks, with the counters it implied."""
+        """Adopt a hub view of ch1 ({bestCum, routedSat, feeUnits, feePaid, held, released}) only when it
+        is one of our given-up locks, at the counters it implied:
+          completed: the hub read t off the provider's ch2 close; its best state is that lock;
+          held (AGP-064): its ch2 pre-signature may be out, so the hub keeps it in the base until that
+            ch2 resolves; our counters become its `after`, our signed state stays;
+          released: its ch2 resolved unpaid; the hold leaves our counters, so our next locks are quoted
+            below our signed state (the dust floor) until what we paid ahead for it is used."""
         try:
             best = int(doc["bestCum"])
-            view = (int(doc["routedSat"]), int(doc["feeUnits"]), int(doc["feePaid"]))
+            hub = (int(doc["routedSat"]), int(doc["feeUnits"]), int(doc["feePaid"]))
         except (KeyError, TypeError, ValueError):
             return False
-        g = next((g for g in self.given_up if g["cum"] == best and tuple(g["after"]) == view), None)
-        if g is None or best <= self.signed:
+        ours = (self.routed, self.fee_units, self.fee_paid)
+
+        def listed(k: str, lid: str) -> bool:
+            v = doc.get(k)
+            return isinstance(v, list) and lid in v
+
+        if best > self.signed:
+            g = next((g for g in self.given_up if not g.get("floor") and g["cum"] == best
+                      and (tuple(g["after"]) == hub or (g.get("held") and hub == ours))), None)
+            if g is None:
+                return False
+            self.signer.adopt_lock(self.chan, best)
+            self.routed, self.fee_units, self.fee_paid = hub
+            self.signed = best
+            self.given_up = [x for x in self.given_up if x is not g]
+            self.events.append({"event": "resync", "lockId": g["lockId"], "cum1": best})
+            return True
+        if best != self.signed or hub == ours:
             return False
-        self.signer.adopt_lock(self.chan, best)
-        self.routed, self.fee_units, self.fee_paid = view
-        self.signed = best
-        self.given_up = [x for x in self.given_up if x is not g]
-        self.events.append({"event": "resync", "lockId": g["lockId"], "cum1": best})
+        gone = [g for g in self.given_up if g.get("held") and listed("released", g["lockId"])]
+        if gone:
+            want = list(ours)
+            for g in gone:
+                for i in range(3):
+                    want[i] = max(0, want[i] - max(0, g["after"][i] - g["before"][i]))
+            if tuple(want) == hub:
+                self.routed, self.fee_units, self.fee_paid = hub
+                self.given_up = [x for x in self.given_up if not any(x is g for g in gone)]
+                self.events.append({"event": "resync_release", "lockIds": [g["lockId"] for g in gone], "routedSat": hub[0]})
+                return True
+        g = next((g for g in self.given_up if not g.get("held") and tuple(g.get("before") or ()) == ours
+                  and tuple(g["after"]) == hub and listed("held", g["lockId"])), None)
+        if g is None:
+            return False
+        g["held"] = True
+        self.routed, self.fee_units, self.fee_paid = hub
+        self.events.append({"event": "resync_hold", "lockId": g["lockId"], "routedSat": hub[0]})
         return True
 
     @property
@@ -365,6 +405,8 @@ class RoutePayer:
                     return {"status": "paid", "amount": d, "fee": f, "lockId": p["lockId"], "via": "provider"}
                 self.stats["refused"][code] = self.stats["refused"].get(code, 0) + 1
                 self._void(p, f"hub: {code}")
+                if "held" in doc:
+                    self._resync(doc)       # AGP-064: the hub keeps this lock in ch1's base until its ch2 resolves
                 # the hub's reason, as the Rust RoutePayer returns it (AGP-056): free text, for logs
                 detail = doc.get("detail")
                 return {"status": "refused", "error": code, "detail": detail if isinstance(detail, str) else ""}

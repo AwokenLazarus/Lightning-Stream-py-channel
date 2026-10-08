@@ -99,8 +99,13 @@ class MakeBeforeBreak(_Roll):
         r = self.pay.lock(self.sh)
         self.assertEqual(r.get("error"), "route_failed", r)
         self.assertEqual(self.hub.stats["refused"].get("zero_conf_cap"), 1)
+        # the provider holds the refused lock's pre-signature: the child is not routed over again (AGP-064)
+        R.stream(self.pay, self.sh, 1)
+        self.assertEqual(self.pay.lock(self.sh).get("error"), "route_blocked")
         # at the parent's close margin the provider takes nothing more on the unconfirmed child (here
         # parent and child expire together, so the margin is moved rather than the tip)
+        self.setUp()
+        parent, child, _ = self.roll()
         st = self.child_st(child)
         with self.prov.ledger.lock:
             st.extra = {**st.extra, "zero_conf": {**st.extra["zero_conf"], "until": self.node.height}}
