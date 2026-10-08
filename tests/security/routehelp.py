@@ -256,7 +256,7 @@ def route_request(pay, sh, *, tamper=None):
     pay.ch.seq += 1
     pl["seq"] = pay.ch.seq
     body = json.dumps({"route": route}).encode()
-    pay.cc._auth(pay.ch, pl, "POST", "/x402/route", body)
+    pay.cc._auth(pay.ch, pl, "POST", HUB + "/x402/route", body)
     if mode == "noauth":
         pl["auth"] = "00" * 32
     st, _, raw = pay.http("POST", HUB + "/x402/route", body,

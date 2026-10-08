@@ -22,10 +22,10 @@ def api(method, path, body):
     return 200, {"Content-Type": "text/plain"}, b"api " + method.encode() + b" " + path.encode()
 
 
-def paid_header(xm, cm, prov, p, payer, method, path, body, seq=1):
+def paid_header(xm, cm, prov, p, payer, method, path, body, seq=1, origin=""):
     pl = {"chan": p.channel_id, "seq": seq, "cum": str(1000 * seq), "sig": payer.sign_state(1000 * seq).hex()}
     if hasattr(cm, "channel_auth_key"):            # unpatched wave 2 has no request auth (H3)
-        pl = authed(xm, cm, payer, p.payee_pub, pl, method=method, path=path, body=body)
+        pl = authed(xm, cm, payer, p.payee_pub, pl, method=method, path=origin + path, body=body)
     return xm.b64json({"x402Version": 2, "accepted": prov.requirements(PRICE), "payload": pl})
 
 
@@ -76,13 +76,13 @@ class RouteShadowing(Repro, unittest.TestCase):
         self.assertEqual((st, json.loads(out)["invalidReason"]), (200, "invalid_batch_settlement_xbt_signature"))
         self.assertEqual(prov.serve("GET", "/x402/verify", {}, b"")[0], 405)
 
-    def check_transport(self, send):
-        """`send(method, path, body, headers) -> (status, body)` over a real transport."""
+    def check_transport(self, send, origin):
+        """`send(method, path, body, headers) -> (status, body)` over a real transport reached at `origin`."""
         xm, cm = load("x402_channel"), load("channel")
         prov, p, payer = self.provider(xm, cm)
         st, out = send(prov, "POST", "/verify", BODY, {})
         self.assertEqual(st, 402)
-        hdr = paid_header(xm, cm, prov, p, payer, "POST", "/verify", BODY)
+        hdr = paid_header(xm, cm, prov, p, payer, "POST", "/verify", BODY, origin=origin)
         self.assertEqual(send(prov, "POST", "/verify", BODY, {"PAYMENT-SIGNATURE": hdr}), (200, b"api POST /verify"))
         st, out = send(prov, "GET", "/x402/supported", b"", {})
         self.assertEqual((st, json.loads(out)["kinds"][0]["network"]), (200, prov.network))
@@ -107,7 +107,7 @@ class RouteShadowing(Repro, unittest.TestCase):
                     return r.status, r.read()
             except urllib.error.HTTPError as e:
                 return e.code, e.read()
-        self.check_transport(send)
+        self.check_transport(send, f"http://127.0.0.1:{port_for('l6')}")
 
     def test_fixed_asgi_transport(self):
         try:
@@ -122,7 +122,7 @@ class RouteShadowing(Repro, unittest.TestCase):
                 clients["c"] = TestClient(asgi.asgi_app(prov))
             r = clients["c"].request(method, path, content=body, headers=headers)
             return r.status_code, r.content
-        self.check_transport(send)
+        self.check_transport(send, "http://testserver")
 
 
 if __name__ == "__main__":

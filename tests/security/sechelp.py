@@ -158,7 +158,7 @@ def authed(xc, ch, payer, prov_payee_pub, payload, method="GET", path="/v1/x", b
     key = ch.channel_auth_key(payer.secret, bytes.fromhex(prov_payee_pub))
     payload = dict(payload)
     payload["auth"] = xc.request_auth(key, payload["chan"], payload["seq"], payload["cum"], payload.get("sig"),
-                                      xc.request_digest(method, path, body))
+                                      xc.request_digest_v2(method, path, body))
     return payload
 
 

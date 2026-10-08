@@ -34,7 +34,7 @@ from .channel import ChannelError
 from .route import (AMSAT_PER_SAT, HUB_ROUTE_PATH, FeeQuote, Invoice, PriceQuote, call_auth, ceil_div, fee_due,
                     lock_auth, next_cum, session_key, state_verify)
 from .signer import ChannelSigner
-from .x402_channel import XbtChannelClient, b64json, request_digest, unb64json
+from .x402_channel import XbtChannelClient, b64json, request_digest_v2, unb64json
 
 
 @dataclass
@@ -157,7 +157,7 @@ class RoutePayer:
             sh.seq += 1
             seq = sh.seq
         hdr = b64json({"session": sh.session, "seq": seq,
-                       "auth": call_auth(sh.key, sh.session, seq, request_digest(method, sh.path, body))})
+                       "auth": call_auth(sh.key, sh.session, seq, request_digest_v2(method, sh.url, body))})
         t0 = time.perf_counter()
         st, rh, out = self.http(method, sh.url, body, {"ROUTE-AUTH": hdr})
         sh.call_ms.append((time.perf_counter() - t0) * 1000)
@@ -363,7 +363,7 @@ class RoutePayer:
             body = json.dumps({"route": route}).encode()
             self.ch.seq += 1
             pl["seq"] = self.ch.seq
-            self.cc._auth(self.ch, pl, "POST", HUB_ROUTE_PATH, body)
+            self.cc._auth(self.ch, pl, "POST", self.hub_url + HUB_ROUTE_PATH, body)
         try:
             st, _, raw = self.http("POST", self.hub_url + HUB_ROUTE_PATH, body,
                                    {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": self.ch.accepted,

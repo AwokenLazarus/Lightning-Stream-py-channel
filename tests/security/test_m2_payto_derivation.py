@@ -98,10 +98,10 @@ class PayToDerivationV11(unittest.TestCase):
 
     def test_fixed_client_refuses_other_derivations_before_funding(self):
         prov = make_provider(self.xp, FakeNode())
-        self.assertEqual(prov.requirements(150)["extra"]["derivation"], "v2")
+        self.assertEqual(prov.requirements(150)["extra"]["derivation"], "v3")
         funded = []
         c = self.xp.XbtChannelClient(prov.network, lambda addr, sats: funded.append(addr), lambda: 1000)
-        for derivation in (None, "v1", "v3"):
+        for derivation in (None, "v1", "v2"):
             acc = prov.requirements(150)
             acc["extra"].pop("derivation")
             if derivation:

@@ -26,7 +26,7 @@ from xbt402 import adaptor, ecc  # noqa: E402
 from xbt402.channel import DUST  # noqa: E402
 from xbt402.route import (AMSAT_PER_SAT, FEE_UNITS_PER_SAT, ROUTE_LOCK_PATH, FeeQuote, ceil_div, fee_due,  # noqa: E402
                           lock_auth, next_cum, route_ok)
-from xbt402.x402_channel import b64json, request_auth, request_digest  # noqa: E402
+from xbt402.x402_channel import b64json, request_auth, request_digest_v2  # noqa: E402
 from xbt402.channel import channel_auth_key  # noqa: E402
 
 
@@ -208,7 +208,7 @@ class ProviderLockChecks(_World):
         pl.update(pl_over or {})
         body = json.dumps({"route": route}).encode()
         key = channel_auth_key(int(oc.secret, 16), bytes.fromhex(p2.payee_pub))
-        pl["auth"] = request_auth(key, p2.channel_id, oc.seq, pl["cum"], None, request_digest("POST", ROUTE_LOCK_PATH, body))
+        pl["auth"] = request_auth(key, p2.channel_id, oc.seq, pl["cum"], None, request_digest_v2("POST", self.origin + ROUTE_LOCK_PATH, body))
         st, _, raw = self.net.http("POST", self.origin + ROUTE_LOCK_PATH, body,
                                    {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": {}, "payload": pl})})
         return st, json.loads(raw)

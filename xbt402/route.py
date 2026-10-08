@@ -659,9 +659,10 @@ class RouteSeller:
                 "invoice": self.invoice(s)}
         return state_sign(self.p.secret, body)
 
-    def begin_call(self, path: str, hdr: str, method: str, req_path: str, body: bytes):
-        """Authenticate a routed call. Returns (session, None) to serve or (session|None, error)."""
-        from .x402_channel import request_digest, unb64json
+    def begin_call(self, path: str, hdr: str, method: str, bind: str, body: bytes):
+        """Authenticate a routed call. Returns (session, None) to serve or (session|None, error).
+        `bind` is the request's URL as request_digest_v2 binds it."""
+        from .x402_channel import request_digest_v2, unb64json
         try:
             h = unb64json(hdr)
             sid, seq, auth = str(h["session"]), int(h["seq"]), str(h["auth"])
@@ -671,7 +672,7 @@ class RouteSeller:
             s = self.sessions.get(sid)
             if s is None or s.path != path:
                 return None, "unknown_session"
-            want = call_auth(self._key(s), s.session, seq, request_digest(method, req_path, body))
+            want = call_auth(self._key(s), s.session, seq, request_digest_v2(method, bind, body))
             if seq <= s.seq or not hmac.compare_digest(want, auth):
                 return None, "bad_auth"
             s.seq = seq

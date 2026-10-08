@@ -53,7 +53,7 @@ class BearerPayload(Repro, unittest.TestCase):
         other = authed(xp, cp, payer, p.payee_pub, {"chan": p.channel_id, "seq": 2, "cum": "3000"}, path="/v1/a")
         self.assertEqual(pay(xp, prov, other, path="/v1/b")[1], "bad_auth")   # bound to the request
         wrong_key = dict(other, auth=xp.request_auth(b"\x00" * 32, p.channel_id, 2, "3000", None,
-                                                     xp.request_digest("GET", "/v1/a", b"")))
+                                                     xp.request_digest_v2("GET", "/v1/a", b"")))
         self.assertEqual(pay(xp, prov, wrong_key, path="/v1/a")[1], "bad_auth")
         self.assertEqual(pay(xp, prov, other, path="/v1/a")[0], 200)
         self.assertEqual(prov.ledger.channels[p.channel_id].spent_msat, 2 * PRICE * 1000)

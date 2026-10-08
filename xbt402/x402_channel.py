@@ -1,8 +1,9 @@
 """x402 v2 scheme `batch-settlement` (XBT channel binding; `xbt-channel` accepted as an alias): HTTP 402 payments over XBT Spillman channels (xbt402 v1.1).
 
 Spec: docs/x402/xbt402-spec-v1.1-draft.md (was ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402
-HTTP 402 payment channels.md). v1.1: the payee key commits to the network (extra.derivation "v2"),
-PAYMENT-RESPONSE is an x402 SettlementResponse, /x402/verify and /x402/settle take and answer the x402
+HTTP 402 payment channels.md). v1.1: the payee key commits to the network. v1.3 (AGP-068,
+extra.derivation "v3"): a payment binds the request's scheme, host and port with length-prefixed
+fields, and the receipt covers the answer's status and body. PAYMENT-RESPONSE is an x402 SettlementResponse, /x402/verify and /x402/settle take and answer the x402
 v2 facilitator shapes.
 
   402 + PAYMENT-REQUIRED: base64(PaymentRequired)      (same JSON in the body)
@@ -12,7 +13,7 @@ v2 facilitator shapes.
       amount: "<sats per call, max>", asset: "XBT:sat", payTo: "<33-byte compressed pubkey hex>",
       maxTimeoutSeconds, extra: {minCapacity, maxCapacity, minExpiryBlocks, maxExpiryBlocks,
       closeMarginBlocks, minConf, closeFeeSat, openUrl, closeUrl, billing: "postpay"|"prepay",
-      derivation: "v2", assetTransferMethod: "channel",
+      derivation: "v3", assetTransferMethod: "channel",
       closeFeePayer?: "payer"|"payee" (v1.2, absent = payer)}}
       payee key P = payTo + t*G, t = H("xbt-channel/payee/v2", len8(network) network payTo A LE32(expiry))
 
@@ -21,10 +22,13 @@ v2 facilitator shapes.
   pay:    PAYMENT-SIGNATURE: base64({x402Version: 2, accepted: <requirements>,
           payload: {chan, seq, cum, sig?, auth}})  sig = payer DER || 0x21 over the state for cum
           auth = HMAC-SHA256(tagged_hash("xbt402/auth-key", ECDH(A, P)),
-                 "xbt402/auth|chan|seq|cum|sig|sha256(method|path|body)"), seq above every earlier one
+                 "xbt402/auth|chan|seq|cum|sig|req"), seq above every earlier one,
+          req = hex(tagged_hash("xbt402/req/v2", f(method) f(scheme) f(host) f(port) f(target) f(body))),
+          f(x) = LE64(len(x)) x  (request_digest_v2)
   result: PAYMENT-RESPONSE: base64(SettlementResponse {success, transaction: "", network, payer: A,
           amount: "", extra: {chargedAmount, receipt: {scheme, chan, seq, cum, charged, spentMsat,
-          owedMsat, creditMsat, expiry, req, sig}}})  sig = receipt by the channel payee key
+          owedMsat, creditMsat, expiry, req, status, bodyHash, sig}}})  sig = receipt by the channel
+          payee key over tagged_hash("xbt402/receipt/v2", f(chan) … f(bodyHash)); bodyHash = sha256(body)
   close:  POST extra.closeUrl {chan, sig, payload?}  sig = payer over tagged_hash("xbt402/close", chan);
           payload = a final state paying what is owed (postpay)
   facilitator: GET /x402/supported, POST /x402/verify and /x402/settle with {x402Version,
@@ -39,6 +43,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -60,6 +65,12 @@ SCHEME = "batch-settlement"
 SCHEME_ALIAS = "xbt-channel"                                # one-release input alias; emit SCHEME
 ASSET_TRANSFER_METHOD = "channel"
 MAX_BODY = 1 << 20                                          # default bytes per request body (overridable)
+MAX_RESPONSE = 64 << 20                                     # a payer never buffers more than this (review T3)
+HEAD_DEADLINE = 10                                          # a header that never finishes (review T1)
+BODY_DEADLINE = 30                                          # a body that never arrives holds a slot until this
+MAX_HEADER_LINE = 8 * 1024
+MAX_HEADERS = 32 * 1024
+MAX_CONNECTIONS = 64
 
 
 def scheme_accepted(s) -> bool:
@@ -77,8 +88,71 @@ def unb64json(s: str):
     return json.loads(base64.b64decode(s))
 
 
-def request_digest(method: str, path: str, body: bytes) -> str:
-    return hashlib.sha256(method.encode() + b"|" + path.encode() + b"|" + body).hexdigest()
+def _alower(s: str) -> str:
+    return "".join(c.lower() if "A" <= c <= "Z" else c for c in s)
+
+
+def request_url(url: str):
+    """(scheme, host, port, target) of `scheme://host[:port]target` as request_digest_v2 binds them:
+    scheme and host lowercased (ASCII), an IPv6 literal kept in brackets, userinfo and a fragment
+    dropped, the port in decimal without leading zeros or the scheme's default (80 http, 443 https),
+    the target as sent ("/" when the URL has no path). Without "://" it is a bare target, which
+    binds no origin."""
+    if "://" not in url:
+        return "", "", "", url
+    scheme, rest = url.split("://", 1)
+    rest = rest.split("#", 1)[0]
+    ends = [i for i in (rest.find("/"), rest.find("?")) if i >= 0]
+    end = min(ends) if ends else len(rest)
+    authority, tail = rest[:end], rest[end:]
+    authority = authority.rsplit("@", 1)[-1]
+    if authority.startswith("[") and "]" in authority:
+        i = authority.index("]")
+        host, port = authority[:i + 1], authority[i + 1:]
+        port = port[1:] if port.startswith(":") else ""
+    elif ":" in authority:
+        host, port = authority.rsplit(":", 1)
+    else:
+        host, port = authority, ""
+    scheme = _alower(scheme)
+    if port and all(c in "0123456789" for c in port) and int(port) <= 0xFFFF:
+        port = str(int(port))
+    elif not port:
+        port = {"http": "80", "https": "443"}.get(scheme, "")
+    target = tail if tail.startswith("/") else "/" + tail
+    return scheme, _alower(host), port, target
+
+
+def url_origin(url: str) -> str:
+    """`scheme://authority` of an absolute URL, or "" for a bare target."""
+    i = url.find("://")
+    if i < 0:
+        return ""
+    rest = url[i + 3:]
+    ends = [j for j in (rest.find("/"), rest.find("?"), rest.find("#")) if j >= 0]
+    return url[:i + 3 + (min(ends) if ends else len(rest))]
+
+
+def _fields(*xs: bytes) -> bytes:
+    """LE64(len(x)) ‖ x for each field: no two field lists share an encoding."""
+    return b"".join(len(x).to_bytes(8, "little") + x for x in xs)
+
+
+def request_digest_v2(method: str, url: str, body: bytes) -> str:
+    """Which request a payment or receipt is for (AGP-068, review T2): hex of
+    tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body)),
+    f(x) = LE64(len(x)) ‖ x. `url` is the absolute URL the payer sent the request to; the server
+    rebuilds it from its public scheme, the Host header and the request target. v1,
+    sha256(method|path|body), ran its fields together and bound no origin."""
+    scheme, host, port, target = request_url(url)
+    return tagged_hash("xbt402/req/v2", _fields(method.encode(), scheme.encode(), host.encode(), port.encode(),
+                                                target.encode(), body)).hex()
+
+
+def binding_url(url: str, path: str) -> str:
+    """What a server binds a request's payment to: the origin it was reached at and the target it
+    routes on. A `url` without an origin binds the target alone."""
+    return url_origin(url) + path
 
 
 def unsafe_headers(hdrs: dict) -> bool:
@@ -94,9 +168,18 @@ def request_auth(key: bytes, chan: str, seq, cum, sig, req: str) -> str:
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
+RECEIPT_FIELDS = ("chan", "seq", "cum", "charged", "spentMsat", "req", "status", "bodyHash")
+
+
 def receipt_message(r: dict) -> bytes:
-    keys = ("chan", "seq", "cum", "charged", "spentMsat", "req")
-    return tagged_hash("xbt402/receipt", "|".join(str(r[k]) for k in keys).encode())
+    """tagged_hash("xbt402/receipt/v2", f(chan) ‖ f(seq) ‖ … ‖ f(bodyHash)), each field as str(),
+    f(x) = LE64(len(x)) ‖ x. AGP-068 adds the answer's status and bodyHash (review T4)."""
+    return tagged_hash("xbt402/receipt/v2", _fields(*(str(r[k]).encode() for k in RECEIPT_FIELDS)))
+
+
+def body_hash(body: bytes) -> str:
+    """A receipt's bodyHash: hex sha256 of the answer's body exactly as sent."""
+    return hashlib.sha256(body).hexdigest()
 
 
 def close_message(chan: str) -> bytes:
@@ -523,8 +606,9 @@ class XbtChannelProvider:
             raise ChannelError("unknown_channel")
         return st
 
-    def _authentic(self, st: ChannelState, pl: dict, method: str, path: str, body: bytes) -> bool:
-        """payload.auth is the channel's HMAC over this request and a seq above every earlier one."""
+    def _authentic(self, st: ChannelState, pl: dict, method: str, bind: str, body: bytes) -> bool:
+        """payload.auth is the channel's HMAC over this request and a seq above every earlier one.
+        `bind` is the request's URL as request_digest_v2 binds it (binding_url)."""
         try:
             seq = int(pl["seq"])
         except (KeyError, TypeError, ValueError):
@@ -537,7 +621,7 @@ class XbtChannelProvider:
             self._auth_keys[cid] = channel_auth_key(
                 self._chan_secret(p), bytes.fromhex(p.payer_pub))
         want = request_auth(self._auth_keys[cid], cid, seq, pl.get("cum"), pl.get("sig"),
-                            request_digest(method, path, body))
+                            request_digest_v2(method, bind, body))
         return hmac.compare_digest(want, str(pl.get("auth", "")))
 
     def _apply(self, st: ChannelState, pl: dict):
@@ -974,7 +1058,7 @@ class XbtChannelProvider:
         return {"chan": p.channel_id, "txid": txid, "amount": amount, "nextChan": f"{txid}:1",
                 "nextCapacity": next_cap}
 
-    def _route_lock(self, method: str, path: str, headers: dict, body: bytes):
+    def _route_lock(self, method: str, bind: str, headers: dict, body: bytes):
         """POST /x402/xbt-channel/lock: a hub's adaptor-locked state on its ch2 to us. Authenticated
         like a paid call (the hub's channel HMAC covers the JSON body with the route terms)."""
         def err(code, detail="", status=400):
@@ -994,7 +1078,7 @@ class XbtChannelProvider:
                 st = None
             if not st:
                 return err("unknown_channel")
-            if not self._authentic(st, pl, method, path, body):
+            if not self._authentic(st, pl, method, bind, body):
                 return err("bad_auth", status=401)
             st.seq = int(pl["seq"])
             if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
@@ -1031,7 +1115,7 @@ class XbtChannelProvider:
     def _routed_call(self, method: str, path: str, path_key: str, hdr: str, body: bytes, url: str):
         from .route import AMSAT_PER_MSAT  # noqa: F401
         o = self.routes.offers[path_key]
-        s, error = self.routes.begin_call(path_key, hdr, method, path, body)
+        s, error = self.routes.begin_call(path_key, hdr, method, binding_url(url, path), body)
         if error:
             st, h, b = self._payment_required(url, self.price(method, path), error)
             doc = json.loads(b)
@@ -1107,10 +1191,11 @@ class XbtChannelProvider:
             except (ChannelError, KeyError, ValueError, TypeError, AttributeError, OverflowError) as e:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
+        bind = binding_url(url, path)
         if path == "/x402/xbt-channel/lock":
             if method != "POST":
                 return 405, {}, b"method not allowed"
-            return self._route_lock(method, path, headers, body)
+            return self._route_lock(method, bind, headers, body)
         if path == "/x402/xbt-channel/terms" and method == "GET":
             return 200, {"Content-Type": "application/json"}, json.dumps(self.terms()).encode()
         if path.startswith("/x402/xbt-channel/"):
@@ -1171,24 +1256,30 @@ class XbtChannelProvider:
                 st = None
             if not st:
                 return self._payment_required(url, price, "unknown_channel")
-            if not self._authentic(st, pl, method, path, body):   # no channel details for strangers
+            if not self._authentic(st, pl, method, bind, body):   # no channel details for strangers
                 return self._payment_required(url, price, "bad_auth")
             st.seq = int(pl["seq"])                               # spent, whatever happens next
-            if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
-                return self._payment_required(url, price, "channel_closing", st)
+
+            def refuse(error):
+                # every refusal is durable: the seq it spent, and a higher state that still does not
+                # cover this call (review T4: a seq kept only in memory came back after a restart,
+                # and the refused header with it)
+                self.ledger.save(st)
+                return self._payment_required(url, price, error, st)
+            try:
+                height = self.height()
+            except BaseException:
+                self.ledger.save(st)
+                raise
+            if st.closed_txid or height >= st.params.expiry - self.close_margin:
+                return refuse("channel_closing")
             if st.suspended:
-                return self._payment_required(url, price, "unconfirmed", st)
-            best = st.best_cum
+                return refuse("unconfirmed")
             try:
                 if not pl.get("hashlock"):
                     self._apply(st, pl)
             except (ChannelError, ValueError, TypeError, KeyError) as e:
-                return self._payment_required(url, price, getattr(e, "code", "bad_payload"), st)
-
-            def refuse(error):
-                if st.best_cum != best:   # a higher state that still does not cover this call: keep it
-                    self.ledger.save(st)
-                return self._payment_required(url, price, error, st)
+                return refuse(getattr(e, "code", "bad_payload"))
             if pl.get("hashlock") and path_key in cond_offers:
                 from .conditional import ConditionalParams
                 offer = cond_offers[path_key]
@@ -1224,6 +1315,7 @@ class XbtChannelProvider:
                 # never settled; an unmetered call's reservation is its exact charge already
                 st.extra = {**(st.extra or {}), "resv": {**((st.extra or {}).get("resv") or {}), str(seq): price * 1000}}
             self.ledger.save(st)
+            numbers = (st.best_cum, st.spent_msat)      # this call's own reservation (review T4)
             self._in_call[st.params.channel_id] = self._in_call.get(st.params.channel_id, 0) + 1
         try:
             status, hdrs, out = self.handler(method, path, body)
@@ -1250,10 +1342,10 @@ class XbtChannelProvider:
             raise
         with self.ledger.lock:
             self._release(st, seq)
-            st.spent_msat -= (price - charged) * 1000
+            refund = (price - charged) * 1000
             if status >= 500:                   # don't bill failed calls
-                st.spent_msat -= charged * 1000
-                charged = 0
+                refund, charged = price * 1000, 0
+            st.spent_msat -= refund
             if metered or charged != price:
                 # a metered call's charge is durable before its answer leaves: the row on disk held
                 # the reservation, which a restart refunds (AGP-059)
@@ -1262,10 +1354,13 @@ class XbtChannelProvider:
                 except BaseException:
                     st.spent_msat -= charged * 1000
                     raise
-            r = {"scheme": SCHEME, "chan": st.params.channel_id, "seq": st.seq, "cum": str(st.best_cum), "charged": str(charged), "spentMsat": str(st.spent_msat),
-                 "owedMsat": str(max(0, st.spent_msat - st.best_cum * 1000)),
-                 "creditMsat": str(max(0, st.best_cum * 1000 - st.spent_msat)), "expiry": st.params.expiry,
-                 "req": request_digest(method, path, body)}
+            # the numbers of this call's own reservation: calls running beside it move the channel,
+            # not this receipt. Calls reserved before it count at what they reserved.
+            cum, spent = numbers[0], numbers[1] - refund
+            r = {"scheme": SCHEME, "chan": st.params.channel_id, "seq": seq, "cum": str(cum), "charged": str(charged),
+                 "spentMsat": str(spent), "owedMsat": str(max(0, spent - cum * 1000)),
+                 "creditMsat": str(max(0, cum * 1000 - spent)), "expiry": st.params.expiry,
+                 "req": request_digest_v2(method, bind, body), "status": status, "bodyHash": body_hash(out)}
             secret = self._chan_secret(st.params)
         r["sig"] = ecc.sign(secret, receipt_message(r)).hex()
         hdrs = dict(hdrs)
@@ -1275,16 +1370,91 @@ class XbtChannelProvider:
     def http_server(self, port: int) -> ThreadingHTTPServer:
         app = self
 
+        class Bound(ThreadingHTTPServer):
+            """At most MAX_CONNECTIONS reads at once. A slow header or body holds a slot, not every
+            worker, and the slot is released when the handler finishes (review T1)."""
+
+            def __init__(self, addr, handler):
+                super().__init__(addr, handler)
+                self._open = 0
+                self._lk = threading.Lock()
+
+            def process_request(self, request, client_address):
+                with self._lk:
+                    if self._open >= MAX_CONNECTIONS:
+                        try:
+                            msg = b"too many connections"
+                            request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: %d\r\n"
+                                            b"Connection: close\r\n\r\n%s" % (len(msg), msg))
+                        except OSError:
+                            pass
+                        request.close()
+                        return
+                    self._open += 1
+                super().process_request(request, client_address)
+
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def _refuse(self, status, why):
                 self.close_connection = True
-                self.send_response(status)
-                self.send_header("Content-Length", str(len(why)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(why)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(why)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(why)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
+                    pass
+
+            def handle_one_request(self):
+                # Headers are read here, with a line cap and a deadline, before any worker runs.
+                # http.server's own parser accepts a 64 KiB line and waits forever.
+                self.close_connection = True
+                self.request_version, self.requestline, self.command = "HTTP/1.1", "", ""
+                try:
+                    deadline = time.monotonic() + HEAD_DEADLINE
+                    block = bytearray()
+                    line_len = 0
+                    while True:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            return self._refuse(408, b"timeout")
+                        self.connection.settimeout(left)    # absolute: a drip of bytes does not renew it
+                        b = self.rfile.read(1)
+                        if not b:
+                            return
+                        block.append(b[0])
+                        if len(block) > MAX_HEADERS:
+                            return self._refuse(431, b"header too large")
+                        if b == b"\n":
+                            line_len = 0
+                        else:
+                            line_len += 1
+                            if line_len > MAX_HEADER_LINE:
+                                return self._refuse(431, b"header too large")
+                        if block.endswith(b"\r\n\r\n"):
+                            break
+                except (TimeoutError, socket.timeout):
+                    return self._refuse(408, b"timeout")
+                except (ConnectionResetError, BrokenPipeError):
+                    return
+                from http.client import parse_headers
+                from io import BytesIO
+                head, _, _rest = bytes(block).partition(b"\r\n")
+                parts = head.decode("iso-8859-1", "replace").split(" ")
+                if len(parts) < 2 or not parts[0] or not parts[1]:
+                    return self._refuse(400, b"bad request")
+                self.requestline = head.decode("iso-8859-1", "replace")
+                self.command, self.path = parts[0], parts[1]
+                self.request_version = parts[2] if len(parts) > 2 else "HTTP/1.1"
+                if self.command not in ("GET", "POST"):
+                    return self._refuse(501, b"unsupported method")
+                try:
+                    self.headers = parse_headers(BytesIO(bytes(block).split(b"\r\n", 1)[1]))
+                except Exception:
+                    return self._refuse(400, b"bad headers")
+                self._go()
 
             def _go(self):
                 # Content-Length only, bounded: a chunked body read as the next request smuggles one
@@ -1297,23 +1467,57 @@ class XbtChannelProvider:
                     return self._refuse(413 if cl[0].isdigit() else 400, b"bad content-length")
                 if len(self.headers.get_all("PAYMENT-SIGNATURE") or []) > 1:
                     return self._refuse(400, b"duplicate PAYMENT-SIGNATURE")
-                status, hdrs, out = app.serve(self.command, self.path, dict(self.headers), self.rfile.read(int(cl[0])),
-                                              f"http://{self.headers.get('Host', '')}{self.path}")
+                n = int(cl[0])
+                if n and (self.headers.get("Expect") or "").strip().lower() == "100-continue":
+                    try:
+                        self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    except OSError:
+                        return
+                body = bytearray()
+                deadline = time.monotonic() + BODY_DEADLINE
+                try:
+                    while len(body) < n:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            return self._refuse(408, b"timeout")
+                        self.connection.settimeout(left)
+                        chunk = self.rfile.read1(min(n - len(body), 1 << 16))
+                        if not chunk:
+                            return self._refuse(400, b"bad body")
+                        body += chunk
+                except (TimeoutError, socket.timeout):
+                    return self._refuse(408, b"timeout")
+                except OSError:
+                    return
+                body = bytes(body)
+                fwd = (self.headers.get("X-Forwarded-Proto") or "").strip()
+                proto = "https" if fwd.lower() == "https" else "http"
+                host = self.headers.get("Host") or ""
+                status, hdrs, out = app.serve(self.command, self.path, dict(self.headers), body,
+                                              f"{proto}://{host}{self.path}")
                 if unsafe_headers(hdrs):
                     return self._refuse(500, b"handler returned a header with CR/LF")
                 self.send_response(status)
                 for k, v in hdrs.items():
                     self.send_header(k, v)
                 self.send_header("Content-Length", str(len(out)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(out)
 
-            do_GET = do_POST = _go
+            def finish(self):
+                try:
+                    super().finish()
+                finally:
+                    srv = self.server
+                    with srv._lk:
+                        if srv._open:
+                            srv._open -= 1
 
             def log_message(self, *a):
                 pass
 
-        return ThreadingHTTPServer(("127.0.0.1", port), H)
+        return Bound(("127.0.0.1", port), H)
 
 
 # --- client SDK -------------------------------------------------------------------------------
@@ -1357,13 +1561,31 @@ class XbtChannelClient:
         self.opened_sats = 0
 
     @staticmethod
+    def _read_capped(r):
+        """A body over the cap, or cut short of its Content-Length, is an error. Reading to the cap
+        and returning the short buffer booked a truncated answer as the one paid for (review T3)."""
+        declared = r.headers.get("Content-Length")
+        n = int(declared) if declared and str(declared).isdigit() else None
+        if n is not None and n > MAX_RESPONSE:
+            raise ChannelError("response_too_large", f"response is {n} bytes; the cap is {MAX_RESPONSE}")
+        out = r.read(MAX_RESPONSE + 1)
+        if len(out) > MAX_RESPONSE:
+            raise ChannelError("response_too_large", f"response exceeds {MAX_RESPONSE} bytes")
+        if n is not None and len(out) != n:
+            raise ChannelError("response_truncated", f"response body is {len(out)} of {n} bytes")
+        status = getattr(r, "status", None)
+        if status is None:
+            status = r.code
+        return status, {k.upper(): v for k, v in r.headers.items()}, out
+
+    @staticmethod
     def http(method, url, body=b"", headers=None):
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
-                return r.status, {k.upper(): v for k, v in r.headers.items()}, r.read()
+                return XbtChannelClient._read_capped(r)
         except urllib.error.HTTPError as e:
-            return e.code, {k.upper(): v for k, v in e.headers.items()}, e.read()
+            return XbtChannelClient._read_capped(e)
 
     def _post(self, url, obj):
         st, _, out = self.http("POST", url, json.dumps(obj).encode(), {"Content-Type": "application/json"})
@@ -1385,8 +1607,8 @@ class XbtChannelClient:
                 if acc["extra"].get("closeFeePayer", "payer") not in FEE_PAYERS:
                     raise ChannelError("bad_offer", "unknown closeFeePayer")
                 if acc["extra"].get("derivation") != DERIVATION:   # before funding: never strand coins
-                    raise ChannelError("bad_offer", f"payee key derivation {acc['extra'].get('derivation')!r}, "
-                                                    f"this client speaks {DERIVATION!r} (xbt402 v1.1)")
+                    raise ChannelError("bad_offer", f"payee key derivation {acc['extra'].get('derivation')!r}, this "
+                                                    f"client speaks {DERIVATION!r} (xbt402 v1.1)")
                 return acc
         raise ChannelError("no_scheme", f"no {SCHEME} offer on {self.network}")
 
@@ -1439,9 +1661,11 @@ class XbtChannelClient:
     def hrp_for(self) -> str:
         return "bc" if self.network == XBT_MAINNET else "bcrt"
 
-    def _auth(self, ch: ClientChannel, pl: dict, method: str, path: str, body: bytes) -> dict:
-        """Add payload.auth for this request. With a signer the ECDH key never leaves it."""
-        req = request_digest(method, path, body)
+    def _auth(self, ch: ClientChannel, pl: dict, method: str, bind: str, body: bytes) -> dict:
+        """Add payload.auth for this request. With a signer the ECDH key never leaves it. `bind`:
+        where the request goes, origin + path (request_digest_v2); a close's payload binds the empty
+        request."""
+        req = request_digest_v2(method, bind, body)
         if self.signer:
             pl["auth"] = self.signer.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
         else:
@@ -1472,7 +1696,7 @@ class XbtChannelClient:
             self.day_spent += max(0, delta)
         elif cum == ch.payer.signed > ch.acked_cum and ch.last_sig:
             pl["sig"] = ch.last_sig        # signed (a conditional upgrade) but not yet seen to arrive
-        return self._auth(ch, pl, method, path, body)
+        return self._auth(ch, pl, method, ch.origin + path if path else "", body)
 
     @staticmethod
     def _chosen_cum(ch: ClientChannel, c: int) -> int:
@@ -1548,11 +1772,12 @@ class XbtChannelClient:
                                                                           cum)})}
             status, rh, out = self.http(method, url, body, {**own, **hdrs})
         if "PAYMENT-RESPONSE" in rh:
-            self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body)
+            self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, (status, out))
         return status, rh, out
 
-    def _receipt(self, ch: ClientChannel, resp: dict, method, path, body, quote: int = None):
-        """`quote` is what this call may cost: the price pinned at open for a plain call, the
+    def _receipt(self, ch: ClientChannel, resp: dict, method, path, body, answer, quote: int = None):
+        """`answer` is the (status, body) the receipt came with: it must be the answer the provider
+        signed for (AGP-068). `quote` is what this call may cost: the price pinned at open for a plain call, the
         conditional amount (already checked against max_price) for a conditional one. Never a
         quote the provider can raise afterwards (H6: a `conditional` quote in any 402 lifted the
         cap on plain calls)."""
@@ -1560,8 +1785,12 @@ class XbtChannelClient:
         r = receipt_of(resp)
         if resp.get("network") != self.network or resp.get("payer") != ch.payer.params.payer_pub:
             raise ChannelError("bad_receipt", "PAYMENT-RESPONSE is for another network or payer")
-        if r["req"] != request_digest(method, path, body):
+        if r["req"] != request_digest_v2(method, ch.origin + path, body):
             raise ChannelError("bad_receipt", "receipt is for another request")
+        status = r.get("status")
+        if type(status) is not int or status != answer[0] or r.get("bodyHash") != body_hash(answer[1]):
+            # a truncated or altered answer is not the one the provider signed for
+            raise ChannelError("bad_receipt", "receipt is for another answer (status or body differs)")
         if not ecc.verify(bytes.fromhex(ch.payer.params.payee_pub), receipt_message(r), bytes.fromhex(r["sig"])):
             raise ChannelError("bad_receipt", "receipt not signed by the channel payee key")
         if int(r["cum"]) > ch.payer.signed or int(r["charged"]) > quote:
@@ -1658,7 +1887,7 @@ class XbtChannelClient:
         ch.seq += 1
         pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(uncond),
               "hashlock": extra["hash"], "sig": sig}
-        self._auth(ch, pl, method, path, body)
+        self._auth(ch, pl, method, ch.origin + path, body)
         hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": pl})}
         status, rh, out = self.http(method, url, body, hdrs)
         if status == 402:                      # refused: the provider did not keep the conditional state
@@ -1676,10 +1905,12 @@ class XbtChannelClient:
                                               f"lock, recover_conditional() reads k from its claim")
         if sha256(k) != h:
             raise ChannelError("bad_preimage", "provider preimage does not match H")
+        if "PAYMENT-RESPONSE" in rh:
+            # while the hash lock is pending: after a bad_receipt, recover_conditional still reads k
+            # from the provider's claim
+            self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, (status, out), cond_amt)
         plain = decrypt(cipher, k)             # the offered ciphertext, whatever the response carries
         ch.pending_cond = {}
-        if "PAYMENT-RESPONSE" in rh:
-            self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, cond_amt)
         # upgrade: fold the increment into an unconditional state and hand it over now, so the
         # provider can close with a plain state (until then it closes with the hash lock, M6)
         new_cum = max(uncond + cond_amt, ch.payer.params.min_amount)

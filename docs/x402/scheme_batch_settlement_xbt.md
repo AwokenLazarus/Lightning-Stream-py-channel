@@ -104,8 +104,9 @@ K = tagged_hash("xbt402/auth-key", x(a·P)) = tagged_hash("xbt402/auth-key", x(p
 ```
 `len8(NET)` is one byte, the length of `NET`. `P` is computable from the 402 alone, so opening needs one
 round trip, and no two channels share a key. Because `t` commits to the network, one `payTo` used on
-several networks derives unrelated channel keys. The 402 advertises this derivation as
-`extra.derivation: "v2"`, and a client MUST refuse any other value before funding. `K` (ECDH) is known
+several networks derives unrelated channel keys. The 402 advertises the channel binding as
+`extra.derivation: "v3"` (this payee key, with the v2 request binding and the v2 receipt below), and a
+client MUST refuse any other value before funding. `K` (ECDH) is known
 only to the two parties. See Security Considerations for the cost of this derivation.
 
 ### Scripts and transactions
@@ -153,7 +154,7 @@ The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
     "openUrl": "/x402/xbt-channel/open",
     "closeUrl": "/x402/xbt-channel/close",
     "billing": "postpay",
-    "derivation": "v2",
+    "derivation": "v3",
     "assetTransferMethod": "channel"
   }
 }
@@ -171,7 +172,7 @@ The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
 | `extra.closeFeePayer` | string | no | `"payer"` (default: the client's side pays the close fee) or `"payee"` (the server's output does). Clients MUST refuse other values before funding. |
 | `extra.openUrl`, `extra.closeUrl` | string | yes | Channel control endpoints, relative to the resource origin. |
 | `extra.billing` | string | yes | `"postpay"` or `"prepay"`. |
-| `extra.derivation` | string | yes | Payee-key derivation, `"v2"` (Keys). Clients MUST refuse other values before funding. |
+| `extra.derivation` | string | yes | Channel binding, `"v3"`: the payee key (Keys), request binding v2 and receipt v2. Clients MUST refuse other values before funding. |
 | `extra.conditional` | object | no | Hash-locked deliverable (experimental; see Appendix). |
 
 On a refused request the server returns a new 402 whose `error` is the refusal reason. It adds
@@ -217,10 +218,21 @@ A client MUST check the echoed `closeFeePayer` (absent = `"payer"`) before signi
 | `auth` | yes | `hex(HMAC-SHA256(K, "xbt402/auth|" ‖ chan ‖ "|" ‖ seq ‖ "|" ‖ cum ‖ "|" ‖ (sig or "") ‖ "|" ‖ req))`. |
 | `hashlock` | conditional only | See Appendix. |
 
-**Request binding.** `req = hex(SHA256(method ‖ "|" ‖ target ‖ "|" ‖ body))`, where `target` is the
-request target exactly as sent (path and query, not percent-decoded) and `body` the raw body bytes.
-`auth` ties one payload to one request, one `seq` and one state, so a captured header can be neither
-replayed nor moved to another request. A request MUST carry at most one `PAYMENT-SIGNATURE` header.
+**Request binding.**
+```
+req = hex(tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body)))
+f(x) = LE64(len(x)) ‖ x
+```
+over the absolute URL the request was sent to. `scheme` and `host` are ASCII-lowercased (an IPv6
+literal keeps its brackets), userinfo and fragment are dropped, `port` is decimal without leading
+zeros or the scheme's default (`80` for http, `443` for https), and `target` is the path and query
+exactly as sent (not percent-decoded; `/` when empty). `body` is the raw body bytes. The server
+rebuilds the URL from its public scheme, the `Host` header and the request target. A payload with
+no request (a close) binds the empty request `("", "", "", "", "", "")`. Every field is
+length-prefixed, so no two requests share a digest; the v1 form `SHA256(method|target|body)` let
+`("/q?a|b", "")` and `("/q?a", "b|")` collide and bound no origin. `auth` ties one payload to one
+request at one origin, one `seq` and one state, so a captured header can be neither replayed nor
+moved to another request or origin. A request MUST carry at most one `PAYMENT-SIGNATURE` header.
 
 **Client construction.** Under postpay, `cum = max(⌈spentMsat / 1000⌉, last signed)`; under prepay
 it also adds this request's `amount`. A `cum` between 1 and 545 is raised to 546. Sign only when `cum`
@@ -287,18 +299,24 @@ broadcast) and the channel receipt in `extra`:
     "chargedAmount": "150",
     "receipt": {"scheme":"xbt-channel","chan":"…:0","seq":5,"cum":"600","charged":"150",
                 "spentMsat":"750000","owedMsat":"150000","creditMsat":"0","expiry":2014,
-                "req":"<hex>","sig":"<DER hex>"}
+                "req":"<hex>","status":200,"bodyHash":"<hex>","sig":"<DER hex>"}
   }
 }
 ```
 `receipt.sig` is `P`'s ECDSA signature over
-`tagged_hash("xbt402/receipt", chan ‖ "|" ‖ seq ‖ "|" ‖ cum ‖ "|" ‖ charged ‖ "|" ‖ spentMsat ‖ "|" ‖ req)`.
+`tagged_hash("xbt402/receipt/v2", f(chan) ‖ f(seq) ‖ f(cum) ‖ f(charged) ‖ f(spentMsat) ‖ f(req) ‖ f(status) ‖ f(bodyHash))`,
+each field in its decimal or hex text form. `status` is the HTTP status of the answer and `bodyHash`
+the hex SHA-256 of its body exactly as sent. `seq`, `cum` and `spentMsat` are the numbers of this
+request's own reservation: a request served beside it does not change them.
 Only the receipt is signed. `extra.chargedAmount` MUST equal `receipt.charged`, and `success` is `true`
 when the handler's status is below 400.
 
 **Client checks.** `network` and `payer` are its channel's; the receipt verifies under `P`; `req` is the
-digest of its own request; `cum` is not above what it signed; `charged ≤ amount`; `spentMsat` grew by
-at most one request. On a 402 for an open channel, the client MUST NOT accept a higher `amount` than it
+digest of its own request; `status` and `bodyHash` match the answer it received (a truncated or
+altered body is not the answer that was paid for); `cum` is not above what it signed; `charged ≤ amount`; `spentMsat` grew by
+at most one request. On a conditional request the client keeps the hash lock and its ciphertext pending
+until the receipt checks out, so after a `bad_receipt` it still recovers the deliverable from the
+payee's claim, which reveals k. On a 402 for an open channel, the client MUST NOT accept a higher `amount` than it
 opened the channel with, and MUST NOT adopt more than one request's worth of unreceipted charges over
 the channel's life. Otherwise a malicious server could drain the channel with 402 loops.
 
@@ -538,3 +556,4 @@ The reference server does all of this.
 | 0.2-draft | 2026-09-25 | Matches the xbt402 v1.1 reference: network in the key tweak (`extra.derivation: "v2"`), `SettlementResponse` and facilitator shapes implemented, enforceable hash-locked close, binding-name appendix |
 | 0.3-draft | 2026-09-28 | xbt402 v1.2: optional `closeFeePayer` (`"payer"` default, `"payee"`), `minCum`, `invalid_xbt_channel_fee_payer` (renamed in 0.4), payee-pays vectors; wire-compatible with 0.2 |
 | 0.4-draft | 2026-09-30 | AGP-050: wire `scheme` is `batch-settlement`, `extra.assetTransferMethod: "channel"`, errors `invalid_batch_settlement_xbt_*`; `xbt-channel` accepted as an input alias |
+| 0.5-draft | 2026-10-08 | xbt402 v1.3 (AGP-068), not wire-compatible with 0.4: `extra.derivation: "v3"`; request binding v2 (length-prefixed, binds scheme, host and port); receipt v2 adds `status` and `bodyHash`; receipt numbers are the request's own reservation |
