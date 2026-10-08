@@ -30,6 +30,7 @@ from xbt402 import hub as hubmod  # noqa: E402
 from xbt402.channel import DUST, ChannelError  # noqa: E402
 from xbt402.hub import OutChannel, RouteHub  # noqa: E402
 from xbt402.route import ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH  # noqa: E402
+from sechelp import crashed
 
 
 class Wrap:
@@ -53,6 +54,7 @@ class Wrap:
 
 def hub_at(node, net, datadir, **kw):
     """A hub over an existing datadir (a restart)."""
+    crashed(datadir)
     return RouteHub(node, 0x4B4B, R.NET, datadir, node.fund_address, http=net.http, close_margin=36, delta=36,
                     ch2_capacity=100_000, ch2_expiry_blocks=1_000, **kw)
 

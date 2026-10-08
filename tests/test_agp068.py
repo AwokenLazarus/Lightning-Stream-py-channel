@@ -245,6 +245,7 @@ class Binding(unittest.TestCase):
         h = paid(prov, payer, params, 7, "0", None, "GET", f"{O}/v1/q", b"")
         st, _, out = prov.serve("GET", "/v1/q", h, b"", f"{O}/v1/q")
         self.assertEqual(error_of(st, out), "insufficient_payment")
+        prov.ledger.close()             # the restart: the first process is gone (AGP-067: one opener)
         prov2 = provider(node, ledger=path)
         self.assertEqual(prov2.ledger.channels[params.channel_id].seq, 7)
         st, _, out = prov2.serve("GET", "/v1/q", h, b"", f"{O}/v1/q")

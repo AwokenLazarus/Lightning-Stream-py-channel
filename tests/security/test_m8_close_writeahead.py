@@ -18,6 +18,7 @@ import unittest
 from condhelp import ORIGIN, Rig, spends
 from sechelp import V11, FakeNode, Repro, load, v11
 from xbt402.tx import Tx
+from sechelp import crashed
 
 
 class LossyNode(FakeNode):
@@ -58,6 +59,7 @@ def claimed(r):
 
 
 def restart(xm, r):
+    crashed(r.prov)
     return xm.XbtChannelProvider(r.node, 0xB0B, r.prov.network, r.prov.ledger.path, lambda m, p: 150,
                                  lambda m, p, b: (200, {}, b"ok"))
 

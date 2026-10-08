@@ -36,6 +36,7 @@ from xbt402 import route as route_mod  # noqa: E402
 from xbt402.funding import FundingPolicy  # noqa: E402
 from xbt402.route import AMSAT_PER_SAT, RouteWal, call_auth, state_verify  # noqa: E402
 from xbt402.x402_channel import XbtChannelProvider, b64json, request_digest_v2, unb64json  # noqa: E402
+from sechelp import crashed
 
 PRICE = 370 * 10 ** 18
 PATH = "/v1/chunk"
@@ -51,6 +52,8 @@ class Box:
         self.start()
 
     def start(self):
+        if getattr(self, "p", None) is not None:
+            crashed(self.p)
         pol = FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640, close_margin=36)
         h = self.handler or (lambda m, p, b: (200, {"Content-Type": "application/json"}, b'{"ok":1}'))
         self.p = XbtChannelProvider(self.node, 0x5151, R.NET, os.path.join(self.d, "prov.json"), lambda m, p: 1000,

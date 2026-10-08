@@ -24,6 +24,7 @@ class LedgerTest(unittest.TestCase):
         st = ChannelState(params(), best_cum=1500, best_sig="aa", seq=3, spent_msat=1500000)
         led.channels[st.params.channel_id] = st
         led.save()
+        led.close()
         led2 = Ledger(path)
         self.assertEqual(len(led2.channels), 1)
         got = led2.channels[st.params.channel_id]

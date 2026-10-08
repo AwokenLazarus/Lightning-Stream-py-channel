@@ -109,6 +109,33 @@ class FakeNode:
 PRICE = 150
 
 
+def crashed(*targets):
+    """A crash, in one test process (AGP-067): a ledger takes one opener and the OS drops a dead
+    process's lock, but here the old instance is still alive. Each target (a provider, a hub, a
+    Ledger, or a ledger path or data directory) lets go of its ledger locks; the objects stay usable,
+    as a call still running in the old instance may finish. A no-op on the unpatched base."""
+    import gc
+
+    def release(led):
+        f = getattr(led, "_file_lock", None)
+        if f is not None:
+            f.close()
+            led._file_lock = None
+
+    for t in targets:
+        if isinstance(t, str):
+            root = os.path.abspath(t[:-5] + ".sqlite" if t.endswith(".json") else t)
+            for o in gc.get_objects():
+                if type(o).__name__ == "Ledger" and isinstance(getattr(o, "path", None), str):
+                    lp = os.path.abspath(o.path)
+                    if lp == root or lp.startswith(root.rstrip(os.sep) + os.sep):
+                        release(o)
+            continue
+        for led in (t, getattr(t, "ledger", None), getattr(getattr(t, "inbound", None), "ledger", None)):
+            if led is not None:
+                release(led)
+
+
 def make_provider(xc, node, billing="postpay", secret=0xB0B):
     """A provider from module `xc` (xbt402w2.x402_channel = unpatched, xbt402.x402_channel = tree)."""
     import tempfile
