@@ -289,7 +289,7 @@ class HubAndRollover(unittest.TestCase):
         wrong = ChannelParams(**{**oc.p().to_dict(), "close_fee_payer": "payer"})
         R.stream(pay, sh, 10)
         from xbt402.route import ROUTE_LOCK_PATH, lock_auth, next_cum
-        from xbt402.x402_channel import b64json, request_auth, request_digest
+        from xbt402.x402_channel import b64json, request_auth, request_digest_v2
         from xbt402.channel import channel_auth_key
         inv, d = sh.invoice, oc.p().min_amount                  # above the floor: a new state, with an adaptor
         cum = next_cum(oc.routed, d, oc.p().min_amount)
@@ -301,7 +301,7 @@ class HubAndRollover(unittest.TestCase):
         pl = {"chan": p2.channel_id, "seq": oc.seq, "cum": str(cum), "point": inv["point"], "adaptor": pre.to_json()}
         body = json.dumps({"route": route}).encode()
         pl["auth"] = request_auth(channel_auth_key(int(oc.secret, 16), bytes.fromhex(p2.payee_pub)), p2.channel_id,
-                                  oc.seq, pl["cum"], None, request_digest("POST", ROUTE_LOCK_PATH, body))
+                                  oc.seq, pl["cum"], None, request_digest_v2("POST", origin + ROUTE_LOCK_PATH, body))
         st, _, raw = net.http("POST", origin + ROUTE_LOCK_PATH, body,
                               {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": {}, "payload": pl})})
         self.assertEqual(json.loads(raw)["error"], "bad_adaptor")

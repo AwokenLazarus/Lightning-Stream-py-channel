@@ -60,7 +60,7 @@ def paid_get(mod, cm, prov, node, path, auth):
     p, payer = make_channel(cm, prov, node)
     pl = {"chan": p.channel_id, "seq": 1, "cum": "20000", "sig": payer.sign_state(20_000).hex()}
     if auth:
-        pl = authed(mod, cm, payer, p.payee_pub, pl, path=path)
+        pl = authed(mod, cm, payer, p.payee_pub, pl, path="http://x" + path)   # the Host the request names
     hdr = mod.b64json({"x402Version": 2, "accepted": prov.requirements(150), "payload": pl})
     return f"GET {path} HTTP/1.1\r\nHost: x\r\nPAYMENT-SIGNATURE: {hdr}\r\nConnection: close\r\n\r\n".encode()
 

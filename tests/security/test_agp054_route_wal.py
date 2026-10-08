@@ -35,7 +35,7 @@ import routehelp as R  # noqa: E402
 from xbt402 import route as route_mod  # noqa: E402
 from xbt402.funding import FundingPolicy  # noqa: E402
 from xbt402.route import AMSAT_PER_SAT, RouteWal, call_auth, state_verify  # noqa: E402
-from xbt402.x402_channel import XbtChannelProvider, b64json, request_digest, unb64json  # noqa: E402
+from xbt402.x402_channel import XbtChannelProvider, b64json, request_digest_v2, unb64json  # noqa: E402
 
 PRICE = 370 * 10 ** 18
 PATH = "/v1/chunk"
@@ -85,7 +85,7 @@ class Client:
             self.seq += 1
             seq = self.seq
         hdr = b64json({"session": self.session, "seq": seq,
-                       "auth": call_auth(self.key, self.session, seq, request_digest("POST", PATH, body))})
+                       "auth": call_auth(self.key, self.session, seq, request_digest_v2("POST", PATH, body))})
         return {"ROUTE-AUTH": hdr}, body
 
     def call(self, body=b"x", seq=None):

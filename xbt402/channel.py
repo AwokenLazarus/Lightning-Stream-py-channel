@@ -79,7 +79,10 @@ def funding_script(payer_pub: bytes, payee_pub: bytes, expiry: int) -> bytes:
 
 
 PAYEE_TAG = "xbt-channel/payee/v2"   # v1.0 was "xbt-channel/payee", without the network
-DERIVATION = "v2"                     # advertised as PaymentRequirements.extra.derivation
+# advertised as PaymentRequirements.extra.derivation: what a client must speak before it funds. "v3"
+# (AGP-068) keeps the v2 payee key (PAYEE_TAG) and binds requests with request_digest_v2 and
+# receipts over the answer; a "v2" client refuses it before funding, as a "v3" client refuses "v2".
+DERIVATION = "v3"
 
 
 def payee_tweak_preimage(network: str, pay_to: bytes, payer_pub: bytes, expiry: int) -> bytes:

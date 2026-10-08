@@ -27,6 +27,8 @@ coincurve (the pure-Python fallback); the output names the backend.
 Signatures are deterministic (RFC 6979, low S), so the vectors are byte-exact. The keys below are
 test keys: never fund them.
 """
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -45,7 +47,7 @@ from xbt402.conditional import ConditionalParams, decrypt, preimage_from_tx  # n
 from xbt402.tx import SIGHASH_ALL, SIGHASH_ALL_UNIFIED, Tx, segwit_address, sha256, tagged_hash  # noqa: E402
 from xbt402.x402_channel import (FACILITATOR_SETTLE, FACILITATOR_SUPPORTED, FACILITATOR_VERIFY,  # noqa: E402
                                  XBT_MAINNET, XbtChannelProvider, b64json, close_message, facilitator_request,
-                                 receipt_message, receipt_of, request_auth, request_digest, unb64json)
+                                 receipt_message, receipt_of, request_auth, request_digest_v2, request_url, unb64json)
 
 VECTORS = os.path.join(HERE, "vectors.json")
 
@@ -123,12 +125,23 @@ def gen_auth():
     k_payee = channel_auth_key(payee_secret, bytes.fromhex(p.payer_pub))
     shared = ecc.ecdh(a, bytes.fromhex(p.payee_pub))
     cases = []
-    for method, path, body, seq, cum, sig in (
-            ("GET", "/v1/quote?pair=XBT-USD", b"", 1, "0", None),
-            ("POST", "/v1/infer", b'{"prompt":"hello"}', 2, "546", Payer(p, a).sign_state(546).hex()),
-            ("POST", "/v1/a%20b?x=1", b"\x00\x01binary", 7, "1200", None)):
-        req = request_digest(method, path, body)
-        cases.append({"method": method, "path": path, "bodyHex": body.hex(), "req": req,
+    # v1.3: absolute URLs (canonicalised), the v1 collision pair (one digest under "|", two here), a
+    # bare target (binds no origin) and the empty request a close binds
+    for method, url, body, seq, cum, sig in (
+            ("GET", "https://api.example.com/v1/quote?pair=XBT-USD", b"", 1, "0", None),
+            ("POST", "HTTPS://API.Example.com:443/v1/infer", b'{"prompt":"hello"}', 2, "546",
+             Payer(p, a).sign_state(546).hex()),
+            ("POST", "http://user@[::1]:08402/v1/a%20b?x=1#frag", b"\x00\x01binary", 7, "1200", None),
+            ("GET", "https://api.example.com/q?a|b", b"", 8, "1200", None),
+            ("GET", "https://api.example.com/q?a", b"b|", 9, "1200", None),
+            ("GET", "/v1/x", b"", 10, "1200", None),
+            ("", "", b"", 11, "1200", None)):
+        req = request_digest_v2(method, url, body)
+        scheme, host, port, target = request_url(url)
+        pre = b"".join(len(x).to_bytes(8, "little") + x for x in
+                       (method.encode(), scheme.encode(), host.encode(), port.encode(), target.encode(), body))
+        cases.append({"method": method, "url": url, "scheme": scheme, "host": host, "port": port,
+                      "target": target, "bodyHex": body.hex(), "reqPreimageHex": pre.hex(), "req": req,
                       "chan": p.channel_id, "seq": seq, "cum": cum, "sig": sig or "",
                       "message": "|".join(("xbt402/auth", p.channel_id, str(seq), cum, sig or "", req)),
                       "auth": request_auth(k_payer, p.channel_id, seq, cum, sig, req)})
@@ -227,7 +240,7 @@ def gen_roundtrip():
             pl = {"chan": p.channel_id, "seq": seq, "cum": str(cum)}
             if cum > payer.signed:
                 pl["sig"] = payer.sign_state(cum).hex()
-            pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest(method, path, body))
+            pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest_v2(method, url, body))
             hdr = b64json({"x402Version": 2, "accepted": accepted, "payload": pl})
             headers.append(hdr)
             status, h, out = prov.serve(method, path, {"PAYMENT-SIGNATURE": hdr}, body, url)
@@ -259,7 +272,7 @@ def gen_roundtrip():
         pl = {"chan": p.channel_id, "seq": seq, "cum": str(final)}
         if final > payer.signed:
             pl["sig"] = payer.sign_state(final).hex()
-        pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest("", "", b""))   # as the reference client does
+        pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest_v2("", "", b""))   # as the reference client does
         close_req = {"chan": p.channel_id, "sig": ecc.sign(a, close_message(p.channel_id)).hex(), "payload": pl}
         status, _, out = prov.serve("POST", accepted["extra"]["closeUrl"], {}, json.dumps(close_req).encode())
         steps.append({"step": "cooperative close", "path": accepted["extra"]["closeUrl"], "request": close_req,
@@ -308,7 +321,7 @@ def gen_conditional():
         def paid(path, pl, seq):
             pl = {"chan": p.channel_id, "seq": seq, **pl}
             pl["auth"] = request_auth(kauth, pl["chan"], seq, pl["cum"], pl.get("sig"),
-                                      request_digest("GET", path, b""))
+                                      request_digest_v2("GET", "https://api.example.com" + path, b""))
             hdr = b64json({"x402Version": 2, "accepted": accepted, "payload": pl})
             st_, h_, out_ = prov.serve("GET", path, {"PAYMENT-SIGNATURE": hdr}, b"", "https://api.example.com" + path)
             return pl, hdr, st_, h_, out_
@@ -420,7 +433,7 @@ def _payee_pays_close(prov, node, p, a):
         pl = {"chan": p.channel_id, "seq": seq, "cum": str(cum)}
         if cum > payer.signed:
             pl["sig"] = payer.sign_state(cum).hex()
-        pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest("GET", "/v1/x", b""))
+        pl["auth"] = request_auth(k, pl["chan"], seq, pl["cum"], pl.get("sig"), request_digest_v2("GET", "/v1/x", b""))
         _, h, _ = prov.serve("GET", "/v1/x", {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc, "payload": pl})}, b"")
         spent_msat = int(receipt_of(unb64json(h["PAYMENT-RESPONSE"]))["spentMsat"])
     final = max(-(-spent_msat // 1000), payer.signed)
@@ -438,20 +451,20 @@ def _payee_pays_close(prov, node, p, a):
 def generate():
     return {
         "title": "x402 batch-settlement (XBT channel) test vectors",
-        "version": "1.2-draft (payee derivation %s, x402 v2 SettlementResponse and facilitator shapes, "
-                   "closeFeePayer)" % DERIVATION,
-        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
+        "version": "1.3-draft (payee derivation %s, request binding v2, x402 v2 SettlementResponse and facilitator shapes, closeFeePayer)" % DERIVATION,
+        "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.3",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",
                   "Hex is lowercase. Integers are JSON numbers unless the wire format uses decimal strings.",
                   "Signatures are RFC 6979 deterministic with low S, so every value is byte-exact.",
                   "Fields starting with '_' are cross-checks, not wire values.",
                   "Sections derivation..conditional are v1.1 and unchanged in v1.2 (payer-pays, closeFeePayer "
-                  "absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format."],
+                  "absent); section payeePays is the v1.2 closeFeePayer \"payee\" state format.",
+                  "v1.3 (AGP-068): auth req and receipts are length-prefixed (origin, status, bodyHash); extra.derivation is v3, which a v1.2 client refuses before funding."],
         "constants": {"network": NETWORK, "dust": 546, "closeFeeSat": CLOSE_FEE, "capacity": CAPACITY,
                       "sighashAllUnified": SIGHASH_ALL_UNIFIED,
                       "derivation": DERIVATION,
-                      "tags": [PAYEE_TAG, "xbt402/auth-key", "xbt402/receipt", "xbt402/close",
-                               "UnifiedSighash"]},
+                      "tags": [PAYEE_TAG, "xbt402/auth-key", "xbt402/receipt/v2", "xbt402/req/v2",
+                               "xbt402/close", "UnifiedSighash"]},
         "derivation": gen_derivation(),
         "auth": gen_auth(),
         "state": gen_states(),
@@ -485,6 +498,16 @@ def independent_checks(v) -> list:
     au = v["auth"]
     need(au["K"] == au["_K_payee_side"], "auth: payer and payee disagree on K")
     need(tagged_hash("xbt402/auth-key", bytes.fromhex(au["ecdhX"])).hex() == au["K"], "auth: K != tagged_hash(x)")
+    for i, c in enumerate(au["cases"]):
+        # v1.3 request binding, from the split fields alone: LE64(len) ‖ field, tagged "xbt402/req/v2"
+        pre = b"".join(len(x).to_bytes(8, "little") + x for x in
+                       (c["method"].encode(), c["scheme"].encode(), c["host"].encode(), c["port"].encode(),
+                        c["target"].encode(), bytes.fromhex(c["bodyHex"])))
+        need(pre.hex() == c["reqPreimageHex"], f"auth.cases[{i}]: req preimage is not the length-prefixed fields")
+        need(tagged_hash("xbt402/req/v2", pre).hex() == c["req"], f"auth.cases[{i}]: req != tagged_hash(preimage)")
+        need(hmac.new(bytes.fromhex(au["K"]), c["message"].encode(), hashlib.sha256).hexdigest() == c["auth"],
+             f"auth.cases[{i}]: auth != HMAC(K, message)")
+    need(len({c["req"] for c in au["cases"]}) == len(au["cases"]), "auth: two requests share a req")
     st = v["state"]
     p = ChannelParams(**st["params"])
     for s in st["states"]:
@@ -506,6 +529,9 @@ def independent_checks(v) -> list:
             r, resp = s["receipt"], s["settlementResponse"]
             need(ecc.verify(bytes.fromhex(payee_pub), receipt_message(r), bytes.fromhex(r["sig"])),
                  f"{s['step']}: receipt not signed by P")
+            if "bodyHex" in s:
+                need(r["status"] == s["status"] and r["bodyHash"] == hashlib.sha256(bytes.fromhex(s["bodyHex"])).hexdigest(),
+                     f"{s['step']}: receipt status/bodyHash is not the answer's")
             need(unb64json(s["PAYMENT-RESPONSE"]) == resp, f"{s['step']}: header does not decode to the response")
             need(set(resp) == {"success", "transaction", "network", "payer", "amount", "extra"}
                  and resp["transaction"] == "" and resp["network"] == rt["network"]

@@ -10,6 +10,25 @@ reference implementation (`xbt402`) implements this text, and `vectors.json` is 
 a v1.1 party never sees the field and every v1.1 byte (states, vectors, 402s) is unchanged. Hub-funded
 routed channels use `"payee"`: the provider pays its own settlement. [Changes in v1.2](#changes-in-v12).
 
+**v1.3-draft (AGP-068)**, 2026-10-08. Not wire-compatible with v1.2. `extra.derivation` is `"v3"`, so a
+v1.2 client (which requires `"v2"`) refuses the offer before it funds. The payee-key algorithm is
+unchanged: the tag is still `xbt-channel/payee/v2`. A payment's `req`
+is `hex(tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body)))`
+with `f(x) = LE64(len(x)) ‖ x` (little-endian). Scheme and host are ASCII-lowercased, an explicit
+default port (`:80` / `:443`) is the same as omitting it, and a URL with no `://` binds the target
+alone. This supersedes the §7.3 formula `SHA256(method ‖ "|" ‖ target ‖ "|" ‖ body)`. The receipt
+tag is `xbt402/receipt/v2` over the same length-prefixed fields plus `status` and `bodyHash`
+(hex sha256 of the answer body), and a payer checks both against the answer it received
+(`bad_receipt`). A seq spent on a refusal is
+written to the ledger before the refusal is returned. Receipt `seq` and `spentMsat` are the numbers
+of that call's own reservation, not a later read of the channel. The HTTP server caps one header
+line at 8 KiB, the header block at 32 KiB and concurrent connections at 64, and closes a header
+that has not finished within 10 s (408). A payer treats a body over 64 MiB, or shorter than its
+`Content-Length`, as `response_too_large` or `response_truncated` and does not book it. A public
+deployment sits behind a reverse proxy that terminates TLS and **overwrites** `X-Forwarded-Proto`
+and `Host` with the name the payer used: the server trusts those two when it rebuilds the URL it
+binds.
+
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT and MAY are to be interpreted as described
 in RFC 2119 and RFC 8174 when, and only when, they appear in all capitals.
 

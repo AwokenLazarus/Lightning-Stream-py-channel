@@ -28,9 +28,9 @@ class Envelopes(unittest.TestCase):
         pl = {"chan": self.p.channel_id, "seq": seq, "cum": str(cum)}
         if cum > self.payer.signed:
             pl["sig"] = self.payer.sign_state(cum).hex()
-        pl = authed(xp, cp, self.payer, self.p.payee_pub, pl, path=path)
+        pl = authed(xp, cp, self.payer, self.p.payee_pub, pl, path="http://api.test" + path)
         hdr = xp.b64json({"x402Version": 2, "accepted": self.acc, "payload": pl})
-        return self.prov.serve("GET", path, {"PAYMENT-SIGNATURE": hdr}, b"")
+        return self.prov.serve("GET", path, {"PAYMENT-SIGNATURE": hdr}, b"", url="http://api.test" + path)
 
     def facilitator(self, path, body):
         st, _, out = self.prov.serve("POST", path, {}, json.dumps(body).encode())
@@ -46,16 +46,16 @@ class Envelopes(unittest.TestCase):
         r = xp.receipt_of(resp)
         self.assertEqual(resp["extra"]["chargedAmount"], r["charged"])
         self.assertEqual(set(r), {"scheme", "chan", "seq", "cum", "charged", "spentMsat", "owedMsat",
-                                  "creditMsat", "expiry", "req", "sig"})
+                                  "creditMsat", "expiry", "req", "status", "bodyHash", "sig"})
         self.assertEqual((r["scheme"], r["chan"], r["charged"]), ("batch-settlement", self.p.channel_id, str(PRICE)))
         self.assertTrue(ecc.verify(bytes.fromhex(self.p.payee_pub), xp.receipt_message(r), bytes.fromhex(r["sig"])))
 
     def test_client_checks_the_envelope(self):
-        _, h, _ = self.paid()
+        st, h, out = self.paid()
         good = xp.unb64json(h["PAYMENT-RESPONSE"])
         client = xp.XbtChannelClient(self.prov.network, None, lambda: 1000)
         ch = xp.ClientChannel(self.payer, "http://api.test", self.acc, price=PRICE)
-        client._receipt(ch, good, "GET", "/v1/x", b"")
+        client._receipt(ch, good, "GET", "/v1/x", b"", (st, out))
         self.assertEqual(ch.receipts[-1], good["extra"]["receipt"])
         for tamper in (lambda d: d["extra"].__setitem__("chargedAmount", "1"),
                        lambda d: d.__setitem__("network", "bip122:" + "00" * 16),
@@ -66,7 +66,7 @@ class Envelopes(unittest.TestCase):
             bad = json.loads(json.dumps(good))
             tamper(bad)
             with self.assertRaises(cp.ChannelError) as err:
-                client._receipt(ch, bad, "GET", "/v1/x", b"")
+                client._receipt(ch, bad, "GET", "/v1/x", b"", (st, out))
             self.assertEqual(err.exception.code, "bad_receipt")
 
     def test_verify_takes_and_answers_x402_shapes(self):

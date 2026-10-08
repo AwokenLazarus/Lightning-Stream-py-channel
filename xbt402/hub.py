@@ -125,7 +125,7 @@ from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, 
                     fee_due, find_spend, hub_channel_message, next_cum, route_ok)
 from .rpc import RPCError
 from .tx import Tx, address_to_spk, segwit_address
-from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, request_auth, request_digest,
+from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, request_auth, request_digest_v2,
                            safe_code, unb64json)
 from .channel import channel_auth_key
 
@@ -489,7 +489,7 @@ class RouteHub:
         if path.split("?", 1)[0] == HUB_ROUTE_PATH:
             hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
             if method == "POST" and hdr:
-                return self.route(method, HUB_ROUTE_PATH, hdr, body)
+                return self.route(method, binding_url(url, HUB_ROUTE_PATH), hdr, body)
             st, h, b = self.inbound._payment_required(url or path, 0, "payment_required")
             doc = json.loads(b)
             doc["accepts"][0]["extra"]["routing"] = self.routing_extra()
@@ -506,7 +506,8 @@ class RouteHub:
         return status, {"Content-Type": "application/json"}, json.dumps(
             {"error": code, "detail": detail, **extra}).encode()
 
-    def route(self, method: str, path: str, hdr: str, body: bytes):
+    def route(self, method: str, bind: str, hdr: str, body: bytes):
+        """`bind`: the request's URL as request_digest_v2 binds it."""
         t0 = time.perf_counter()
         try:
             pl = unb64json(hdr)["payload"]
@@ -526,7 +527,7 @@ class RouteHub:
                 st1 = None
             if st1 is None:
                 return self._err("unknown_channel")
-            if not ib._authentic(st1, pl, method, path, body):
+            if not ib._authentic(st1, pl, method, bind, body):
                 return self._err("bad_auth", status=401)
             st1.seq = int(pl["seq"])
             done = ((st1.extra or {}).get("route_done") or {}).get(lock_id)
@@ -797,7 +798,7 @@ class RouteHub:
         if pend.get("pre"):
             pl["adaptor"] = pend["pre"]
         key = channel_auth_key(int(oc.secret, 16), bytes.fromhex(p2.payee_pub))
-        pl["auth"] = request_auth(key, p2.channel_id, seq, pl["cum"], None, request_digest("POST", ROUTE_LOCK_PATH, body))
+        pl["auth"] = request_auth(key, p2.channel_id, seq, pl["cum"], None, request_digest_v2("POST", oc.origin + ROUTE_LOCK_PATH, body))
         hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": oc.terms, "payload": pl}),
                 "Content-Type": "application/json"}
         try:

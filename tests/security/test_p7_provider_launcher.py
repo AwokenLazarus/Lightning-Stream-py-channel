@@ -127,7 +127,7 @@ class Launcher(unittest.TestCase):
         extra = prov.requirements(500)["extra"]
         self.assertEqual((extra["minCapacity"], extra["maxCapacity"], extra["closeFeeSat"], extra["minConf"]),
                          ("10000", "10000", "600", 1))
-        self.assertEqual((extra["minExpiryBlocks"], extra["closeMarginBlocks"], extra["derivation"]), (1008, 144, "v2"))
+        self.assertEqual((extra["minExpiryBlocks"], extra["closeMarginBlocks"], extra["derivation"]), (1008, 144, "v3"))
         self.assertEqual(prov.requirements(500)["amount"], "500")
 
     def test_mainnet_serving_is_on_hold_but_check_works(self):

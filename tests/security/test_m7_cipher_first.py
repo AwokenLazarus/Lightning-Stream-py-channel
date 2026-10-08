@@ -116,8 +116,15 @@ class CipherFirst(Repro, unittest.TestCase):
                 out = json.dumps(d).encode()
             return st, h, out
         r.prov.serve = swap
-        st, _, _, plain = r.client.request_conditional("GET", ORIGIN + "/v1/cond")
-        self.assertEqual((st, plain), (200, PLAIN))                  # decrypted from the offered ciphertext
+        from xbt402.channel import ChannelError
+        r.client.request("GET", ORIGIN + "/v1/x")
+        with self.assertRaises(ChannelError) as e:                   # receipt v2 binds the answer (AGP-068)
+            r.client.request_conditional("GET", ORIGIN + "/v1/cond")
+        self.assertEqual(e.exception.code, "bad_receipt")
+        self.assertTrue(r.cch.pending_cond)                          # the offered ciphertext is kept
+        r.close_at_margin()
+        claim = next(hx for hx in r.node.sent if spends(hx, r.chan.closed_txid))
+        self.assertEqual(r.client.recover_conditional(ORIGIN, claim), PLAIN)
 
 
 if __name__ == "__main__":

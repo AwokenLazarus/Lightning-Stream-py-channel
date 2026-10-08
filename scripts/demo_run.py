@@ -27,7 +27,7 @@ from xbt402.rpc import RPC, RPCError                                            
 from xbt402.signer import ChannelSigner                                           # noqa: E402
 from xbt402.watcher import Watcher                                                # noqa: E402
 from xbt402.x402_channel import (RefundCustody, XbtChannelClient,                 # noqa: E402
-                                 XbtChannelProvider, b64json, network_id, request_digest,
+                                 XbtChannelProvider, b64json, network_id, request_digest_v2,
                                  unb64json)
 
 SAT = 100_000_000
@@ -142,7 +142,7 @@ def main():
             ch.seq += 1
             payload = {**payload, "seq": ch.seq}
             payload["auth"] = signer.request_auth(payload["chan"], ch.seq, payload["cum"], payload.get("sig"),
-                                                  request_digest("GET", "/v1/infer", b""))
+                                                  request_digest_v2("GET", base + "/v1/infer", b""))
         hdr = b64json({"x402Version": 2, "accepted": accepted or ch.accepted, "payload": payload})
         st, h, out = client.http("GET", base + "/v1/infer", headers={"PAYMENT-SIGNATURE": hdr})
         return st, unb64json(h["PAYMENT-REQUIRED"])["error"] if st == 402 else ""
