@@ -84,7 +84,8 @@ transaction formats are Bitcoin's. Four chain rules shape this scheme:
    channel's server key `P` from `payTo`, `A` and `expiry` (Keys below), and pays `capacity` sat to
    the P2WSH channel address, signing the funding `0x21`. It signs its own refund transaction and keeps it.
 3. **Open.** `POST extra.openUrl` with the funding outpoint and terms. The server rebuilds the script,
-   checks the funding on its own node, and records the channel.
+   checks the funding on its own node, and records the channel. Before funding, the client asks the
+   same endpoint whether it would open on these terms (preflight, below).
 4. **Pay.** Each request carries `PAYMENT-SIGNATURE` with the cumulative total `cum`, the client's
    signature on the state transaction for `cum` (when it rises), a strictly increasing `seq`, and an HMAC
    `auth` binding the payload to this exact request.
@@ -195,6 +196,15 @@ A client MUST check the echoed `closeFeePayer` (absent = `"payer"`) before signi
 
 `chan` is canonical: the txid in 64 lowercase hex, `:`, the output index in decimal with no leading zeros.
 
+**Preflight (before funding).** A client SHOULD first send the same request with `"preflight": true`
+and a `channel` without `txid` and `vout`. The server runs every check of the funded open that does not
+need the funding output (network, `closeFeePayer`, `redeemScript`, capacity and expiry against its
+policy), records nothing, and replies `200 {"preflight":true,"expiry":2014,"maxCum":"199400","minConf":1}`
+(plus `closeFeePayer` and `minCum` under payee-pays), or with the refusal the funded open would get.
+Then a refusal, such as a stale `payTo` after a server restart, costs the client nothing on-chain. A
+server from before this rule answers `bad_request` (no `vout`) only after its own terms checks pass,
+so on that answer the client funds and opens as before.
+
 ### `PAYMENT-SIGNATURE`
 ```json
 {
@@ -284,6 +294,15 @@ A **watcher** (at least once per block) MUST, for each channel independently: su
 funding is no longer confirmed to depth (reorg), close channels reaching the margin, and rebroadcast a
 close whose funding is unspent again. It SHOULD bump a stuck close by CPFP from the server's output. It
 MUST be supervised: after `expiry`, a missing close means the client's refund wins.
+
+The reference watcher bumps every block the close is unconfirmed. It works out the package feerate the
+close needs: the highest of a configured minimum, the node's estimate for confirming within a quarter
+of the blocks left, and the mempool's floor, doubled from the last send once a few blocks pass without a
+confirmation in the second half of the margin. It sends the close alone if that pays enough, and
+otherwise sends a package (`submitpackage`): the close plus a child that spends the server's own close
+output back to its key and pays the difference. Each new child replaces the last (BIP125). The child's
+fee is capped by configuration and by that output less dust. Package relay lets a close below the
+mempool's dynamic floor in on its child's fee, but not one below the node's static `minrelaytxfee`.
 
 ### `PAYMENT-RESPONSE`
 Every served request returns a `SettlementResponse` with an empty `transaction` and `amount` (nothing was
