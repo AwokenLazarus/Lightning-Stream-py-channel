@@ -813,15 +813,15 @@ class XbtChannelProvider:
                 self.rpc.sendrawtransaction(tx.hex())
             except Exception as e:  # noqa: BLE001 - node errors become protocol errors
                 # AGP-067 (C1): refused alone (below the mempool's floor), it goes in with a child
-                bumped = False
+                bumped, why = False, str(e)
                 if self.close_bump_max_fee > 0:
                     try:
                         self._bump_close(st, self.height(), txid, tx, refused_alone=True)
                         bumped = True
-                    except Exception:  # noqa: BLE001 - the close's own refusal is the one reported
-                        pass
+                    except Exception as b:  # noqa: BLE001 - reported with the close's own refusal
+                        why = f"{e}; bump: {b}"
                 if not bumped and not self._tx_known(txid, tx):
-                    raise ChannelError("close_failed", str(e))
+                    raise ChannelError("close_failed", why)
             self._closed(st, tx.hex(), txid, conditional)
         return st.closed_txid
 
