@@ -127,7 +127,7 @@ class PayeePaysOnChain(unittest.TestCase):
         node.tc = self
         h = R.hub(node, net, secret=int.from_bytes(os.urandom(16), "big"))
         prov = R.provider(node, net, "http://p.test", amsat_per_call=40 * AMSAT_PER_SAT)
-        h.connect("http://p.test", capacity=30_000)
+        h.connect("http://p.test", capacity=40_000)
         h.watch_tick()
         oc = h.out.chans["http://p.test"]
         self.assertEqual((oc.state, oc.p().close_fee_payer), ("open", "payee"))
@@ -140,7 +140,7 @@ class PayeePaysOnChain(unittest.TestCase):
         node.mine()
         st2 = next(s for s in prov.ledger.channels.values() if s.closed_txid == c2["txid"])
         self.assertEqual(self.values(c2["txid"]), [(st2.best_cum - FEE, st2.params.payee_spk),
-                                                   (30_000 - st2.best_cum, st2.params.payer_spk)])
+                                                   (40_000 - st2.best_cum, st2.params.payer_spk)])
 
 
 if __name__ == "__main__":

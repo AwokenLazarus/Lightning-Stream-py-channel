@@ -128,7 +128,7 @@ from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, 
                     fee_due, find_spend, hub_channel_message, next_cum, route_ok)
 from .rpc import RPCError
 from .tx import Tx, address_to_spk, segwit_address
-from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, request_auth, request_digest_v2,
+from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, closing, request_auth, request_digest_v2,
                            same_origin_url,
                            safe_code, unb64json)
 from .channel import channel_auth_key
@@ -708,7 +708,8 @@ class RouteHub:
         done = ((st1.extra or {}).get("route_done") or {}).get(lock_id)
         if done:                                   # the client lost our answer: the same one again
             return None, (200, {"Content-Type": "application/json"}, json.dumps(done).encode())
-        if st1.closed_txid or ib.height() >= st1.params.expiry - ib.close_margin:
+        # AGP-084: a ch1 close or rollover the node errored on can still confirm: no lock above it
+        if closing(st1) or ib.height() >= st1.params.expiry - ib.close_margin:
             return None, self._err("channel_closing")
         if st1.suspended:
             return None, self._err("unconfirmed")
@@ -1167,7 +1168,8 @@ class RouteHub:
     def ch2_terms(self, terms: dict, capacity: int = None, expiry_blocks: int = None) -> tuple:
         """Bound a provider's /terms before the hub funds anything (AGP-037): (capacity, blocks) or
         ChannelError bad_terms. A provider must not be able to set a ch2 the hub can never use or get
-        back: an expiry decades away, a close fee that eats the capacity, a minConf never reached."""
+        back: an expiry decades away, a close fee that eats the capacity, a minConf never reached.
+        bad_config when max_lock_sat is more than half of the capacity it would be funded with (AGP-084)."""
         c = self.config
         try:
             ex = terms["extra"]
@@ -1180,6 +1182,10 @@ class RouteHub:
             raise ChannelError("bad_terms", f"malformed /terms: {type(e).__name__} {e}") from None
         max_blocks = c.ch2_max_expiry_blocks or 2 * c.ch2_expiry_blocks
         cap = max(capacity or self.ch2_capacity, min_cap)
+        # AGP-084: AGP-064's bound (a lock is at most half of a ch2) against the capacity this ch2 is
+        # funded with, which the caller may have chosen below the configured one
+        if 2 * self.max_lock_sat > cap:
+            raise ChannelError("bad_config", f"max_lock_sat {self.max_lock_sat} must be at most half of this ch2's capacity {cap}")
         why = ""
         if not 0 <= close_fee <= c.ch2_max_close_fee_sat:
             why = f"closeFeeSat {close_fee} > ch2_max_close_fee_sat {c.ch2_max_close_fee_sat}"

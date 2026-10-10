@@ -233,6 +233,20 @@ def locks_open(st) -> bool:
     return any(above(s) for s in ex.get("stale_locks") or [])
 
 
+def intent_open(st) -> bool:
+    """A close or rollover of this channel was signed and written ahead (`close_intent`, M8) and is not
+    recorded as its close yet: the node answered the broadcast with an error, or we stopped before its
+    answer. That transaction is complete and can still confirm, so the channel takes no state above it
+    (AGP-084): no paid call, no routed lock. It ends when the node shows the spend (`_adopt_intent`),
+    when the watcher gets a close through, or when the client rolls over or closes again."""
+    return not st.closed_txid and bool((st.extra or {}).get("close_intent"))
+
+
+def closing(st) -> bool:
+    """The channel is closed, or a spend of it may be on its way (see `intent_open`)."""
+    return bool(st.closed_txid) or intent_open(st)
+
+
 def receipt_of(resp: dict) -> dict:
     """The signed channel receipt inside a PAYMENT-RESPONSE SettlementResponse."""
     r = ((resp or {}).get("extra") or {}).get("receipt") if isinstance(resp, dict) else None
@@ -680,6 +694,9 @@ class XbtChannelProvider:
             # so a close here could otherwise land between the two
             if not st.closed_txid and locks_open(st):
                 raise ChannelError("lock_pending", "a routed lock is open on this channel")
+            # AGP-084: an earlier spend the node has after all is this channel's close, before a new
+            # close replaces its intent
+            self._adopt_intent(st)
             if req.get("payload") and not st.closed_txid:   # after the close a state changes nothing (L10)
                 self._apply(st, req["payload"])
             txid = self._close_locked(st)
@@ -723,6 +740,10 @@ class XbtChannelProvider:
         if not self._tx_known(intent["txid"], Tx.parse(bytes.fromhex(intent["hex"]))):
             return False
         self._closed(st, intent["hex"], intent["txid"], intent["cond"])
+        if intent.get("next"):
+            # a rollover (AGP-084): the next channel is the one this tx funds
+            st.extra = {**st.extra, "rollover_to": intent["next"]}
+            self.ledger.save(st)
         return True
 
     # hash-locked conditional state (XBT-061 M6) ---------------------------------------------
@@ -1006,6 +1027,14 @@ class XbtChannelProvider:
             if st.extra.get("cond_close"):
                 self._claim(st)
             return
+        # AGP-084: a close the node answered with an error is sent again every tick. The channel takes
+        # no state until then, so it is the same close. Never a rollover: its client was told it failed
+        # and may no longer hold the next channel's key
+        if intent_open(st) and not st.extra["close_intent"].get("next") and not locks_open(st):
+            out.append(self._close_locked(st))
+            if st.extra.get("cond_close"):
+                self._claim(st)
+            return
         utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
         st.suspended = utxo is None or utxo.get("confirmations", 0) < self.policy.conf_for(p.capacity)
         zc = (st.extra or {}).get("zero_conf")
@@ -1174,7 +1203,7 @@ class XbtChannelProvider:
                     self.ledger.save(st)
                 # a VerifyResponse is what a resource server serves on: never isValid for a state this
                 # channel can no longer settle (L11). A higher state is still kept while closing.
-                if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
+                if closing(st) or self.height() >= st.params.expiry - self.close_margin:
                     raise ChannelError("channel_closing")
                 if st.suspended:
                     raise ChannelError("unconfirmed")
@@ -1256,6 +1285,9 @@ class XbtChannelProvider:
         tx.inputs[0].witness = [sig, ecc.sign(self._chan_secret(p), digest) + bytes([SIGHASH_ALL_UNIFIED]),
                                 b"\x01", p.script]
         with self.ledger.lock:
+            # AGP-084: an earlier spend the node has after all is this channel's close, before this
+            # rollover replaces its intent
+            self._adopt_intent(st)
             if st.closed_txid:
                 raise ChannelError("channel_closing", "already settled")
             # AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
@@ -1265,7 +1297,8 @@ class XbtChannelProvider:
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
-            st.extra = {**(st.extra or {}), "close_intent": {"hex": tx.hex(), "txid": txid, "cond": False}}
+            st.extra = {**(st.extra or {}), "close_intent": {"hex": tx.hex(), "txid": txid, "cond": False,
+                                                              "next": f"{txid}:1"}}
             self.ledger.save(st)
             try:
                 self.rpc.sendrawtransaction(tx.hex())
@@ -1316,7 +1349,8 @@ class XbtChannelProvider:
     def _lock_authed(self, st, pl: dict, route: dict, err):
         """A /lock whose auth passed and whose seq is in `st` (the ledger lock is the caller's): the
         answer, and whether `st` was written to disk on the way to it."""
-        if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
+        # AGP-084: nor on a ch2 whose close or rollover the node errored on (it can still confirm)
+        if closing(st) or self.height() >= st.params.expiry - self.close_margin:
             return err("channel_closing"), False
         if st.suspended:
             # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
@@ -1506,7 +1540,7 @@ class XbtChannelProvider:
             except BaseException:
                 self.ledger.save(st)
                 raise
-            if st.closed_txid or height >= st.params.expiry - self.close_margin:
+            if closing(st) or height >= st.params.expiry - self.close_margin:
                 return refuse("channel_closing")
             if st.suspended:
                 return refuse("unconfirmed")

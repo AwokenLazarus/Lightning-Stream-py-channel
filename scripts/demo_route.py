@@ -164,7 +164,7 @@ def main():
     print("== hub funds one channel per provider process from its own wallet (providers open nothing)")
     committed0 = hub.committed_sat()
     for n in "ABCD":
-        cap = 30_000 if n == "D" else 150_000
+        cap = 40_000 if n == "D" else 150_000
         oc = hub.connect(urls[n], capacity=cap)
         print(f"   ch2 hub->{n}: {oc.p().channel_id[:20]}... capacity {oc.p().capacity}")
     hub.watch_tick()
@@ -175,7 +175,7 @@ def main():
     check("hub-funded ch2 open to all 4 providers", len(opened) == 4, ",".join(opened))
     check("one ch2 per provider process: A and B (one payTo key, two ledgers) have a ch2 each, 4 funded",
           ch2("A").p().channel_id != ch2("B").p().channel_id and len(hub.out.chans) == 4
-          and hub.committed_sat() - committed0 == 150_000 * 3 + 30_000
+          and hub.committed_sat() - committed0 == 150_000 * 3 + 40_000
           and ch2("B").p().channel_id in provs["B"][0].ledger.channels
           and ch2("B").p().channel_id not in provs["A"][0].ledger.channels,
           f"{len(hub.out.chans)} ch2s, {hub.committed_sat() - committed0} sat committed")
