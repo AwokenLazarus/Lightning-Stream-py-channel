@@ -34,7 +34,7 @@ from .channel import ChannelError
 from .route import (AMSAT_PER_SAT, HUB_ROUTE_PATH, FeeQuote, Invoice, PriceQuote, call_auth, ceil_div, fee_due,
                     lock_auth, next_cum, session_key, state_verify)
 from .signer import ChannelSigner
-from .x402_channel import XbtChannelClient, b64json, request_digest_v2, unb64json
+from .x402_channel import XbtChannelClient, b64json, request_digest_v2, same_origin_url, unb64json
 
 
 @dataclass
@@ -443,7 +443,7 @@ class RoutePayer:
     def close(self) -> dict:
         """Cooperative close of ch1: the hub closes with the best state it holds (every completed
         lock is already a plain state there, so no final state is needed)."""
-        return self.cc._post(self.hub_url + self.ch.accepted["extra"]["closeUrl"],
+        return self.cc._post(same_origin_url(self.hub_url, self.ch.accepted["extra"]["closeUrl"]),
                              {"chan": self.chan, "sig": self.signer.sign_close(self.chan)})
 
     def summary(self) -> dict:
