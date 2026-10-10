@@ -8,6 +8,10 @@
 > is released, `released`); `max_lock_sat` defaults to 20,000 and is at most half of `ch2_capacity`.
 > The client resyncs on the `held` / `released` lists in the hub's view. Details: xbt-rs README,
 > "Hub routing safety (AGP-064)"; tests `tests/security/test_agp064_hub_safety.py`.
+> Since AGP-078 (closure audit): a ch1 rollover is refused `lock_pending` exactly as a close is; the
+> seq an authentic `/x402/route` or `/x402/xbt-channel/lock` spent is saved before its refusal leaves;
+> a `RouteHub` checks its `HubConfig` again when it is built. Details: xbt-rs README, "Hub
+> closure-audit fixes (AGP-078)"; tests `tests/security/test_agp078_hub_closure.py`.
 
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.

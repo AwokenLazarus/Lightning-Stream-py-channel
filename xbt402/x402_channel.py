@@ -250,7 +250,8 @@ def settlement_response(receipt: dict, network: str, payer: str, success: bool) 
 def locks_open(st) -> bool:
     """A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
     (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
-    have to pay on its ch2. Closing ch1 now would close below it."""
+    have to pay on its ch2. Closing ch1 now would close below it, and so would rolling it over: both
+    spend its funding (AGP-078)."""
     ex = st.extra or {}
     if ex.get("route_lock"):
         return True
@@ -1251,7 +1252,8 @@ class XbtChannelProvider:
         channel, one tx that pays this provider `amount` (at least its best state) and funds the next
         channel with the rest less the close fee (ChannelParams.rollover_tx). The payer's signature
         over that exact tx is the authorisation. The next channel opens through extra.openUrl once it
-        confirms."""
+        confirms. Refused `lock_pending`, as a close is, while a routed lock is open on the channel,
+        whatever `amount`."""
         st = self._channel(req["chan"])
         p = st.params
         with self.ledger.lock:
@@ -1286,6 +1288,10 @@ class XbtChannelProvider:
         with self.ledger.lock:
             if st.closed_txid:
                 raise ChannelError("channel_closing", "already settled")
+            # AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
+            # ledger lock that is held until the rollover is sent: route() writes its lock under it too
+            if locks_open(st):
+                raise ChannelError("lock_pending", "a routed lock is open on this channel")
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
@@ -1324,37 +1330,52 @@ class XbtChannelProvider:
                 return err("unknown_channel")
             if not self._authentic(st, pl, method, bind, body):
                 return err("bad_auth", status=401)
-            st.seq = int(pl["seq"])
-            if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
-                return err("channel_closing")
-            if st.suspended:
-                # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
-                # leaves a rollover child suspended although it confirmed (the parent was then spent in a
-                # block, so it was no zero-conf child either). A hub looks at the chain itself before it
-                # sends a lock: so do we before refusing one on an unconfirmed child
-                zc = (st.extra or {}).get("zero_conf")
-                if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
-                    return err("unconfirmed")
-                st.suspended = False
-                self.ledger.save(st)
-            if not self._zc_confirmed(st):
-                # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
-                zc = st.extra["zero_conf"]
-                try:
-                    cum = int(pl.get("cum"))
-                except (TypeError, ValueError):
-                    return err("bad_payload")
-                # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
-                if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
-                    if self.height() >= zc["until"]:
-                        return err("unconfirmed", "rollover unconfirmed at the parent's close margin")
-                    return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed")
+            st.seq = int(pl["seq"])                               # spent, whatever happens next
+            # AGP-078 (review T4): the seq is durable before any answer that did not write it (or the
+            # error that ended the request) leaves. Kept only in memory it came back after a restart,
+            # and the refused header authenticated again
             try:
-                out = self.routes.complete_lock(st, pl, route)
-            except ChannelError as e:
+                resp, saved = self._lock_authed(st, pl, route, err)
+            except BaseException:
                 self.ledger.save(st)
-                return err(e.code, str(e))
-        return (202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()
+                raise
+            if not saved:
+                self.ledger.save(st)
+            return resp
+
+    def _lock_authed(self, st, pl: dict, route: dict, err):
+        """A /lock whose auth passed and whose seq is in `st` (the ledger lock is the caller's): the
+        answer, and whether `st` was written to disk on the way to it."""
+        if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
+            return err("channel_closing"), False
+        if st.suspended:
+            # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
+            # leaves a rollover child suspended although it confirmed (the parent was then spent in a
+            # block, so it was no zero-conf child either). A hub looks at the chain itself before it
+            # sends a lock: so do we before refusing one on an unconfirmed child
+            zc = (st.extra or {}).get("zero_conf")
+            if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
+                return err("unconfirmed"), False
+            st.suspended = False
+        if not self._zc_confirmed(st):
+            # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
+            zc = st.extra["zero_conf"]
+            try:
+                cum = int(pl.get("cum"))
+            except (TypeError, ValueError):
+                return err("bad_payload"), False
+            # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
+            if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
+                if self.height() >= zc["until"]:
+                    return err("unconfirmed", "rollover unconfirmed at the parent's close margin"), False
+                return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed"), False
+        # what the checks above changed (a child seen confirmed) is written with the seq: by
+        # complete_lock when it answers, by the caller when it refuses
+        try:
+            out = self.routes.complete_lock(st, pl, route)
+        except ChannelError as e:
+            return err(e.code, str(e)), False
+        return ((202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()), True
 
     def _routed_call(self, method: str, path: str, path_key: str, hdr: str, body: bytes, url: str):
         from .route import AMSAT_PER_MSAT  # noqa: F401
@@ -1800,6 +1821,34 @@ class ClientChannel:
     receipts: list = field(default_factory=list)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib then raises the 3xx as an HTTPError, which `http` returns."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
+def same_origin_url(origin: str, value) -> str:
+    """AGP-080 X1: where a seller says its open or close endpoint is, held to the seller's own origin.
+    `origin + value` let "@evil.example/open" name another host. Accepted: a path starting with exactly
+    one "/", or an absolute URL on `origin`; no backslash, whitespace or control character either way.
+    Anything else is refused before a request is made."""
+    def refuse():
+        return ChannelError("seller_url", "the seller's URL is not on its own origin; refused before any request")
+    if not isinstance(value, str) or not value:
+        raise refuse()
+    if any(c == "\\" or c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise refuse()
+    if value.startswith("/") and not value.startswith("//"):
+        return origin + value
+    if not origin or url_origin(value) != origin:       # url_origin: "" for anything not absolute
+        raise refuse()
+    return value
+
+
 class XbtChannelClient:
     """Payer SDK. `fund(address, sats) -> (txid, vout)` is the only wallet hook: in production it is
     the B2 agent-wallet MCP (policy-checked, 0x21-signed), so the SDK never holds funding keys.
@@ -1842,9 +1891,12 @@ class XbtChannelClient:
 
     @staticmethod
     def http(method, url, body=b"", headers=None):
+        """One request, one answer. A 3xx is returned as the answer and never followed (AGP-080 X1, as
+        the Rust transport): a payer that checked the origin against an allowlist must not be sent on
+        to another host, least of all with its PAYMENT-SIGNATURE header."""
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with _NO_REDIRECT.open(req, timeout=30) as r:
                 return XbtChannelClient._read_capped(r)
         except urllib.error.HTTPError as e:
             return XbtChannelClient._read_capped(e)
@@ -1909,7 +1961,8 @@ class XbtChannelClient:
         terms = {"capacity": cap, "expiry": expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
                  "redeemScript": p.script.hex(), **({"closeFeePayer": fee_payer} if fee_payer != "payer" else {})}
         # review C2 (AGP-067): the provider's answer to these exact terms before anything is funded
-        self._preflight(origin + ex["openUrl"], terms, fee_payer)
+        open_url = same_origin_url(origin, ex["openUrl"])
+        self._preflight(open_url, terms, fee_payer)
         fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
         txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
@@ -1931,7 +1984,7 @@ class XbtChannelClient:
         if self.on_open:
             self.on_open(ch)
         c = {"txid": txid, "vout": vout, **terms}
-        r = self._post(origin + ex["openUrl"], {"x402Version": 2, "network": self.network, "channel": c})
+        r = self._post(open_url, {"x402Version": 2, "network": self.network, "channel": c})
         if isinstance(r, dict) and r.get("closeFeePayer", "payer") != fee_payer:
             # a provider that did not take our terms would refuse every state we sign: stop before paying
             raise ChannelError("bad_fee_payer", "the provider opened the channel with another closeFeePayer")
@@ -2101,7 +2154,7 @@ class XbtChannelClient:
             sig = self.signer.sign_close(ch.payer.params.channel_id)
         else:
             sig = ecc.sign(ch.payer.secret, close_message(ch.payer.params.channel_id)).hex()
-        return self._post(origin + ch.accepted["extra"]["closeUrl"],
+        return self._post(same_origin_url(origin, ch.accepted["extra"]["closeUrl"]),
                           {"chan": ch.payer.params.channel_id, "sig": sig, "payload": pl})
 
     def _rollover(self, ch: ClientChannel):

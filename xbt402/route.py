@@ -796,7 +796,8 @@ class RouteSeller:
     def complete_lock(self, st, pl: dict, route: dict) -> dict:
         """Called by the provider with its ledger lock held, after the hub's channel auth passed.
         Checks the lock, completes it with the window's t, saves the plain state write-ahead, and
-        only then credits the session and returns t.
+        only then credits the session and returns t. Every answer has written `st` (and with it the
+        seq the request spent); after a ChannelError the caller writes it.
 
         ch2's cumulative amount is `next_cum(routed, d, min_amount)`: the routed total with the
         channel's floor (546-sat dust, plus closeFee when the provider pays its own close, v1.2),
@@ -815,6 +816,7 @@ class RouteSeller:
             if done:                                         # idempotent: the same answer again
                 if done["session"] != sid or done["amount"] != amount:
                     raise ChannelError("bad_invoice", "lockId already completed with other terms")
+                self.p.ledger.save(st)                       # the seq this answer spent (AGP-078)
                 return self._lock_answer(st, lock_id, done)
             s = self.sessions.get(sid)
             if s is None:
@@ -834,6 +836,7 @@ class RouteSeller:
                 raise ChannelError("bad_amount", "lock amount must be >= 1 sat")
             if self.no_reveal:
                 self.held.append({"lockId": lock_id, "cum": cum, "pre": pl.get("adaptor"), "chan": st.params.channel_id})
+                self.p.ledger.save(st)
                 return {"held": lock_id}
             routed = int((st.extra or {}).get("routed_sat", 0))
             need = next_cum(routed, amount, st.params.min_amount)
