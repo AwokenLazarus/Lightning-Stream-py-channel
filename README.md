@@ -57,3 +57,15 @@ B2 (XBT-062) should implement these signer methods: `xbt402_new_key`, `xbt402_at
   (`funding.offer_expiry_blocks`), and refuses an offer without those terms before it funds.
 
 Tests: `tests/security/test_agp081_closure_audit.py`.
+
+## Fix wave 3, the hub (AGP-085)
+
+- **A hub's rollover keeps its next ch2.** The next ch2's key and refund are written before the
+  rollover request leaves and stay whatever the provider answers (it holds the request signed and
+  may broadcast it). One next key per ch2: a retry asks under the same key and expiry, and the
+  watcher adopts whichever attempt spends the funding, by its script. `next` is cleared only when a
+  confirmed spend of the funding is not a rollover into it.
+- **ch1's counters move by what a lock adds** (`unitsBy`), on completion and on a hold, so a hold
+  released while another lock was in flight does not come back with that lock.
+
+Details: `docs/routing.md` (the AGP-085 note). Tests: `tests/security/test_agp085_hub.py`.

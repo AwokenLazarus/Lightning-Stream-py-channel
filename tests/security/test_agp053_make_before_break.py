@@ -71,7 +71,7 @@ class MakeBeforeBreak(_Roll):
         with self.assertRaises(ChannelError) as e:                   # and the provider would refuse it
             self.hub.rollover(child)
         self.assertEqual(e.exception.code, "unconfirmed")
-        self.assertEqual(child.next, {})
+        self.assertTrue(child.next.get("secret"))    # AGP-085: kept at a refusal (the provider holds the request signed)
         child.signed = self.child_st(child).best_cum
         self.node.confirm_all()
         self.hub.watch_tick()

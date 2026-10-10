@@ -34,7 +34,8 @@ and closes ch1s at their margin.
 
 Money safety (AGP-037):
   * write-ahead funding: a ch2's payer key and params are on disk (state `funding`) before the `fund`
-    hook runs, and a rollover's next ch2 (`next`) before the rollover request leaves. A fund hook that
+    hook runs, and a rollover's next ch2 (`next`) before the rollover request leaves, kept whatever the
+    provider answers until a confirmed spend shows the rollover did not happen (AGP-085). A fund hook that
     fails after it broadcast leaves a record the watcher reconciles: the wallet's sends to the ch2
     address (gettransaction), gettxout incl. the mempool, getmempoolentry, then scantxoutset (AGP-045).
     Found in a block or the mempool -> funded, the open goes on; not found within
@@ -194,14 +195,28 @@ def watched(r: dict) -> bool:
 COUNTERS = (("routed_sat", "routed"), ("fee_units", "units"), ("fee_paid", "paid"))   # ch1's base, a lock's `after`
 
 
+def lock_adds(lock: dict) -> Optional[dict]:
+    """What a ch1 lock adds to the base (AGP-085): d + f, its fee units (`unitsBy`, written at admission)
+    and f. None for a lock written before AGP-085, which has only the totals fixed at admission."""
+    if "unitsBy" not in lock:
+        return None
+    return {"routed": int(lock["d"]) + int(lock["f"]), "units": int(lock["unitsBy"]), "paid": int(lock["f"])}
+
+
 def hold_in_base(ex: dict, lock: dict):
     """AGP-064 (H2): a lock written off after its ch2 pre-signature left stays in ch1's base until that
-    ch2 resolves. Raise the counters to the lock's `after` and record on it what was added (`hold`),
+    ch2 resolves. Raise the counters by what the lock adds (`lock_adds`) and record that on it (`hold`),
     so a release takes back exactly that, whatever came after."""
     hold = {}
+    add = lock_adds(lock)
     for k, a in COUNTERS:
         cur = int(ex.get(k, 0))
-        to = max(cur, int((lock.get("after") or {}).get(a, 0)))
+        if add is not None:
+            # AGP-085: what this lock adds, not the totals fixed when it was admitted: a hold released
+            # while it was in flight is not in the base any more and must not come back with it
+            to = cur + add[a]
+        else:                                    # a lock written before AGP-085
+            to = max(cur, int((lock.get("after") or {}).get(a, 0)))
         ex[k], hold[a] = to, to - cur
     lock["hold"] = hold
 
@@ -815,7 +830,9 @@ class RouteHub:
         lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
                  "T": rt["point"], "T1": pl.get("point"), "r": f"{r:064x}", "d": d, "f": f, "units": units,
                  "provider": provider, "at": round(time.time(), 3), "session": rt.get("session"),
-                 "after": {"routed": routed1 + d + f, "units": units, "paid": int(ex1.get("fee_paid", 0)) + f}}
+                 "after": {"routed": routed1 + d + f, "units": units, "paid": int(ex1.get("fee_paid", 0)) + f},
+                 # the fee units it adds (AGP-085): ch1's base may move under a lock in flight (a release)
+                 "unitsBy": units - int(ex1.get("fee_units", 0))}
         st1.extra = {**ex1, "route_lock": lock1}
         try:
             ib.ledger.save(st1)
@@ -1071,7 +1088,11 @@ class RouteHub:
             else:
                 ex["route_lock"] = None
                 ex["routed_sat"] = int(ex.get("routed_sat", 0)) + lock1["d"] + lock1["f"]
-                ex["fee_units"] = lock1["units"]
+                # AGP-085: by what the lock adds, as the two beside it. Its `units` is the total fixed at
+                # admission: a hold released while the lock was in flight came back with it, the client
+                # (which had subtracted it) disagreed for good, and every later lock was bad_amount
+                add = lock_adds(lock1)
+                ex["fee_units"] = int(ex.get("fee_units", 0)) + add["units"] if add is not None else lock1["units"]
                 ex["fee_paid"] = int(ex.get("fee_paid", 0)) + lock1["f"]
                 done = dict(ex.get("route_done") or {})
                 done[lock_id] = ans
@@ -1547,7 +1568,16 @@ class RouteHub:
     def rollover(self, oc: OutChannel) -> dict:
         """One tx pays the provider its balance and funds the next ch2 (rollover instead of close). The
         next ch2's key is written ahead (`oc.next`), and its funding txid is known before the request
-        leaves, so a lost answer is finished by the watcher when that tx spends the funding."""
+        leaves, so a lost answer is finished by the watcher when that tx spends the funding.
+
+        AGP-085: the next ch2 outlives every answer. The provider holds the request signed whatever it
+        answered (400 after its broadcast, a lost reply, a node that took the tx after erroring), so
+        `next` is kept until a confirmed spend of this funding shows it was not a rollover (_reconcile).
+        One next key per ch2: a later attempt asks under the same key and expiry (the amount, and with it
+        the txid, may differ), so whichever attempt the provider broadcasts pays the one script the
+        watcher looks for (_next_funded). Once that expiry is under the terms' floor it is not asked for
+        again, and no other key is made (the provider could still broadcast into the kept one): the ch2
+        is closed and refilled, `next` still kept."""
         # AGP-064 (H2): a rollover spends the funding a written-off lock's pre-signature is on, and its
         # secret could no longer be read off a close
         if oc.pending or oc.stale:
@@ -1568,7 +1598,14 @@ class RouteHub:
                 # kept until the next one is usable or it is drained (closing it now would pause routing)
                 return {"event": "ch2_wait_next", "provider": oc.origin, "chan": p.channel_id}
             return self.close_ch2(oc, refill=True)
-        secret = secrets.randbelow(adaptor.N - 1) + 1
+        if oc.next:
+            kept = OutChannel(**oc.next)
+            min_exp, _, min_conf, margin = offer_expiry_terms(oc.terms["extra"])
+            if kept.p().expiry - tip < open_expiry_floor(min_exp, min_conf, margin):
+                return self.close_ch2(oc, refill=True)
+            secret, expiry = int(kept.secret, 16), kept.p().expiry
+        else:
+            secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
         nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, network=self.network,
                                    close_fee_payer=p.close_fee_payer)
@@ -1591,11 +1628,7 @@ class RouteHub:
             doc = json.loads(raw)
         except (OSError, ValueError) as e:
             raise ChannelError("provider_error", f"rollover: {type(e).__name__}: {e}") from None
-        if st != 200:
-            if st in (400, 401, 403):                  # refused: nothing was broadcast
-                with self.out.lock:
-                    oc.next = {}
-                    self.out.save()
+        if st != 200:                                  # refused, it says: `next` stays (AGP-085)
             raise ChannelError(doc.get("error", "provider_error") if isinstance(doc, dict) else "provider_error",
                                str(doc)[:200])
         if not isinstance(doc, dict) or str(doc.get("txid", "")).lower() != txid:
@@ -1634,10 +1667,12 @@ class RouteHub:
         txid = new.p().funding_txid
         with self.out.lock:
             oc.state, oc.rolled_to, oc.close_txid, oc.next = "rolled", f"{txid}:1", txid, {}
-            self.out.archived.append(asdict(oc))
             if self.out.chans.get(oc.origin) is oc:
+                self.out.archived.append(asdict(oc))
                 self.out.chans[oc.origin] = new
             else:
+                # an archived ch2 (replaced by a refill or a switch): the watcher writes its record back
+                # in place; the next ch2 is watched in the archive and refunded at its expiry
                 self.out.archived.append(asdict(new))
             self.out.save()
         ev = {"event": "ch2_rollover", "provider": oc.origin, "txid": txid, "amount": amount,
@@ -2151,7 +2186,10 @@ class RouteHub:
             if gone is not None:
                 return out + gone
         confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
-        if oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid and confirmed:
+        # (AGP-085: with a next ch2 written ahead the spender is read, never taken on the provider's word:
+        # it may be a rollover into it)
+        if (oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid and confirmed
+                and not oc.next):
             with self.out.lock:                             # the provider's close as it told us, confirmed: done
                 oc.state, oc.final = "closed", True
                 self.out.save()
@@ -2178,13 +2216,26 @@ class RouteHub:
             out.append(ev)
             return out
         spender = tx.txid()
-        if oc.next and spender == OutChannel(**oc.next).p().funding_txid:
-            return [self._finish_rollover(oc, oc.signed)]
+        if self._next_funded(oc, tx):
+            if oc.pending or oc.stale:
+                # AGP-085: a rollover reveals no t. Its locks are unpaid once it confirms, not before (a
+                # close that shows t may still replace it in the mempool)
+                if not confirmed:
+                    return out
+                with self.out.lock:
+                    if oc.pending:
+                        oc.stale = oc.stale + [{**oc.pending, "voided": round(time.time(), 3), "why": "rolled over"}]
+                        oc.pending = {}
+                    self.out.save()
+                out += self._release_stale(oc)
+            return out + [self._finish_rollover(oc, oc.signed)]
         prev_fee = next((int(r.get("fee") or 0) for r in oc.refund_prev if r.get("txid") == spender), None)
         if spender == oc.refund_txid or prev_fee is not None:          # one of our refund versions
             fee = oc.refund_fee if prev_fee is None else prev_fee
             with self.out.lock:
                 oc.state, oc.final = "refunded", confirmed
+                if confirmed:
+                    oc.next = {}                        # the funding went to our refund: no rollover (AGP-085)
                 if confirmed and prev_fee is not None:     # an earlier version won: it is the refund that counts
                     oc.refund_txid, oc.refund_fee, oc.refund_hex = spender, fee, ""
                 self.out.save()
@@ -2227,6 +2278,32 @@ class RouteHub:
         out += self._release_stale(oc)          # a confirmed close that did not reveal a written-off lock's t did not pay it
         return out
 
+    def _pays_ch2(self, new: OutChannel, tx: Tx) -> bool:
+        """`tx` is a rollover into `new`: two outputs, the second to its script. Only a transaction the
+        hub signed pays that script from the parent's funding. If it is not the attempt on record (the
+        same key and expiry, another amount: AGP-085), the record takes the outpoint and value this one
+        gave it, and a refund for them (the caller saves)."""
+        p = new.p()
+        if len(tx.outputs) != 2 or tx.outputs[1].script_pubkey != p.spk:
+            return False
+        if tx.txid() != p.funding_txid or p.funding_vout != 1:
+            p.funding_txid, p.funding_vout, p.capacity = tx.txid(), 1, tx.outputs[1].value
+            new.params, new.refund_hex = p.to_dict(), p.refund_tx(int(new.secret, 16)).hex()
+        return True
+
+    def _next_funded(self, oc: OutChannel, tx: Tx) -> bool:
+        """`tx`, which spent this ch2's funding, is a rollover into the next ch2 written ahead
+        (`oc.next`): the attempt last asked for, or an earlier one under the same key."""
+        if not oc.next:
+            return False
+        new = OutChannel(**oc.next)
+        if not self._pays_ch2(new, tx):
+            return False
+        with self.out.lock:
+            oc.next = asdict(new)
+            self.out.save()
+        return True
+
     def _rollover_gone(self, oc: OutChannel, p: ChannelParams) -> Optional[list]:
         """A rollover child's funding output is not in the UTXO set nor the mempool (AGP-053). The
         rollover tx exists (in the mempool, or its output confirmed): None, the usual reconcile (it was
@@ -2259,6 +2336,33 @@ class RouteHub:
         if tx is None or tx.txid() == p.funding_txid:
             return None
         spender = tx.txid()
+        if len(tx.outputs) == 2 and tx.outputs[1].script_pubkey == p.spk:
+            # AGP-085: another attempt at the same rollover, into this ch2's script, took the place of
+            # the one adopted (one next key per ch2: the provider may hold several attempts). The coins
+            # are in this ch2 at another outpoint, and every state signed on the old one is void: it
+            # starts again as that transaction's child, and the watcher opens it. Locks out on the old
+            # outpoint are unpaid once the replacement confirms; until then it waits
+            if oc.pending or oc.stale:
+                if self.rpc.gettxout(ptxid, pvout, False) is not None:
+                    return []
+                with self.out.lock:
+                    if oc.pending:
+                        oc.stale = oc.stale + [{**oc.pending, "voided": round(time.time(), 3), "why": "rollover replaced"}]
+                        oc.pending = {}
+                    self.out.save()
+                out = self._release_stale(oc)
+            else:
+                out = []
+            was = p.channel_id
+            with self.out.lock:
+                self._pays_ch2(oc, tx)
+                oc.state, oc.zero_conf, oc.fund_seen, oc.blocked = "funded", {}, True, ""
+                oc.signed = oc.routed = oc.seq = 0
+                self.out.save()
+            ev = {"event": "ch2_rollover_replaced", "provider": oc.origin, "chan": was, "parent": oc.rolled_from,
+                  "spender": spender, "kept": oc.p().channel_id}
+            self.events.append(ev)
+            return out + [ev]
         with self.out.lock:
             oc.state, oc.final, oc.blocked = "dropped", True, f"the rollover was replaced by {spender}"
             self.out.save()

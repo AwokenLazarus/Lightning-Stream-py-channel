@@ -270,7 +270,8 @@ class RoutePayer:
           held (AGP-064): its ch2 pre-signature may be out, so the hub keeps it in the base until that
             ch2 resolves; our counters become its `after`, our signed state stays;
           released: its ch2 resolved unpaid; the hold leaves our counters, so our next locks are quoted
-            below our signed state (the dust floor) until what we paid ahead for it is used."""
+            below our signed state (the dust floor) until what we paid ahead for it is used.
+        AGP-085: a release may come in the same view as a completion or a hold; see `gone` below."""
         try:
             best = int(doc["bestCum"])
             hub = (int(doc["routedSat"]), int(doc["feeUnits"]), int(doc["feePaid"]))
@@ -282,34 +283,65 @@ class RoutePayer:
             v = doc.get(k)
             return isinstance(v, list) and lid in v
 
+        # AGP-085: held locks the hub lists as released, and what they take out of the counters. A view
+        # may show a release together with a completion or a new hold (the hub released while that lock
+        # was in flight), so each case below is also tried with the released holds taken out
+        gone = [g for g in self.given_up if g.get("held") and listed("released", g["lockId"])]
+
+        def less(v, skip=None) -> tuple:
+            v = list(v)
+            for x in gone:
+                if x is not skip:
+                    for i in range(3):
+                        v[i] = max(0, v[i] - max(0, x["after"][i] - x["before"][i]))
+            return tuple(v)
+
+        def drop(*gs):
+            self.given_up = [x for x in self.given_up if not any(x is g for g in gs)]
+
         if best > self.signed:
-            g = next((g for g in self.given_up if not g.get("floor") and g["cum"] == best
-                      and (tuple(g["after"]) == hub or (g.get("held") and hub == ours))), None)
-            if g is None:
-                return False
-            self.signer.adopt_lock(self.chan, best)
-            self.routed, self.fee_units, self.fee_paid = hub
-            self.signed = best
-            self.given_up = [x for x in self.given_up if x is not g]
-            self.events.append({"event": "resync", "lockId": g["lockId"], "cum1": best})
-            return True
+            for g in (g for g in self.given_up if not g.get("floor") and g["cum"] == best):
+                rel = [x for x in gone if x is not g]
+                if tuple(g["after"]) == hub or (g.get("held") and hub == ours):
+                    rel = []
+                elif not rel or not (less(g["after"], g) == hub or (g.get("held") and less(ours, g) == hub)):
+                    continue
+                self.signer.adopt_lock(self.chan, best)
+                self.routed, self.fee_units, self.fee_paid = hub
+                self.signed = best
+                drop(g, *rel)
+                self.events.append({"event": "resync", "lockId": g["lockId"], "cum1": best})
+                if rel:
+                    self.events.append({"event": "resync_release", "lockIds": [x["lockId"] for x in rel], "routedSat": hub[0]})
+                return True
+            return False
         if best != self.signed or hub == ours:
             return False
-        gone = [g for g in self.given_up if g.get("held") and listed("released", g["lockId"])]
-        if gone:
-            want = list(ours)
-            for g in gone:
-                for i in range(3):
-                    want[i] = max(0, want[i] - max(0, g["after"][i] - g["before"][i]))
-            if tuple(want) == hub:
-                self.routed, self.fee_units, self.fee_paid = hub
-                self.given_up = [x for x in self.given_up if not any(x is g for g in gone)]
-                self.events.append({"event": "resync_release", "lockIds": [g["lockId"] for g in gone], "routedSat": hub[0]})
-                return True
+        if gone and less(ours) == hub:
+            self.routed, self.fee_units, self.fee_paid = hub
+            drop(*gone)
+            self.events.append({"event": "resync_release", "lockIds": [g["lockId"] for g in gone], "routedSat": hub[0]})
+            return True
+
+        def adds(g) -> tuple:
+            return tuple(g["after"][i] - g["before"][i] for i in range(3))
         g = next((g for g in self.given_up if not g.get("held") and tuple(g.get("before") or ()) == ours
                   and tuple(g["after"]) == hub and listed("held", g["lockId"])), None)
+        rel = []
+        if g is None and gone:
+            # a hold on top of a release: the hub holds this lock by what it adds, on a base the
+            # released holds have left
+            base = less(ours)
+            g = next((g for g in self.given_up if not g.get("held") and tuple(g.get("before") or ()) == ours
+                      and tuple(base[i] + adds(g)[i] for i in range(3)) == hub and listed("held", g["lockId"])), None)
+            rel = gone
         if g is None:
             return False
+        if rel:
+            # as if the release had been adopted first: the lock was given up on the base without them
+            g["before"], g["after"] = less(ours), hub
+            drop(*rel)
+            self.events.append({"event": "resync_release", "lockIds": [x["lockId"] for x in rel], "routedSat": less(ours)[0]})
         g["held"] = True
         self.routed, self.fee_units, self.fee_paid = hub
         self.events.append({"event": "resync_hold", "lockId": g["lockId"], "routedSat": hub[0]})
