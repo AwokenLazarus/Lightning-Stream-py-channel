@@ -415,6 +415,12 @@ class HubConfig:
         return cls(**d)
 
     def __post_init__(self):
+        self.validate()
+
+    def validate(self):
+        """The bounds a config must keep however it was built: checked when one is constructed and again
+        when a RouteHub is built from it (AGP-078: a config changed after construction went around the
+        first)."""
         if self.ch1_close_fee_payer not in FEE_PAYERS or self.ch2_close_fee_payer not in FEE_PAYERS:
             raise ValueError("ch1_close_fee_payer / ch2_close_fee_payer are payer or payee")
         # AGP-064: a written-off lock holds the client's base and blocks its ch2 until that ch2
@@ -449,6 +455,7 @@ class RouteHub:
             overrides["fee_strategy"], fee_strategy = fee_strategy, None
         if overrides:
             cfg = HubConfig(**{**asdict(cfg), **overrides})
+        cfg.validate()
         self.config = cfg
         os.makedirs(datadir, exist_ok=True)
         self.rpc, self.secret, self.network, self.fund, self.hrp = rpc, pay_to_secret, network, fund, cfg.hrp
@@ -591,7 +598,8 @@ class RouteHub:
             doc["accepts"][0]["extra"]["routing"] = self.routing_extra()
             h["PAYMENT-REQUIRED"] = b64json(doc)
             return 402, h, json.dumps(doc).encode()
-        if method == "POST" and path.split("?", 1)[0] == "/x402/xbt-channel/close":
+        # a rollover spends ch1's funding as a close does (AGP-078): the same sweep before either
+        if method == "POST" and path.split("?", 1)[0] in ("/x402/xbt-channel/close", "/x402/xbt-channel/rollover"):
             try:
                 self._sweep_orphan_lock(canonical_chan(json.loads(body)["chan"]))
             except (ValueError, KeyError, TypeError, ChannelError):
@@ -673,118 +681,143 @@ class RouteHub:
             if not ib._authentic(st1, pl, method, bind, body):
                 return self._err("bad_auth", status=401)
             st1.seq = int(pl["seq"])
-            done = ((st1.extra or {}).get("route_done") or {}).get(lock_id)
-            if done:                                   # the client lost our answer: the same one again
-                return 200, {"Content-Type": "application/json"}, json.dumps(done).encode()
-            if st1.closed_txid or ib.height() >= st1.params.expiry - ib.close_margin:
-                return self._err("channel_closing")
-            if st1.suspended:
-                return self._err("unconfirmed")
-            # 2 point --------------------------------------------------------------------------
+            # AGP-078 (review T4): the seq this request spent is durable before its refusal (or the error
+            # that ended it) leaves. Kept only in memory it came back after a restart, and the refused
+            # header authenticated again
             try:
-                T = adaptor.dec(rt["point"])
-                r = int(rt["tweak"], 16) % adaptor.N
-                T1 = adaptor.dec(pl["point"]) if pl.get("point") else None
-            except (KeyError, TypeError, ValueError):
-                return self._err("bad_point", "points must be compressed secp256k1 points")
-            if T1 is not None and (not r or adaptor.add(T, adaptor._mul_pub(r)) != T1):
-                return self._err("bad_point", "T1 != T + r*G")
-            # 3 amount -------------------------------------------------------------------------
-            ex1 = st1.extra or {}
-            routed1 = int(ex1.get("routed_sat", 0))
-            cum = int(pl.get("cum", -1))
-            need1 = next_cum(routed1, d + f, st1.params.min_amount)
-            if d < 1 or f < 0 or d > self.max_lock_sat:
-                return self._err("bad_amount", f"lock amount must be in [1, {self.max_lock_sat}]")
-            floor1 = need1 <= st1.best_cum
-            # our view of ch1, so a client that gave up a lock we later completed (t read off a ch2
-            # close), held or released can resync: it adopts only states and counters it implied itself
-            view = ch1_view(st1)
-            if floor1:
-                if cum != st1.best_cum or pl.get("adaptor"):
-                    return self._err("bad_amount", f"the dust floor covers this lock: cum {st1.best_cum}, no adaptor",
-                                     expectCum=st1.best_cum, **view)
-            elif cum != need1 or cum > st1.params.max_amount or T1 is None:
-                return self._err("bad_amount", f"lock pays {cum}, expected {need1}", expectCum=need1, **view)
-            # 4 pre-verify ---------------------------------------------------------------------
-            pre1 = None
-            if not floor1:
-                try:
-                    pre1 = adaptor.PreSig.from_json(pl["adaptor"])
-                except (KeyError, TypeError, ValueError):
-                    return self._err("bad_adaptor", "malformed adaptor")
-                z1 = st1.params.sighash(st1.params.state_tx(cum))
-                if not adaptor.preverify(bytes.fromhex(st1.params.payer_pub), z1, T1, pre1):
-                    return self._err("bad_adaptor", "pre-signature does not verify under T1")
-            # 5 fee quote ----------------------------------------------------------------------
-            try:
-                q = FeeQuote.from_dict(rt["feeQuote"])
-            except (ChannelError, KeyError):
-                return self._err("route_fee", "no fee quote")
-            # any live quote this hub signed is honoured, including one the fee strategy has since moved
-            if q.hub != self.pay_to or q.network != self.network or not q.verify() or not q.live(time.time()):
-                return self._err("route_fee", "not a live fee quote of this hub")
-            f_due, units = fee_due(q, d, int(ex1.get("fee_units", 0)), int(ex1.get("fee_paid", 0)))
-            if f < f_due:
-                return self._err("route_fee", f"fee {f} < {f_due} due under quote {q.seq}", feeDue=f_due)
-            # 6 expiry rule --------------------------------------------------------------------
-            # the provider is the origin the client named: its own ch2, in that process's ledger (AGP-056)
-            key = provider
-            oc = self.out.chans.get(key)
-            # a rollover's next ch2 is opened (AGP-053) under the mutex the lock takes below: it is checked
-            # again there, once it is open
-            opening = oc is not None and oc.state == "funded" and oc.rolled_from and self.zero_conf_rollover
-            # the origin's next ch2, funded ahead (AGP-057), takes the lock its live one cannot: decided
-            # under the mutex below
-            nxt = self.out.next_chans.get(key)
-            spare = nxt is not None and nxt.state == "open"
-            if (oc is None or (oc.state != "open" and not opening)) and not spare:
-                return self._err("route_blocked", self._no_channel(provider, oc))
-            if oc is not None and oc.blocked and not (spare and oc.blocked == ROLLOVER_GONE):
-                return self._err("route_blocked", oc.blocked)
-            if oc is None:
-                oc = nxt
-            try:
-                inv = Invoice.from_dict(rt["invoice"])
-            except (ChannelError, KeyError):
-                return self._err("bad_invoice")
-            if (inv.payTo != oc.pay_to or not inv.verify() or inv.point.lower() != str(rt["point"]).lower()
-                    or inv.lockId != lock_id or inv.validUntil < time.time() + 0.5
-                    or (inv.hubs != "any" and self.pay_to not in inv.hubs)):
-                return self._err("bad_invoice", "invoice not signed by the provider for this point, or expiring")
-            p2 = oc.p()
-            if not spare and not route_ok(ib.height(), st1.params.expiry, p2.expiry, self.close_margin, self.delta) \
-                    and d > self.max_unguarded_lock_sat:
-                return self._err("route_expiry", f"ch2 outlives ch1 and {d} > maxUnguardedLockSat")
-            # 7 one lock per channel -----------------------------------------------------------
-            if ex1.get("route_lock"):
-                return self._err("lock_outstanding", "a lock on this ch1 is pending")
-            mtx = self.out.mutex_for(key)
-            if not mtx.acquire(timeout=0.5):
-                return self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
-            # re-read under the mutex: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
-            # the checks that depend on the channel are made again on the one the lock will use
-            oc = self.out.chans.get(key)
-            why = self._ch2_refusal(oc, st1, d)
-            if oc is None or why or self._exhausted(oc, d):
-                # AGP-057: the next ch2, funded ahead, takes over with this lock (make-before-break refill)
-                alt = self._switch_for(key, oc, st1, d, why)
-                if alt is not None:
-                    oc, why = alt, None
-            if why:
-                mtx.release()
-                return self._err(*why)
-            # write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
-            lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
-                     "T": rt["point"], "T1": pl.get("point"), "r": f"{r:064x}", "d": d, "f": f, "units": units,
-                     "provider": provider, "at": round(time.time(), 3), "session": rt.get("session"),
-                     "after": {"routed": routed1 + d + f, "units": units, "paid": int(ex1.get("fee_paid", 0)) + f}}
-            st1.extra = {**ex1, "route_lock": lock1}
-            ib.ledger.save(st1)
+                adm, refusal = self._admit(st1, pl, rt, d, f, lock_id, provider)
+            except BaseException:
+                ib.ledger.save(st1)
+                raise
+            if adm is None:
+                ib.ledger.save(st1)
+                return refusal
+            oc, lock1, mtx = adm
         try:
             return self._forward(st1, oc, lock1, rt, pl, t0)
         finally:
             mtx.release()
+
+    def _admit(self, st1, pl: dict, rt: dict, d: int, f: int, lock_id: str, provider: str):
+        """Checks 2 to 7 of a /x402/route whose auth passed, and the ch1 write-ahead of its lock (the
+        ledger lock is the caller's). `((oc, lock1, mtx), None)`: the ch2 the lock goes over, the lock as
+        written on ch1, and that provider's mutex, held. `(None, answer)`: the answer to send instead (a
+        refusal, or a completed lock's answer again); nothing was written."""
+        ib = self.inbound
+        done = ((st1.extra or {}).get("route_done") or {}).get(lock_id)
+        if done:                                   # the client lost our answer: the same one again
+            return None, (200, {"Content-Type": "application/json"}, json.dumps(done).encode())
+        if st1.closed_txid or ib.height() >= st1.params.expiry - ib.close_margin:
+            return None, self._err("channel_closing")
+        if st1.suspended:
+            return None, self._err("unconfirmed")
+        # 2 point --------------------------------------------------------------------------
+        try:
+            T = adaptor.dec(rt["point"])
+            r = int(rt["tweak"], 16) % adaptor.N
+            T1 = adaptor.dec(pl["point"]) if pl.get("point") else None
+        except (KeyError, TypeError, ValueError):
+            return None, self._err("bad_point", "points must be compressed secp256k1 points")
+        if T1 is not None and (not r or adaptor.add(T, adaptor._mul_pub(r)) != T1):
+            return None, self._err("bad_point", "T1 != T + r*G")
+        # 3 amount -------------------------------------------------------------------------
+        ex1 = st1.extra or {}
+        routed1 = int(ex1.get("routed_sat", 0))
+        cum = int(pl.get("cum", -1))
+        need1 = next_cum(routed1, d + f, st1.params.min_amount)
+        if d < 1 or f < 0 or d > self.max_lock_sat:
+            return None, self._err("bad_amount", f"lock amount must be in [1, {self.max_lock_sat}]")
+        floor1 = need1 <= st1.best_cum
+        # our view of ch1, so a client that gave up a lock we later completed (t read off a ch2
+        # close), held or released can resync: it adopts only states and counters it implied itself
+        view = ch1_view(st1)
+        if floor1:
+            if cum != st1.best_cum or pl.get("adaptor"):
+                return None, self._err("bad_amount", f"the dust floor covers this lock: cum {st1.best_cum}, no adaptor",
+                                 expectCum=st1.best_cum, **view)
+        elif cum != need1 or cum > st1.params.max_amount or T1 is None:
+            return None, self._err("bad_amount", f"lock pays {cum}, expected {need1}", expectCum=need1, **view)
+        # 4 pre-verify ---------------------------------------------------------------------
+        pre1 = None
+        if not floor1:
+            try:
+                pre1 = adaptor.PreSig.from_json(pl["adaptor"])
+            except (KeyError, TypeError, ValueError):
+                return None, self._err("bad_adaptor", "malformed adaptor")
+            z1 = st1.params.sighash(st1.params.state_tx(cum))
+            if not adaptor.preverify(bytes.fromhex(st1.params.payer_pub), z1, T1, pre1):
+                return None, self._err("bad_adaptor", "pre-signature does not verify under T1")
+        # 5 fee quote ----------------------------------------------------------------------
+        try:
+            q = FeeQuote.from_dict(rt["feeQuote"])
+        except (ChannelError, KeyError):
+            return None, self._err("route_fee", "no fee quote")
+        # any live quote this hub signed is honoured, including one the fee strategy has since moved
+        if q.hub != self.pay_to or q.network != self.network or not q.verify() or not q.live(time.time()):
+            return None, self._err("route_fee", "not a live fee quote of this hub")
+        f_due, units = fee_due(q, d, int(ex1.get("fee_units", 0)), int(ex1.get("fee_paid", 0)))
+        if f < f_due:
+            return None, self._err("route_fee", f"fee {f} < {f_due} due under quote {q.seq}", feeDue=f_due)
+        # 6 expiry rule --------------------------------------------------------------------
+        # the provider is the origin the client named: its own ch2, in that process's ledger (AGP-056)
+        key = provider
+        oc = self.out.chans.get(key)
+        # a rollover's next ch2 is opened (AGP-053) under the mutex the lock takes below: it is checked
+        # again there, once it is open
+        opening = oc is not None and oc.state == "funded" and oc.rolled_from and self.zero_conf_rollover
+        # the origin's next ch2, funded ahead (AGP-057), takes the lock its live one cannot: decided
+        # under the mutex below
+        nxt = self.out.next_chans.get(key)
+        spare = nxt is not None and nxt.state == "open"
+        if (oc is None or (oc.state != "open" and not opening)) and not spare:
+            return None, self._err("route_blocked", self._no_channel(provider, oc))
+        if oc is not None and oc.blocked and not (spare and oc.blocked == ROLLOVER_GONE):
+            return None, self._err("route_blocked", oc.blocked)
+        if oc is None:
+            oc = nxt
+        try:
+            inv = Invoice.from_dict(rt["invoice"])
+        except (ChannelError, KeyError):
+            return None, self._err("bad_invoice")
+        if (inv.payTo != oc.pay_to or not inv.verify() or inv.point.lower() != str(rt["point"]).lower()
+                or inv.lockId != lock_id or inv.validUntil < time.time() + 0.5
+                or (inv.hubs != "any" and self.pay_to not in inv.hubs)):
+            return None, self._err("bad_invoice", "invoice not signed by the provider for this point, or expiring")
+        p2 = oc.p()
+        if not spare and not route_ok(ib.height(), st1.params.expiry, p2.expiry, self.close_margin, self.delta) \
+                and d > self.max_unguarded_lock_sat:
+            return None, self._err("route_expiry", f"ch2 outlives ch1 and {d} > maxUnguardedLockSat")
+        # 7 one lock per channel -----------------------------------------------------------
+        if ex1.get("route_lock"):
+            return None, self._err("lock_outstanding", "a lock on this ch1 is pending")
+        mtx = self.out.mutex_for(key)
+        if not mtx.acquire(timeout=0.5):
+            return None, self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
+        # re-read under the mutex: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
+        # the checks that depend on the channel are made again on the one the lock will use
+        oc = self.out.chans.get(key)
+        why = self._ch2_refusal(oc, st1, d)
+        if oc is None or why or self._exhausted(oc, d):
+            # AGP-057: the next ch2, funded ahead, takes over with this lock (make-before-break refill)
+            alt = self._switch_for(key, oc, st1, d, why)
+            if alt is not None:
+                oc, why = alt, None
+        if why:
+            mtx.release()
+            return None, self._err(*why)
+        # write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
+        lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
+                 "T": rt["point"], "T1": pl.get("point"), "r": f"{r:064x}", "d": d, "f": f, "units": units,
+                 "provider": provider, "at": round(time.time(), 3), "session": rt.get("session"),
+                 "after": {"routed": routed1 + d + f, "units": units, "paid": int(ex1.get("fee_paid", 0)) + f}}
+        st1.extra = {**ex1, "route_lock": lock1}
+        try:
+            ib.ledger.save(st1)
+        except BaseException:
+            st1.extra = ex1                              # not written: the lock is not there
+            mtx.release()
+            raise
+        return (oc, lock1, mtx), None
 
     def _ch2_refusal(self, oc: Optional[OutChannel], st1, d: int) -> Optional[tuple]:
         """(code, detail) if the ch2 (as read under its mutex) cannot take a lock of `d` now: another

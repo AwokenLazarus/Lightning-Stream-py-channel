@@ -220,7 +220,8 @@ def settlement_response(receipt: dict, network: str, payer: str, success: bool) 
 def locks_open(st) -> bool:
     """A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
     (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
-    have to pay on its ch2. Closing ch1 now would close below it."""
+    have to pay on its ch2. Closing ch1 now would close below it, and so would rolling it over: both
+    spend its funding (AGP-078)."""
     ex = st.extra or {}
     if ex.get("route_lock"):
         return True
@@ -1221,7 +1222,8 @@ class XbtChannelProvider:
         channel, one tx that pays this provider `amount` (at least its best state) and funds the next
         channel with the rest less the close fee (ChannelParams.rollover_tx). The payer's signature
         over that exact tx is the authorisation. The next channel opens through extra.openUrl once it
-        confirms."""
+        confirms. Refused `lock_pending`, as a close is, while a routed lock is open on the channel,
+        whatever `amount`."""
         st = self._channel(req["chan"])
         p = st.params
         with self.ledger.lock:
@@ -1256,6 +1258,10 @@ class XbtChannelProvider:
         with self.ledger.lock:
             if st.closed_txid:
                 raise ChannelError("channel_closing", "already settled")
+            # AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
+            # ledger lock that is held until the rollover is sent: route() writes its lock under it too
+            if locks_open(st):
+                raise ChannelError("lock_pending", "a routed lock is open on this channel")
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
@@ -1294,37 +1300,52 @@ class XbtChannelProvider:
                 return err("unknown_channel")
             if not self._authentic(st, pl, method, bind, body):
                 return err("bad_auth", status=401)
-            st.seq = int(pl["seq"])
-            if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
-                return err("channel_closing")
-            if st.suspended:
-                # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
-                # leaves a rollover child suspended although it confirmed (the parent was then spent in a
-                # block, so it was no zero-conf child either). A hub looks at the chain itself before it
-                # sends a lock: so do we before refusing one on an unconfirmed child
-                zc = (st.extra or {}).get("zero_conf")
-                if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
-                    return err("unconfirmed")
-                st.suspended = False
-                self.ledger.save(st)
-            if not self._zc_confirmed(st):
-                # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
-                zc = st.extra["zero_conf"]
-                try:
-                    cum = int(pl.get("cum"))
-                except (TypeError, ValueError):
-                    return err("bad_payload")
-                # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
-                if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
-                    if self.height() >= zc["until"]:
-                        return err("unconfirmed", "rollover unconfirmed at the parent's close margin")
-                    return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed")
+            st.seq = int(pl["seq"])                               # spent, whatever happens next
+            # AGP-078 (review T4): the seq is durable before any answer that did not write it (or the
+            # error that ended the request) leaves. Kept only in memory it came back after a restart,
+            # and the refused header authenticated again
             try:
-                out = self.routes.complete_lock(st, pl, route)
-            except ChannelError as e:
+                resp, saved = self._lock_authed(st, pl, route, err)
+            except BaseException:
                 self.ledger.save(st)
-                return err(e.code, str(e))
-        return (202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()
+                raise
+            if not saved:
+                self.ledger.save(st)
+            return resp
+
+    def _lock_authed(self, st, pl: dict, route: dict, err):
+        """A /lock whose auth passed and whose seq is in `st` (the ledger lock is the caller's): the
+        answer, and whether `st` was written to disk on the way to it."""
+        if st.closed_txid or self.height() >= st.params.expiry - self.close_margin:
+            return err("channel_closing"), False
+        if st.suspended:
+            # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
+            # leaves a rollover child suspended although it confirmed (the parent was then spent in a
+            # block, so it was no zero-conf child either). A hub looks at the chain itself before it
+            # sends a lock: so do we before refusing one on an unconfirmed child
+            zc = (st.extra or {}).get("zero_conf")
+            if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
+                return err("unconfirmed"), False
+            st.suspended = False
+        if not self._zc_confirmed(st):
+            # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
+            zc = st.extra["zero_conf"]
+            try:
+                cum = int(pl.get("cum"))
+            except (TypeError, ValueError):
+                return err("bad_payload"), False
+            # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
+            if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
+                if self.height() >= zc["until"]:
+                    return err("unconfirmed", "rollover unconfirmed at the parent's close margin"), False
+                return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed"), False
+        # what the checks above changed (a child seen confirmed) is written with the seq: by
+        # complete_lock when it answers, by the caller when it refuses
+        try:
+            out = self.routes.complete_lock(st, pl, route)
+        except ChannelError as e:
+            return err(e.code, str(e)), False
+        return ((202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()), True
 
     def _routed_call(self, method: str, path: str, path_key: str, hdr: str, body: bytes, url: str):
         from .route import AMSAT_PER_MSAT  # noqa: F401
