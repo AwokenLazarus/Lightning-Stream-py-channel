@@ -129,6 +129,7 @@ from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, 
 from .rpc import RPCError
 from .tx import Tx, address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, request_auth, request_digest_v2,
+                           same_origin_url,
                            safe_code, unb64json)
 from .channel import channel_auth_key
 
@@ -1334,7 +1335,7 @@ class RouteHub:
                             "redeemScript": p.script.hex(),
                             **({"closeFeePayer": p.close_fee_payer} if p.close_fee_payer != "payer" else {})},
                 "hub": {"payTo": self.pay_to}}
-        st, _, raw = self.http("POST", origin + terms["extra"].get("openUrl", "/x402/xbt-channel/open"), json.dumps(body).encode(),
+        st, _, raw = self.http("POST", same_origin_url(origin, terms["extra"].get("openUrl", "/x402/xbt-channel/open")), json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
         try:
             doc = json.loads(raw)
@@ -1490,7 +1491,7 @@ class RouteHub:
                             "redeemScript": p.script.hex(),
                             **({"closeFeePayer": p.close_fee_payer} if p.close_fee_payer != "payer" else {})},
                 "hub": {"payTo": self.pay_to, "sig": ecc.sign(self.secret, hub_channel_message(p.channel_id)).hex()}}
-        st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["openUrl"], json.dumps(body).encode(),
+        st, _, raw = self.http("POST", same_origin_url(oc.origin, oc.terms["extra"]["openUrl"]), json.dumps(body).encode(),
                                {"Content-Type": "application/json"})
         if st != 200:
             # said, not only returned (AGP-057): a refused open is why a ch2 stays `funded`
@@ -1648,7 +1649,7 @@ class RouteHub:
             return ev
         req = {"chan": p.channel_id, "sig": ecc.sign(int(oc.secret, 16), close_message(p.channel_id)).hex()}
         try:
-            st, _, raw = self.http("POST", oc.origin + oc.terms["extra"]["closeUrl"], json.dumps(req).encode(),
+            st, _, raw = self.http("POST", same_origin_url(oc.origin, oc.terms["extra"]["closeUrl"]), json.dumps(req).encode(),
                                    {"Content-Type": "application/json"})
         except OSError as e:
             raise ChannelError("provider_error", f"close: {type(e).__name__}: {e}") from None

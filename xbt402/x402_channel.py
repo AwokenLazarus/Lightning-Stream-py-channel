@@ -1773,6 +1773,34 @@ class ClientChannel:
     receipts: list = field(default_factory=list)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib then raises the 3xx as an HTTPError, which `http` returns."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
+def same_origin_url(origin: str, value) -> str:
+    """AGP-080 X1: where a seller says its open or close endpoint is, held to the seller's own origin.
+    `origin + value` let "@evil.example/open" name another host. Accepted: a path starting with exactly
+    one "/", or an absolute URL on `origin`; no backslash, whitespace or control character either way.
+    Anything else is refused before a request is made."""
+    def refuse():
+        return ChannelError("seller_url", "the seller's URL is not on its own origin; refused before any request")
+    if not isinstance(value, str) or not value:
+        raise refuse()
+    if any(c == "\\" or c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise refuse()
+    if value.startswith("/") and not value.startswith("//"):
+        return origin + value
+    if not origin or url_origin(value) != origin:       # url_origin: "" for anything not absolute
+        raise refuse()
+    return value
+
+
 class XbtChannelClient:
     """Payer SDK. `fund(address, sats) -> (txid, vout)` is the only wallet hook: in production it is
     the B2 agent-wallet MCP (policy-checked, 0x21-signed), so the SDK never holds funding keys.
@@ -1815,9 +1843,12 @@ class XbtChannelClient:
 
     @staticmethod
     def http(method, url, body=b"", headers=None):
+        """One request, one answer. A 3xx is returned as the answer and never followed (AGP-080 X1, as
+        the Rust transport): a payer that checked the origin against an allowlist must not be sent on
+        to another host, least of all with its PAYMENT-SIGNATURE header."""
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with _NO_REDIRECT.open(req, timeout=30) as r:
                 return XbtChannelClient._read_capped(r)
         except urllib.error.HTTPError as e:
             return XbtChannelClient._read_capped(e)
@@ -1881,7 +1912,8 @@ class XbtChannelClient:
         terms = {"capacity": cap, "expiry": expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
                  "redeemScript": p.script.hex(), **({"closeFeePayer": fee_payer} if fee_payer != "payer" else {})}
         # review C2 (AGP-067): the provider's answer to these exact terms before anything is funded
-        self._preflight(origin + ex["openUrl"], terms, fee_payer)
+        open_url = same_origin_url(origin, ex["openUrl"])
+        self._preflight(open_url, terms, fee_payer)
         fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
         txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
         p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
@@ -1903,7 +1935,7 @@ class XbtChannelClient:
         if self.on_open:
             self.on_open(ch)
         c = {"txid": txid, "vout": vout, **terms}
-        r = self._post(origin + ex["openUrl"], {"x402Version": 2, "network": self.network, "channel": c})
+        r = self._post(open_url, {"x402Version": 2, "network": self.network, "channel": c})
         if isinstance(r, dict) and r.get("closeFeePayer", "payer") != fee_payer:
             # a provider that did not take our terms would refuse every state we sign: stop before paying
             raise ChannelError("bad_fee_payer", "the provider opened the channel with another closeFeePayer")
@@ -2061,7 +2093,7 @@ class XbtChannelClient:
             sig = self.signer.sign_close(ch.payer.params.channel_id)
         else:
             sig = ecc.sign(ch.payer.secret, close_message(ch.payer.params.channel_id)).hex()
-        return self._post(origin + ch.accepted["extra"]["closeUrl"],
+        return self._post(same_origin_url(origin, ch.accepted["extra"]["closeUrl"]),
                           {"chan": ch.payer.params.channel_id, "sig": sig, "payload": pl})
 
     def _rollover(self, ch: ClientChannel):

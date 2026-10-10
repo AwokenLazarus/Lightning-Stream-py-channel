@@ -323,6 +323,7 @@ class Payer:
         else:
             tx = self.params.state_tx_a3(amount)
             sig = ecc.sign(self.secret, self.params.sighash_a3(tx)) + bytes([SIGHASH_SINGLE_ACP_UNIFIED])
+        self.signed = amount      # AGP-080: a 0xA3 state is a signed amount too; never a plain state below it
         return sig
 
 
