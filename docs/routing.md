@@ -12,6 +12,15 @@
 > seq an authentic `/x402/route` or `/x402/xbt-channel/lock` spent is saved before its refusal leaves;
 > a `RouteHub` checks its `HubConfig` again when it is built. Details: xbt-rs README, "Hub
 > closure-audit fixes (AGP-078)"; tests `tests/security/test_agp078_hub_closure.py`.
+> Since AGP-084: a channel whose close or rollover was signed and written ahead (`close_intent`) and
+> answered with an error by the node takes no new state (`channel_closing` on a paid call, `/x402/route`
+> and `/x402/xbt-channel/lock`): that tx can still confirm. The watcher sends such a close again every
+> tick and records a spend the node shows after all; `connect` / `connect_next` refuse `bad_config` when
+> `max_lock_sat` is more than half of the capacity the ch2 would be funded with. Limits: a rollover is
+> never sent again (its client was told it failed and may no longer hold the next channel's key: it
+> rolls over again or closes); a superseded intent that lands after a second failed spend is not
+> recorded; a rollover child may be smaller than 2 x `max_lock_sat`. Tests
+> `tests/security/test_agp084_hub_leftovers.py`.
 
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.

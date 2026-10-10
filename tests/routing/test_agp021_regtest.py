@@ -75,7 +75,7 @@ class RoutedRegtest(unittest.TestCase):
         node.tc = self
         h = R.hub(node, net, secret=int.from_bytes(os.urandom(16), "big"))
         prov = R.provider(node, net, "http://p.test", **pkw)
-        h.connect("http://p.test", capacity=30_000)
+        h.connect("http://p.test", capacity=40_000)
         h.watch_tick()
         self.assertEqual(h.out.chans["http://p.test"].state, "open")
         pay = R.payer(node, net)
