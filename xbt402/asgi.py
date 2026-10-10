@@ -1,10 +1,23 @@
-"""Starlette ASGI app + middleware speaking x402 v2 `xbt-channel` headers."""
+"""Starlette ASGI app + middleware speaking x402 v2 `xbt-channel` headers.
+
+Limits (AGP-081, review T1). The app bounds what an ASGI app can see: the request body, duplicate
+payment headers, a `#` in the target. It cannot bound connections. `XbtChannelProvider.http_server`
+caps them (64 in all, 48 per address) and cuts off a header or a body that does not finish (10 s,
+30 s); an ASGI server owns its sockets, and uvicorn has no such deadline and no such cap: a
+connection that sends nothing, or half a header, stays open (300 idle sockets were still open after
+40 s). So this path needs those limits in front of it: a reverse proxy with header and body timeouts
+and per-client connection limits, or an ASGI server configured with them. `serve_asgi` therefore
+listens on loopback only; an embedder that runs `asgi_app` or `Xbt402Middleware` under its own server
+takes on the same duty.
+"""
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from .x402_channel import MAX_BODY, unsafe_headers
+from .x402_channel import FRAGMENT_REFUSED, MAX_BODY, unsafe_headers
+
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 
 def _raw_path(scope) -> str:
@@ -34,6 +47,8 @@ async def _bounded_body(request: Request, limit: int = MAX_BODY):
 
 async def _serve(provider, request: Request) -> Response:
     path = _raw_path(request.scope)
+    if "#" in path:                         # as provider.serve does, before the body is read
+        return Response(FRAGMENT_REFUSED, status_code=400)
     limit = provider.body_limit(path) if hasattr(provider, "body_limit") else MAX_BODY
     body = await _bounded_body(request, limit)
     if body is None:
@@ -71,6 +86,10 @@ def asgi_app(provider) -> Starlette:
 
 
 def serve_asgi(provider, host: str, port: int):
-    """Run uvicorn in the current thread (call from a daemon thread in demos)."""
+    """Run uvicorn in the current thread (call from a daemon thread in demos). `host` is a loopback
+    address (ValueError otherwise): this server has no deadlines and no connection cap (the module
+    docstring), so whatever is public is the proxy in front of it."""
+    if host not in LOOPBACK:
+        raise ValueError(f"serve_asgi listens on loopback only, not {host!r}: put a reverse proxy in front")
     import uvicorn
     uvicorn.run(asgi_app(provider), host=host, port=port, log_level="error")

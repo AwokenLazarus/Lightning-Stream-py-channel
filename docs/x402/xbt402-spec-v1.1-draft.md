@@ -29,6 +29,18 @@ deployment sits behind a reverse proxy that terminates TLS and **overwrites** `X
 and `Host` with the name the payer used: the server trusts those two when it rebuilds the URL it
 binds.
 
+Closure audit (AGP-081). A payer that sent a `PAYMENT-SIGNATURE` takes an answer below 400 only
+with its `PAYMENT-RESPONSE` (`bad_receipt` otherwise); an answer of 400 or above may come without
+one, and nothing is adopted from it. The request digest drops a URL's fragment, so a `#` is refused
+on both sides instead: a payer refuses such a URL before it signs or sends anything (`bad_request`),
+and a server answers 400 to any request target that holds one, before it authenticates or routes.
+The digest and its vectors are unchanged. Of the server's 64 connections one client address may
+hold 48 (an IPv6 address counts as its /64, an IPv4-mapped one as its IPv4 address); the reference
+server takes that cap as a parameter, 0 for a server whose only peer is its reverse proxy. A payer
+opens a channel for at least `minExpiryBlocks + minConf + closeMarginBlocks` blocks (`minConf`
+absent is 1) and refuses an offer without `minExpiryBlocks`, `maxExpiryBlocks` or
+`closeMarginBlocks` before it funds (`bad_offer`).
+
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT and MAY are to be interpreted as described
 in RFC 2119 and RFC 8174 when, and only when, they appear in all capitals.
 
@@ -150,7 +162,8 @@ being served). Under **prepay** the client risks one call. Neither can take more
 | Conditional `csvDelta` | 10 blocks | `extra.conditional` | Optional hash-locked calls, §6.5. |
 
 Reference client defaults (informative): capacity 200,000 sat; per-call cap 1,000 sat; total budget
-1,000,000 sat; channel lifetime `min(max(1008, minExpiryBlocks + 6), maxExpiryBlocks − 1)` blocks.
+1,000,000 sat; channel lifetime `min(max(1008, minExpiryBlocks + minConf + closeMarginBlocks),
+maxExpiryBlocks − 1)` blocks (AGP-081; `minExpiryBlocks + 6` before).
 
 ## 5. Keys
 All public keys are 33-byte compressed SEC1 secp256k1 keys. `G` is the generator, `n` the group order.

@@ -40,6 +40,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -58,7 +59,7 @@ from . import ecc
 from .channel import (DERIVATION, DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
                       canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, cpfp_child, settle_due)
 from .conditional import CSV_DELTA
-from .funding import FundingPolicy, check_funding
+from .funding import FundingPolicy, check_funding, offer_expiry_blocks
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
@@ -72,6 +73,7 @@ BODY_DEADLINE = 30                                          # a body that never 
 MAX_HEADER_LINE = 8 * 1024
 MAX_HEADERS = 32 * 1024
 MAX_CONNECTIONS = 64
+MAX_PER_ADDRESS = 48                                        # of those, from one client address (AGP-081)
 CPFP_CHILD_VSIZE = 110      # a CPFP child: one P2WPKH input, one P2WPKH output (109.25 vB, rounded up)
 
 
@@ -125,6 +127,19 @@ def request_url(url: str):
     return scheme, _alower(host), port, target
 
 
+def no_fragment(url: str) -> str:
+    """Refuse a URL or request target that holds a `#` (AGP-081, review T2). request_url drops a
+    fragment, so a payment for `/a` would authenticate `/a#b` too, and a server routes on the target
+    as it arrives. Payer and provider both call this before anything is signed, sent or served; the
+    digest and its published vectors are unchanged."""
+    if "#" in url:
+        raise ChannelError("bad_request", "a URL with a # fragment is outside the request binding: not paid and not served")
+    return url
+
+
+FRAGMENT_REFUSED = b"request target with a # fragment"      # the body of the provider's 400
+
+
 def url_origin(url: str) -> str:
     """`scheme://authority` of an absolute URL, or "" for a bare target."""
     i = url.find("://")
@@ -155,6 +170,21 @@ def binding_url(url: str, path: str) -> str:
     """What a server binds a request's payment to: the origin it was reached at and the target it
     routes on. A `url` without an origin binds the target alone."""
     return url_origin(url) + path
+
+
+def address_key(host: str) -> str:
+    """What the per-address connection cap counts a peer as (AGP-081, review T1): an IPv4 address, an
+    IPv4-mapped IPv6 address as that IPv4 address, any other IPv6 address as its /64 (one subscriber
+    holds a whole /64). A host that is no IP address counts as itself."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if ip.version == 4:
+        return str(ip)
+    if ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return f"{int(ip) >> 64:x}/64" + (f"%{ip.scope_id}" if ip.scope_id else "")
 
 
 def unsafe_headers(hdrs: dict) -> bool:
@@ -1391,6 +1421,8 @@ class XbtChannelProvider:
         # body bound before any billing: a too-large body is an unbilled 400 on every transport
         if len(body or b"") > self.body_limit(path, max_body):
             return 400, {}, b"bad request framing or body over MAX_BODY"
+        if "#" in path:                 # before anything is authenticated or routed (AGP-081, review T2)
+            return 400, {}, FRAGMENT_REFUSED
         # facilitator endpoints live under /x402/ only: bare /verify, /settle and /supported shadowed
         # a paid API's own routes of those names (XBT-061 L6)
         control = {("GET", FACILITATOR_SUPPORTED): lambda: self.supported(),
@@ -1581,21 +1613,27 @@ class XbtChannelProvider:
         hdrs["PAYMENT-RESPONSE"] = b64json(settlement_response(r, self.network, st.params.payer_pub, status < 400))
         return status, hdrs, out
 
-    def http_server(self, port: int) -> ThreadingHTTPServer:
+    def http_server(self, port: int, max_per_address: int = MAX_PER_ADDRESS) -> ThreadingHTTPServer:
+        """The reference HTTP server on 127.0.0.1:`port`. `max_per_address`: connections one client
+        address may hold at once (address_key); 0 turns that cap off, for a server whose only peer is
+        its reverse proxy (every connection then comes from the proxy's address)."""
         app = self
 
         class Bound(ThreadingHTTPServer):
-            """At most MAX_CONNECTIONS reads at once. A slow header or body holds a slot, not every
-            worker, and the slot is released when the handler finishes (review T1)."""
+            """At most MAX_CONNECTIONS reads at once, and at most `max_per_address` of them from one
+            address (AGP-081: one address could hold all 64). A slow header or body holds a slot, not
+            every worker, and the slot is released when the handler finishes (review T1)."""
 
             def __init__(self, addr, handler):
                 super().__init__(addr, handler)
                 self._open = 0
+                self._by_address = {}
                 self._lk = threading.Lock()
 
             def process_request(self, request, client_address):
+                key = address_key(client_address[0])
                 with self._lk:
-                    if self._open >= MAX_CONNECTIONS:
+                    if self._open >= MAX_CONNECTIONS or 0 < max_per_address <= self._by_address.get(key, 0):
                         try:
                             msg = b"too many connections"
                             request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: %d\r\n"
@@ -1605,7 +1643,18 @@ class XbtChannelProvider:
                         request.close()
                         return
                     self._open += 1
+                    self._by_address[key] = self._by_address.get(key, 0) + 1
                 super().process_request(request, client_address)
+
+            def release(self, client_address):
+                key = address_key(client_address[0])
+                with self._lk:
+                    if self._open:
+                        self._open -= 1
+                    if self._by_address.get(key, 0) > 1:
+                        self._by_address[key] -= 1
+                    else:
+                        self._by_address.pop(key, None)
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1664,6 +1713,8 @@ class XbtChannelProvider:
                 self.request_version = parts[2] if len(parts) > 2 else "HTTP/1.1"
                 if self.command not in ("GET", "POST"):
                     return self._refuse(501, b"unsupported method")
+                if "#" in self.path:                        # as serve does, before the body is read
+                    return self._refuse(400, FRAGMENT_REFUSED)
                 try:
                     self.headers = parse_headers(BytesIO(bytes(block).split(b"\r\n", 1)[1]))
                 except Exception:
@@ -1723,10 +1774,7 @@ class XbtChannelProvider:
                 try:
                     super().finish()
                 finally:
-                    srv = self.server
-                    with srv._lk:
-                        if srv._open:
-                            srv._open -= 1
+                    self.server.release(self.client_address)
 
             def log_message(self, *a):
                 pass
@@ -1847,13 +1895,14 @@ class XbtChannelClient:
         cap = max(self.capacity, int(ex["minCapacity"]))
         if cap > int(ex.get("maxCapacity", cap)) or self.opened_sats + cap > self.budget_sats:
             raise ChannelError("budget", "channel capacity outside provider range or our budget")
+        # refused bad_offer, before a key is made or anything funded, on an offer without its terms
+        blocks = offer_expiry_blocks(ex, self.expiry_blocks)
         if self.signer:
             pub = self.signer.new_key(origin)
             secret = None
         else:
             secret = secrets.randbelow(ecc.N - 1) + 1
             pub = ecc.pubkey(secret).hex()
-        blocks = min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6), int(ex["maxExpiryBlocks"]) - 1)
         expiry = self.height() + blocks
         p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
                                  close_fee_payer=fee_payer)
@@ -1895,7 +1944,7 @@ class XbtChannelClient:
         """Add payload.auth for this request. With a signer the ECDH key never leaves it. `bind`:
         where the request goes, origin + path (request_digest_v2); a close's payload binds the empty
         request."""
-        req = request_digest_v2(method, bind, body)
+        req = request_digest_v2(method, no_fragment(bind), body)
         if self.signer:
             pl["auth"] = self.signer.request_auth(pl["chan"], pl["seq"], pl["cum"], pl.get("sig"), req)
         else:
@@ -1971,6 +2020,7 @@ class XbtChannelClient:
         Refused: below the last signed state (bad_amount), above the channel's capacity (exhausted),
         above the receipted spend plus one call at the pinned price (too_expensive), over the daily
         budget (budget). Under the channel's minimum state with nothing signed, the call goes unsigned."""
+        no_fragment(url)
         origin = "/".join(url.split("/")[:3])
         path = "/" + "/".join(url.split("/")[3:])
         own = self._extra_headers(headers)
@@ -2003,7 +2053,18 @@ class XbtChannelClient:
             status, rh, out = self.http(method, url, body, {**own, **hdrs})
         if "PAYMENT-RESPONSE" in rh:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, (status, out))
+        elif hdrs:
+            self._unreceipted(status)
         return status, rh, out
+
+    @staticmethod
+    def _unreceipted(status: int):
+        """The answer to a request that carried a payment came without a PAYMENT-RESPONSE (AGP-081,
+        review T4c). A success is refused: with the receipt stripped on the way, any body passed as
+        the paid answer. An answer of 400 or above may have none (the provider's own failures carry
+        no receipt): the caller returns it as it is and nothing is adopted from it."""
+        if status < 400:
+            raise ChannelError("bad_receipt", "paid call returned no receipt")
 
     def _receipt(self, ch: ClientChannel, resp: dict, method, path, body, answer, quote: int = None):
         """`answer` is the (status, body) the receipt came with: it must be the answer the provider
@@ -2049,13 +2110,12 @@ class XbtChannelClient:
         owed = max(ch.spent_msat // 1000, ch.payer.signed)
         if owed < ch.payer.params.min_amount:
             owed = ch.payer.params.min_amount
+        expiry = self.height() + offer_expiry_blocks(ex, self.expiry_blocks)    # as an open: bad_offer first
         if self.signer:
             pub = self.signer.new_key(origin + "/next")
         else:
             secret2 = secrets.randbelow(ecc.N - 1) + 1
             pub = ecc.pubkey(secret2).hex()
-        expiry = self.height() + min(max(self.expiry_blocks, int(ex["minExpiryBlocks"]) + 6),
-                                     int(ex["maxExpiryBlocks"]) - 1)
         nxt = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
                                    close_fee_payer=ch.payer.params.close_fee_payer)
         next_cap = min(self.capacity, ch.payer.params.rollover_next_capacity(owed))
@@ -2069,6 +2129,7 @@ class XbtChannelClient:
     def request_conditional(self, method: str, url: str, body: bytes = b""):
         """Pay-on-preimage: sign a hash-locked increment, receive cipher+k, upgrade if k checks."""
         from .conditional import ConditionalParams, decrypt, sha256
+        no_fragment(url)
         origin = "/".join(url.split("/")[:3])
         path = "/" + "/".join(url.split("/")[3:])
         ch = self.channels.get(origin)
@@ -2135,10 +2196,12 @@ class XbtChannelClient:
                                               f"lock, recover_conditional() reads k from its claim")
         if sha256(k) != h:
             raise ChannelError("bad_preimage", "provider preimage does not match H")
+        # while the hash lock is pending: after a bad_receipt, recover_conditional still reads k from
+        # the provider's claim
         if "PAYMENT-RESPONSE" in rh:
-            # while the hash lock is pending: after a bad_receipt, recover_conditional still reads k
-            # from the provider's claim
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, (status, out), cond_amt)
+        else:
+            self._unreceipted(status)
         plain = decrypt(cipher, k)             # the offered ciphertext, whatever the response carries
         ch.pending_cond = {}
         # upgrade: fold the increment into an unconditional state and hand it over now, so the
