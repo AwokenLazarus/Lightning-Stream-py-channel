@@ -73,3 +73,31 @@ Tests: `tests/security/test_agp081_closure_audit.py`.
 
 Details: `docs/routing.md` (the AGP-085 note). Tests: `tests/security/test_agp085_hub.py`,
 `tests/security/test_agp085_intents.py`.
+
+## Fix wave 4, channel client and transport (AGP-090)
+
+As xbt-rs (its README, same heading); `XbtChannelClient` and `funding.py`.
+
+- **A funded channel is never forgotten.** `ClientChannel.stage` is `keyed` (on the books before
+  `fund` is called), `funded` (refund held and handed out, before the provider hears of the
+  outpoint) or `open`. `_ensure_open` is the only way to `open`, for a plain call, a conditional call
+  and the routed client's ch1. A seller that refuses the funded open, or whose answer is lost, is
+  asked again on the next call and nothing is funded again; nothing is signed before `open`. A retry
+  after a `fund` that raised pays the same script under the same key (`fund` is a bare callable, so
+  the client cannot ask the wallet what it sent). A keyed channel too old to fund moves to
+  `unfunded` with its key (with a signer it stays: `open_unresolved`); `forget_unfunded` drops them.
+- **The owner bounds the expiry.** `offer_expiry_blocks(extra, want, owner_max=4032)`: an offer
+  whose floor is above the bound is `bad_offer` before a key is made. `XbtChannelClient(...,
+  max_expiry_blocks=4032)`.
+- **Receipts.** A receipt must be for the seq just sent. The provider's spent total may be ahead of
+  the last verified receipt by one quote per paid request it has not answered (`unanswered_msat`; a
+  402 is an answer), plus the channel's one call of slack. A lost answer no longer ends the channel,
+  and each served call is paid once.
+- **Transport.** A bare target is bound byte for byte (`split_scheme`: `://` in a query is not a
+  scheme). A HEAD answer, and a 1xx, 204 or 304, is not compared with its Content-Length, and its
+  receipt is checked on the status.
+
+Tests: `tests/security/test_agp087_hub_b_client.py`, `test_agp087_transport.py`,
+`test_agp090_client.py`. Changed: `test_agp081_closure_audit.py` pinned the wedge after a stripped
+receipt (now the next call goes through); `tests/test_agp068.py` and `tests/test_x402_envelopes.py`
+build a channel by hand and now say which call it sent.

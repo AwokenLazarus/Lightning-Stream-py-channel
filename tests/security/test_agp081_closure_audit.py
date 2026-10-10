@@ -122,10 +122,12 @@ class ReceiptRequired(unittest.TestCase):
         self.assertEqual((st, out), (502, b"upstream down"))
         self.assertEqual((ch.spent_msat, len(ch.receipts), ch.acked_cum), before)
         # the provider did serve the stripped call. The payer holds no receipt for it and signs nothing
-        # on its account: the next receipt counts two calls, which the receipt check refuses as before
-        self.assertEqual(code_of(self, c.request, "GET", O + "/v1/q"), "bad_receipt")
+        # on its account. AGP-090: the next receipt counts two calls, the stripped one and its own, and
+        # is taken (it was refused, and every receipt after it: the audit's wedged channel). The call
+        # whose answer was damaged on the way is paid for once, like any answer lost on the way
+        self.assertEqual(c.request("GET", O + "/v1/q")[0], 200)
         self.assertEqual(ch.payer.signed, signed, "the next call signed a higher state for the refused answer")
-        self.assertEqual((ch.spent_msat, len(ch.receipts), ch.acked_cum), before)
+        self.assertEqual((ch.spent_msat, len(ch.receipts), ch.unanswered_msat), (before[0] + 2 * PRICE * 1000, before[1] + 1, 0))
 
     def test_a_first_answer_without_a_receipt_is_refused(self):
         # the paid retry right after a 402 (the channel is opened in the same call)

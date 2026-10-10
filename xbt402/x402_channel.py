@@ -59,7 +59,7 @@ from . import ecc
 from .channel import (DERIVATION, DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
                       canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, cpfp_child, settle_due)
 from .conditional import CSV_DELTA
-from .funding import FundingPolicy, check_funding, offer_expiry_blocks
+from .funding import OWNER_MAX_EXPIRY_BLOCKS, FundingPolicy, check_funding, offer_expiry_blocks, offer_expiry_floor
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
@@ -96,15 +96,33 @@ def _alower(s: str) -> str:
     return "".join(c.lower() if "A" <= c <= "Z" else c for c in s)
 
 
+_SCHEME_FIRST = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_SCHEME_REST = _SCHEME_FIRST + "0123456789+-."
+
+
+def split_scheme(url: str):
+    """(scheme, rest) of an absolute URL `scheme://rest`, or None. The scheme is the whole string before
+    the first "://" and is spelled as RFC 3986 spells one (a letter, then letters, digits, "+", "-",
+    "."). Anything else is a bare target, whatever its query holds (AGP-090, review T2): the split used
+    to be at the first "://" anywhere, so `/a?next=http://h/x` was read as scheme `/a?next=http` and
+    host `h`, both lowercased, and shared a digest with `/A?next=HTTP://H/x`. One function for
+    request_url and url_origin (and through it same_origin_url), as xbt-rs wire::split_scheme."""
+    i = url.find("://")
+    if i < 1 or url[0] not in _SCHEME_FIRST or any(c not in _SCHEME_REST for c in url[1:i]):
+        return None
+    return url[:i], url[i + 3:]
+
+
 def request_url(url: str):
     """(scheme, host, port, target) of `scheme://host[:port]target` as request_digest_v2 binds them:
     scheme and host lowercased (ASCII), an IPv6 literal kept in brackets, userinfo and a fragment
     dropped, the port in decimal without leading zeros or the scheme's default (80 http, 443 https),
-    the target as sent ("/" when the URL has no path). Without "://" it is a bare target, which
-    binds no origin."""
-    if "://" not in url:
+    the target as sent ("/" when the URL has no path). Anything that is not absolute (split_scheme) is
+    a bare target, bound byte for byte: it binds no origin."""
+    split = split_scheme(url)
+    if split is None:
         return "", "", "", url
-    scheme, rest = url.split("://", 1)
+    scheme, rest = split
     rest = rest.split("#", 1)[0]
     ends = [i for i in (rest.find("/"), rest.find("?")) if i >= 0]
     end = min(ends) if ends else len(rest)
@@ -142,10 +160,10 @@ FRAGMENT_REFUSED = b"request target with a # fragment"      # the body of the pr
 
 def url_origin(url: str) -> str:
     """`scheme://authority` of an absolute URL, or "" for a bare target."""
-    i = url.find("://")
-    if i < 0:
+    split = split_scheme(url)
+    if split is None:
         return ""
-    rest = url[i + 3:]
+    i, rest = len(split[0]), split[1]
     ends = [j for j in (rest.find("/"), rest.find("?"), rest.find("#")) if j >= 0]
     return url[:i + 3 + (min(ends) if ends else len(rest))]
 
@@ -1864,6 +1882,10 @@ class XbtChannelProvider:
 
 
 # --- client SDK -------------------------------------------------------------------------------
+# Most stale unfunded opens kept per origin (XbtChannelClient.unfunded), as xbt-rs client::MAX_KEPT.
+MAX_KEPT = 16
+
+
 @dataclass
 class ClientChannel:
     payer: Payer
@@ -1872,13 +1894,26 @@ class ClientChannel:
     refund_hex: str = ""
     auth_key: bytes = b""        # without a signer; with one, the signer computes payload.auth
     price: int = 0               # sat per call agreed at open: a 402 may not raise it mid-channel
-    slack_msat: int = 0          # charges adopted from a 402 without a receipt, over the channel's life
+    # charges adopted over the channel's life that no request of ours accounts for: at most one call
+    # (a request sent just before a crash, whose answer and count were both lost)
+    slack_msat: int = 0
     seq: int = 0
     spent_msat: int = 0          # from the last verified receipt
     last_sig: str = ""           # our signature for payer.signed, resent until a receipt shows it arrived
     pending_cond: dict = field(default_factory=dict)   # {hash, cipher, amount} of a signed hash lock
     acked_cum: int = 0           # the provider's best cum per its last receipt
     receipts: list = field(default_factory=list)
+    # How far the open has got (AGP-090, review C2; as xbt-rs client::Stage). "keyed": it has a key and
+    # terms; its funding has not left, or the call that sends it has not answered. "funded": funded
+    # and bound, the refund held; the provider has not answered the funded open. "open": the only
+    # stage a state is signed in.
+    stage: str = "open"
+    # What the paid requests the provider has not answered may have cost: one quote each, added when a
+    # request leaves, taken off when the provider refuses it (a 402: not charged), cleared by a
+    # verified receipt (AGP-090, review T4). An answer lost on the way, or one refused for its receipt,
+    # leaves its request here: the provider may have served it, so its spent total may be ahead of
+    # ours by this much (and by what is left of slack_msat's one call).
+    unanswered_msat: int = 0
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1921,18 +1956,24 @@ class XbtChannelClient:
     def __init__(self, network: str, fund: Callable[[str, int], tuple], height: Callable[[], int],
                  capacity=200_000, expiry_blocks=1_008, max_price=1_000, max_close_fee=2_000,
                  budget_sats=1_000_000, on_open: Callable = None, on_refund: Callable = None,
-                 signer=None, refunds: RefundCustody = None, daily_budget=0):
+                 signer=None, refunds: RefundCustody = None, daily_budget=0,
+                 max_expiry_blocks=OWNER_MAX_EXPIRY_BLOCKS):
         self.network, self.fund, self.height = network, fund, height
         self.capacity, self.expiry_blocks, self.max_price = capacity, expiry_blocks, max_price
         self.max_close_fee, self.budget_sats = max_close_fee, budget_sats
         self.on_open, self.on_refund = on_open, on_refund
         self.signer, self.refunds = signer, refunds
         self.daily_budget, self.day_spent, self.day_start = daily_budget, 0, time.time()
+        # the most blocks to expiry this client funds, whatever an offer asks for (AGP-090)
+        self.max_expiry_blocks = max_expiry_blocks
         self.channels: Dict[str, ClientChannel] = {}
+        # keyed channels whose funding call failed and that are now too near their expiry to fund,
+        # per origin: `fund` can fail after it sent, so their keys are kept (AGP-090)
+        self.unfunded: Dict[str, list] = {}
         self.opened_sats = 0
 
     @staticmethod
-    def _read_capped(r):
+    def _read_capped(r, method: str = ""):
         """A body over the cap, or cut short of its Content-Length, is an error. Reading to the cap
         and returning the short buffer booked a truncated answer as the one paid for (review T3)."""
         declared = r.headers.get("Content-Length")
@@ -1942,11 +1983,14 @@ class XbtChannelClient:
         out = r.read(MAX_RESPONSE + 1)
         if len(out) > MAX_RESPONSE:
             raise ChannelError("response_too_large", f"response exceeds {MAX_RESPONSE} bytes")
-        if n is not None and len(out) != n:
-            raise ChannelError("response_truncated", f"response body is {len(out)} of {n} bytes")
         status = getattr(r, "status", None)
         if status is None:
             status = r.code
+        # an answer to a HEAD, and a 1xx, 204 or 304, has no body by its framing: its Content-Length
+        # is the length a GET would get, so there is nothing to compare (AGP-090)
+        bodiless = method.upper() == "HEAD" or status in (204, 304) or 100 <= status < 200
+        if n is not None and len(out) != n and not bodiless:
+            raise ChannelError("response_truncated", f"response body is {len(out)} of {n} bytes")
         return status, {k.upper(): v for k, v in r.headers.items()}, out
 
     @staticmethod
@@ -1957,9 +2001,9 @@ class XbtChannelClient:
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
             with _NO_REDIRECT.open(req, timeout=30) as r:
-                return XbtChannelClient._read_capped(r)
+                return XbtChannelClient._read_capped(r, method)
         except urllib.error.HTTPError as e:
-            return XbtChannelClient._read_capped(e)
+            return XbtChannelClient._read_capped(e, method)
 
     def _post(self, url, obj):
         st, _, out = self.http("POST", url, json.dumps(obj).encode(), {"Content-Type": "application/json"})
@@ -2001,14 +2045,38 @@ class XbtChannelClient:
                 return acc
         raise ChannelError("no_scheme", f"no {SCHEME} offer on {self.network}")
 
-    def _open(self, origin: str, acc: dict) -> ClientChannel:
+    def _ensure_open(self, origin: str, acc: dict) -> ClientChannel:
+        """Bring `origin`'s channel to stage "open". Every open goes through here (a plain call, a
+        conditional call, a retry after any failure).
+
+        The rule (AGP-090, review C2; as xbt-rs Client::ensure_open): a channel's key is on the books
+        before its funding leaves, its refund before the provider is asked to open it, and an origin
+        that has a channel on the books is never funded a second time. The client used to keep a
+        channel only after the provider answered the funded open: a seller that said yes to the
+        preflight and no to the open (or an answer lost on the way) left the coins in a script whose
+        only payer key had been dropped, and every later call funded another channel."""
+        if origin not in self.channels:
+            self._key_channel(origin, acc)
+        if self.channels[origin].stage == "keyed":
+            self._fund_keyed(origin)
+        ch = self.channels[origin]
+        if ch.stage == "funded":
+            self._post_open(ch)
+        return ch
+
+    _open = _ensure_open        # the routed client opens its ch1 through the same function
+
+    def _key_channel(self, origin: str, acc: dict):
+        """Terms, a key and the preflight for a new channel, on the books before anything is funded."""
         ex = acc["extra"]
         fee_payer = ex.get("closeFeePayer", "payer")
         cap = max(self.capacity, int(ex["minCapacity"]))
         if cap > int(ex.get("maxCapacity", cap)) or self.opened_sats + cap > self.budget_sats:
             raise ChannelError("budget", "channel capacity outside provider range or our budget")
         # refused bad_offer, before a key is made or anything funded, on an offer without its terms
-        blocks = offer_expiry_blocks(ex, self.expiry_blocks)
+        # or one that asks for more blocks than the owner's bound
+        blocks = offer_expiry_blocks(ex, self.expiry_blocks, self.max_expiry_blocks)
+        open_url = same_origin_url(origin, ex["openUrl"])
         if self.signer:
             pub = self.signer.new_key(origin)
             secret = None
@@ -2018,37 +2086,94 @@ class XbtChannelClient:
         expiry = self.height() + blocks
         p = ChannelParams.derive(acc["payTo"], pub, expiry, int(ex["closeFeeSat"]), network=self.network,
                                  close_fee_payer=fee_payer)
-        terms = {"capacity": cap, "expiry": expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
-                 "redeemScript": p.script.hex(), **({"closeFeePayer": fee_payer} if fee_payer != "payer" else {})}
+        p.capacity = cap
         # review C2 (AGP-067): the provider's answer to these exact terms before anything is funded
-        open_url = same_origin_url(origin, ex["openUrl"])
-        self._preflight(open_url, terms, fee_payer)
-        fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
-        txid, vout = fund(segwit_address(self.hrp_for(), p.spk), cap)
-        p.funding_txid, p.funding_vout, p.capacity = txid, vout, cap
-        self.opened_sats += cap
+        self._preflight(open_url, self._open_terms(p), fee_payer)
+        payer = Payer(p, backend=self.signer) if self.signer else Payer(p, secret)
+        ch = ClientChannel(payer, origin, acc, stage="keyed",
+                           auth_key=b"" if self.signer else channel_auth_key(secret, bytes.fromhex(p.payee_pub)))
+        ch.price = int(acc["amount"])
+        self.channels[origin] = ch
+
+    @staticmethod
+    def _open_terms(p: ChannelParams) -> dict:
+        """The `channel` object of an open request (the outpoint too, once `p` is funded)."""
+        c = {"capacity": p.capacity, "expiry": p.expiry, "payerPub": p.payer_pub, "payerSpk": p.payer_spk,
+             "redeemScript": p.script.hex()}
+        if p.close_fee_payer != "payer":
+            c["closeFeePayer"] = p.close_fee_payer
+        if p.funding_txid:
+            c = {"txid": p.funding_txid, "vout": p.funding_vout, **c}
+        return c
+
+    def _fund_keyed(self, origin: str):
+        """Fund the keyed channel of `origin` (unless an earlier call did), bind it to its key and hold
+        its refund: stage "funded", before the provider hears of the outpoint. A retry after a `fund`
+        that raised pays the same script under the same key: `fund` is a bare callable here, so the
+        client cannot ask the wallet whether the first call sent, and whatever it did is refundable
+        with the key on the books."""
+        ch = self.channels[origin]
+        p = ch.payer.params
+        if not p.funding_txid:
+            if p.expiry < self.height() + offer_expiry_floor(ch.accepted["extra"]):
+                self._shelve_keyed(origin)
+            fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
+            txid, vout = fund(segwit_address(self.hrp_for(), p.spk), p.capacity)
+            p.funding_txid, p.funding_vout = txid, vout
+            self.opened_sats += p.capacity
         if self.signer:
             self.signer.attach(origin, p)
-            refund_hex = self.signer.sign_refund(p.channel_id)
-            payer = Payer(p, backend=self.signer)
+            ch.refund_hex = self.signer.sign_refund(p.channel_id)
         else:
-            refund_hex = p.refund_tx(secret).hex()
-            payer = Payer(p, secret)
-        ch = ClientChannel(payer, origin, acc, refund_hex=refund_hex,
-                           auth_key=b"" if self.signer else channel_auth_key(secret, bytes.fromhex(p.payee_pub)))
+            ch.refund_hex = p.refund_tx(ch.payer.secret).hex()
         if self.refunds:
-            self.refunds.add(ch.refund_hex, expiry, p.channel_id)
-        ch.price = int(acc["amount"])
+            self.refunds.add(ch.refund_hex, p.expiry, p.channel_id)
         if self.on_refund:
-            self.on_refund(ch.refund_hex, expiry)
+            self.on_refund(ch.refund_hex, p.expiry)
         if self.on_open:
             self.on_open(ch)
-        c = {"txid": txid, "vout": vout, **terms}
-        r = self._post(open_url, {"x402Version": 2, "network": self.network, "channel": c})
-        if isinstance(r, dict) and r.get("closeFeePayer", "payer") != fee_payer:
+        ch.stage = "funded"
+
+    def _shelve_keyed(self, origin: str):
+        """The keyed channel of `origin` is too near its expiry to fund now. Its key is kept in
+        `unfunded` (the call that failed may have sent) and the next call opens with a new key. A
+        signer holds one issued key per origin and a new one would replace this one, so with a signer
+        the record stays where it is until the embedder calls forget_unfunded."""
+        if self.signer or len(self.unfunded.get(origin, [])) >= MAX_KEPT:
+            raise ChannelError("open_unresolved", f"an earlier open to {origin} never learned whether its funding "
+                                                  f"was sent, and its channel is too near expiry to fund now: once "
+                                                  f"the wallet shows no send to it, call forget_unfunded")
+        self.unfunded.setdefault(origin, []).append(self.channels.pop(origin))
+        raise ChannelError("open_unresolved", f"an earlier open to {origin} was too old to fund; its key is kept, "
+                                              f"and the next call opens a new channel")
+
+    def forget_unfunded(self, origin: str) -> int:
+        """Drop the channels of `origin` that were never funded: the keyed one without an outpoint, and
+        those in `unfunded`. Call it only when the wallet shows no send to their scripts: their keys
+        go with them. Returns how many were dropped."""
+        n = len(self.unfunded.pop(origin, []))
+        ch = self.channels.get(origin)
+        if ch and ch.stage == "keyed" and not ch.payer.params.funding_txid:
+            del self.channels[origin]
+            n += 1
+        return n
+
+    def _post_open(self, ch: ClientChannel):
+        """Ask the provider to open the funded channel. Asked again on every call until it answers: a
+        provider that already has the channel (its first answer was lost) says duplicate_channel,
+        which is the yes that never arrived."""
+        p = ch.payer.params
+        try:
+            r = self._post(same_origin_url(ch.origin, ch.accepted["extra"]["openUrl"]),
+                           {"x402Version": 2, "network": self.network, "channel": self._open_terms(p)})
+        except ChannelError as e:
+            if e.code != "duplicate_channel":
+                raise
+            r = None
+        if isinstance(r, dict) and r.get("closeFeePayer", "payer") != p.close_fee_payer:
             # a provider that did not take our terms would refuse every state we sign: stop before paying
             raise ChannelError("bad_fee_payer", "the provider opened the channel with another closeFeePayer")
-        return ch
+        ch.stage = "open"
 
     def hrp_for(self) -> str:
         return "bc" if self.network == XBT_MAINNET else "bcrt"
@@ -2066,6 +2191,9 @@ class XbtChannelClient:
 
     def _payload(self, ch: ClientChannel, price: int, method: str = "", path: str = "", body: bytes = b"",
                  chosen: int | None = None) -> dict:
+        if ch.stage != "open":
+            # one choke point for every signature of a state: none before the provider opened it
+            raise ChannelError("no_channel", "the channel is not open at the provider yet")
         billing = ch.accepted["extra"].get("billing", "postpay")
         need_msat = ch.spent_msat + (price * 1000 if billing == "prepay" else 0)
         cum = max(-(-need_msat // 1000), ch.payer.signed)
@@ -2079,6 +2207,10 @@ class XbtChannelClient:
             self._rollover(ch)
             remaining = ch.payer.params.max_amount - ch.payer.signed
         ch.seq += 1
+        if path:
+            # a call (a close charges nothing): the provider may serve it whether or not its answer
+            # reaches us, so its quote counts until a receipt says what was charged
+            ch.unanswered_msat += (ch.price or int(ch.accepted["amount"])) * 1000
         pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(cum)}
         if cum > ch.payer.signed:
             if cum > ch.payer.params.max_amount:
@@ -2139,36 +2271,51 @@ class XbtChannelClient:
         own = self._extra_headers(headers)
         ch = self.channels.get(origin)
         hdrs = {}
-        if ch:
+        if ch and ch.stage == "open":
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": ch.accepted,
                                                   "payload": self._payload(ch, int(ch.accepted["amount"]),
                                                                           method, path, body, cum)})}
         status, rh, out = self.http(method, url, body, {**own, **hdrs})
         if status == 402:
+            if hdrs:
+                self._refused(ch)
             pr = unb64json(rh["PAYMENT-REQUIRED"])
             acc = self._pick(pr)
-            if not ch:
-                ch = self._open(origin, acc)
-                self.channels[origin] = ch
+            ch = self._ensure_open(origin, acc)
             if ch.price and int(acc["amount"]) > ch.price:
                 raise ChannelError("bad_offer", f"price raised mid-channel: {ch.price} -> {acc['amount']} sat")
             ch.accepted = acc
-            if "channel" in pr:   # provider's view: at most one unreceipted call over the channel's life
+            if "channel" in pr:
+                # The provider's view of what it charged, unsigned. It may be ahead of our receipts by
+                # the requests it never answered, at one quote each (AGP-090, review T4), plus the one
+                # call of slack a channel has over its life. The slack alone was the bound, so a second
+                # lost answer ended the channel in bad_offer. A request it refused with a 402 is not
+                # among them: a provider that serves nothing can claim nothing (M3).
                 claimed = int(pr["channel"]["spentMsat"])
-                extra = claimed - ch.spent_msat
-                if extra > 0 and ch.slack_msat + extra > int(acc["amount"]) * 1000:
+                extra = max(0, claimed - ch.spent_msat)
+                unproven = max(0, extra - ch.unanswered_msat)
+                if unproven > 0 and ch.slack_msat + unproven > int(acc["amount"]) * 1000:
                     raise ChannelError("bad_offer", "provider claims charges we have no receipts for")
-                ch.slack_msat += max(0, extra)
+                ch.unanswered_msat -= extra - unproven
+                ch.slack_msat += unproven
                 ch.spent_msat = max(ch.spent_msat, claimed)
             hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": acc,
                                                   "payload": self._payload(ch, int(acc["amount"]), method, path, body,
                                                                           cum)})}
             status, rh, out = self.http(method, url, body, {**own, **hdrs})
+            if status == 402:
+                self._refused(ch)
         if "PAYMENT-RESPONSE" in rh:
             self._receipt(ch, unb64json(rh["PAYMENT-RESPONSE"]), method, path, body, (status, out))
         elif hdrs:
             self._unreceipted(status)
         return status, rh, out
+
+    @staticmethod
+    def _refused(ch: ClientChannel, quote: int = None):
+        """The provider answered the paid request just sent with a 402: by its own word it did not
+        charge it."""
+        ch.unanswered_msat = max(0, ch.unanswered_msat - (quote or ch.price or int(ch.accepted["amount"])) * 1000)
 
     @staticmethod
     def _unreceipted(status: int):
@@ -2185,23 +2332,43 @@ class XbtChannelClient:
         conditional amount (already checked against max_price) for a conditional one. Never a
         quote the provider can raise afterwards (H6: a `conditional` quote in any 402 lifted the
         cap on plain calls)."""
-        quote = quote or ch.price or int(ch.accepted["amount"])
+        pinned = ch.price or int(ch.accepted["amount"])
+        quote = quote or pinned
         r = receipt_of(resp)
         if resp.get("network") != self.network or resp.get("payer") != ch.payer.params.payer_pub:
             raise ChannelError("bad_receipt", "PAYMENT-RESPONSE is for another network or payer")
         if r["req"] != request_digest_v2(method, ch.origin + path, body):
             raise ChannelError("bad_receipt", "receipt is for another request")
+        if type(r.get("seq")) is not int or r["seq"] != ch.seq:
+            # The receipt of the request we just sent, and of no other (AGP-090, review T4): an identical
+            # earlier request has the same digest, so whoever sits between could answer this one with
+            # the earlier answer and its genuine receipt.
+            raise ChannelError("bad_receipt", f"receipt is for seq {r.get('seq')!r}, this call was seq {ch.seq}")
         status = r.get("status")
-        if type(status) is not int or status != answer[0] or r.get("bodyHash") != body_hash(answer[1]):
+        # An answer that has no body by its framing (to a HEAD, or a 204 or 304) is checked on its
+        # status: the receipt's bodyHash is of the body the provider did not send (AGP-090).
+        bodiless = not answer[1] and (str(method).upper() == "HEAD" or answer[0] in (204, 304))
+        if type(status) is not int or status != answer[0] or (not bodiless and r.get("bodyHash") != body_hash(answer[1])):
             # a truncated or altered answer is not the one the provider signed for
             raise ChannelError("bad_receipt", "receipt is for another answer (status or body differs)")
         if not ecc.verify(bytes.fromhex(ch.payer.params.payee_pub), receipt_message(r), bytes.fromhex(r["sig"])):
             raise ChannelError("bad_receipt", "receipt not signed by the channel payee key")
         if int(r["cum"]) > ch.payer.signed or int(r["charged"]) > quote:
             raise ChannelError("bad_receipt", "provider claims more than we signed or were quoted")
-        if int(r["spentMsat"]) - ch.spent_msat > quote * 1000:
-            raise ChannelError("bad_receipt", "provider charged more than one call")
+        if int(r["cum"]) < 0 or int(r["charged"]) < 0 or int(r["spentMsat"]) < 0:
+            raise ChannelError("bad_receipt", "receipt amounts are not non-negative integers")
+        # The spent total may have grown, since the last receipt we verified, by one quote for each
+        # request the provider has not answered: this one and those whose answers were lost on the way
+        # (AGP-090, review T4), plus what is left of the channel's one call of slack. It was held to one
+        # call, so after one lost answer every later receipt was refused and the provider went on
+        # charging for answers the payer threw away. A lost answer is paid for once, like the call it
+        # answered; a request the provider refused is not paid for at all.
+        unproven = max(0, int(r["spentMsat"]) - ch.spent_msat - ch.unanswered_msat)
+        if unproven > 0 and ch.slack_msat + unproven > pinned * 1000:
+            raise ChannelError("bad_receipt", "provider charged more than the calls we sent")
+        ch.slack_msat += unproven
         ch.spent_msat = int(r["spentMsat"])
+        ch.unanswered_msat = 0
         ch.acked_cum = max(ch.acked_cum, int(r["cum"]))
         ch.receipts.append(r)
 
@@ -2223,7 +2390,7 @@ class XbtChannelClient:
         owed = max(ch.spent_msat // 1000, ch.payer.signed)
         if owed < ch.payer.params.min_amount:
             owed = ch.payer.params.min_amount
-        expiry = self.height() + offer_expiry_blocks(ex, self.expiry_blocks)    # as an open: bad_offer first
+        expiry = self.height() + offer_expiry_blocks(ex, self.expiry_blocks, self.max_expiry_blocks)    # as an open: bad_offer first
         if self.signer:
             pub = self.signer.new_key(origin + "/next")
         else:
@@ -2259,9 +2426,7 @@ class XbtChannelClient:
         except (KeyError, TypeError, ValueError):
             # without the ciphertext first, k (off-chain or in the claim) buys nothing (M7)
             raise ChannelError("bad_offer", "conditional offer carries no ciphertext")
-        if not ch:
-            ch = self._open(origin, acc)
-            self.channels[origin] = ch
+        ch = self._ensure_open(origin, acc)
         if ch.price and int(acc["amount"]) > ch.price:
             raise ChannelError("bad_offer", f"price raised mid-channel: {ch.price} -> {acc['amount']} sat")
         ch.accepted = acc
@@ -2289,6 +2454,7 @@ class XbtChannelClient:
         self.day_spent += cond_amt
         ch.pending_cond = {"hash": h.hex(), "cipher": cipher.hex(), "amount": cond_amt}
         ch.seq += 1
+        ch.unanswered_msat += cond_amt * 1000
         pl = {"chan": ch.payer.params.channel_id, "seq": ch.seq, "cum": str(uncond),
               "hashlock": extra["hash"], "sig": sig}
         self._auth(ch, pl, method, ch.origin + path, body)
@@ -2296,6 +2462,7 @@ class XbtChannelClient:
         status, rh, out = self.http(method, url, body, hdrs)
         if status == 402:                      # refused: the provider did not keep the conditional state
             ch.pending_cond = {}
+            self._refused(ch, cond_amt)
             try:
                 code = json.loads(out).get("error") or "refused"
             except (ValueError, AttributeError):

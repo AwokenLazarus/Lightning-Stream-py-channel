@@ -101,7 +101,29 @@ def offer_expiry_terms(extra: dict) -> tuple:
         need("closeMarginBlocks")
 
 
-def offer_expiry_blocks(extra: dict, want: int) -> int:
-    """open_expiry_blocks for an offer's `extra` (offer_expiry_terms)."""
+# The most blocks to expiry a payer funds on an offer unless its owner sets another bound: four
+# weeks, the bound the signer socket's open_channel has (as xbt-rs funding::OWNER_MAX_EXPIRY_BLOCKS).
+OWNER_MAX_EXPIRY_BLOCKS = 4_032
+
+
+def offer_expiry_floor(extra: dict) -> int:
+    """open_expiry_floor for an offer's `extra`."""
+    min_expiry, _, min_conf, close_margin = offer_expiry_terms(extra)
+    return open_expiry_floor(min_expiry, min_conf, close_margin)
+
+
+def offer_expiry_blocks(extra: dict, want: int, owner_max: int = OWNER_MAX_EXPIRY_BLOCKS) -> int:
+    """open_expiry_blocks for an offer's `extra` (offer_expiry_terms), held to the owner's bound.
+
+    The rule (AGP-090, review C2): how long a payer's coins are locked is the owner's number, never
+    only the seller's. Every term of open_expiry_floor comes from the offer, and so did the only cap
+    (maxExpiryBlocks): an offer with minExpiryBlocks 2,000,000 got a channel that refunds in 38
+    years. So the payer asks for at most `owner_max` blocks, and an offer whose floor is above that
+    is refused bad_offer here, before a key is made or anything is funded. Every payer that opens on
+    an offer comes through this function."""
     min_expiry, max_expiry, min_conf, close_margin = offer_expiry_terms(extra)
-    return open_expiry_blocks(want, min_expiry, max_expiry, min_conf, close_margin)
+    blocks = open_expiry_blocks(min(want, owner_max), min_expiry, max_expiry, min_conf, close_margin)
+    if blocks > owner_max:
+        raise ChannelError("bad_offer", f"the offer needs {blocks} blocks to expiry and this payer locks its coins "
+                                        f"for at most {owner_max}")
+    return blocks
