@@ -31,7 +31,11 @@
 > (2) ch1's counters move by what a lock adds (`unitsBy` on the lock record, written at admission),
 > on completion and on a hold: a hold released while another lock was in flight no longer comes back
 > with it. The client adopts a release that arrives in the same view as a hold or a completion.
-> Tests `tests/security/test_agp085_hub.py`.
+> (3) A replaced intent is kept: writing a new `close_intent` for another transaction moves the old one
+> to `close_intents`, and every unresolved one is looked for (the latest first) until the node shows
+> one, which is then the channel's close (AGP-084's limit "a superseded intent ... is not recorded" is
+> closed). A rollover is refused `channel_closing` once 8 replaced ones are unresolved; a close is not.
+> Tests `tests/security/test_agp085_hub.py`, `tests/security/test_agp085_intents.py`.
 
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.

@@ -68,4 +68,8 @@ Tests: `tests/security/test_agp081_closure_audit.py`.
 - **ch1's counters move by what a lock adds** (`unitsBy`), on completion and on a hold, so a hold
   released while another lock was in flight does not come back with that lock.
 
-Details: `docs/routing.md` (the AGP-085 note). Tests: `tests/security/test_agp085_hub.py`.
+- **A replaced close or rollover intent is kept** (`close_intents`) until the node shows one of them;
+  a rollover is refused `channel_closing` once 8 are unresolved.
+
+Details: `docs/routing.md` (the AGP-085 note). Tests: `tests/security/test_agp085_hub.py`,
+`tests/security/test_agp085_intents.py`.

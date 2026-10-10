@@ -267,9 +267,33 @@ def intent_open(st) -> bool:
     """A close or rollover of this channel was signed and written ahead (`close_intent`, M8) and is not
     recorded as its close yet: the node answered the broadcast with an error, or we stopped before its
     answer. That transaction is complete and can still confirm, so the channel takes no state above it
-    (AGP-084): no paid call, no routed lock. It ends when the node shows the spend (`_adopt_intent`),
+    (AGP-084): no paid call, no routed lock. It ends when the node shows the spend (`_adopt_intent`: the
+    latest intent or one it replaced, AGP-085),
     when the watcher gets a close through, or when the client rolls over or closes again."""
     return not st.closed_txid and bool((st.extra or {}).get("close_intent"))
+
+
+MAX_KEPT_INTENTS = 8    # unresolved spends a channel keeps beside its latest intent (`close_intents`, AGP-085)
+
+
+def set_intent(st, intent: dict):
+    """Write `intent` ahead as the channel's `close_intent` (the caller saves). AGP-085: an earlier one
+    for another transaction is not forgotten. It is complete and signed and can still confirm, so it
+    moves to `close_intents` and `_adopt_intent` goes on looking for it."""
+    ex = dict(st.extra or {})
+    old = ex.get("close_intent")
+    if old and old.get("txid") != intent.get("txid"):
+        kept = [k for k in ex.get("close_intents") or [] if k.get("txid") not in (old.get("txid"), intent.get("txid"))]
+        ex["close_intents"] = kept + [old]
+    ex["close_intent"] = intent
+    st.extra = ex
+
+
+def intents(st) -> list:
+    """The spends written ahead for this channel and not recorded: the latest first, then the ones it
+    replaced, newest to oldest."""
+    ex = st.extra or {}
+    return [i for i in [ex.get("close_intent")] + list(reversed(ex.get("close_intents") or [])) if i]
 
 
 def closing(st) -> bool:
@@ -762,19 +786,19 @@ class XbtChannelProvider:
 
     def _adopt_intent(self, st: ChannelState) -> bool:
         """A close this provider sent and never recorded (M8: the intent is written ahead): record it.
-        True when the channel is now closed by it."""
-        intent = (st.extra or {}).get("close_intent")
-        if not intent:
-            return False
+        True when the channel is now closed by it. AGP-085: every unresolved intent is looked for, the
+        latest first, not only the last one written."""
         from .tx import Tx
-        if not self._tx_known(intent["txid"], Tx.parse(bytes.fromhex(intent["hex"]))):
-            return False
-        self._closed(st, intent["hex"], intent["txid"], intent["cond"])
-        if intent.get("next"):
-            # a rollover (AGP-084): the next channel is the one this tx funds
-            st.extra = {**st.extra, "rollover_to": intent["next"]}
-            self.ledger.save(st)
-        return True
+        for intent in intents(st):
+            if not self._tx_known(intent["txid"], Tx.parse(bytes.fromhex(intent["hex"]))):
+                continue
+            self._closed(st, intent["hex"], intent["txid"], intent["cond"])
+            if intent.get("next"):
+                # a rollover (AGP-084): the next channel is the one this tx funds
+                st.extra = {**st.extra, "rollover_to": intent["next"]}
+                self.ledger.save(st)
+            return True
+        return False
 
     # hash-locked conditional state (XBT-061 M6) ---------------------------------------------
     def _cond_state(self, st: ChannelState):
@@ -859,7 +883,7 @@ class XbtChannelProvider:
             txid = tx.txid()
             # write-ahead (M8): a close the node took but we never recorded (lost RPC answer, crash
             # before the save) would never be claimed, and once it confirms no re-send is accepted
-            st.extra = {**(st.extra or {}), "close_intent": {"hex": tx.hex(), "txid": txid, "cond": conditional}}
+            set_intent(st, {"hex": tx.hex(), "txid": txid, "cond": conditional})
             self.ledger.save(st)
             try:
                 self.rpc.sendrawtransaction(tx.hex())
@@ -1327,8 +1351,10 @@ class XbtChannelProvider:
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
-            st.extra = {**(st.extra or {}), "close_intent": {"hex": tx.hex(), "txid": txid, "cond": False,
-                                                              "next": f"{txid}:1"}}
+            if len((st.extra or {}).get("close_intents") or []) >= MAX_KEPT_INTENTS:
+                # AGP-085: each one is kept until the chain settles it, and a client could ask without end
+                raise ChannelError("channel_closing", f"{MAX_KEPT_INTENTS} earlier spends of this channel are unresolved: close it")
+            set_intent(st, {"hex": tx.hex(), "txid": txid, "cond": False, "next": f"{txid}:1"})
             self.ledger.save(st)
             try:
                 self.rpc.sendrawtransaction(tx.hex())
