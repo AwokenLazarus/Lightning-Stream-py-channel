@@ -1834,13 +1834,13 @@ _NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
 def same_origin_url(origin: str, value) -> str:
     """AGP-080 X1: where a seller says its open or close endpoint is, held to the seller's own origin.
     `origin + value` let "@evil.example/open" name another host. Accepted: a path starting with exactly
-    one "/", or an absolute URL on `origin`; no backslash, whitespace or control character either way.
-    Anything else is refused before a request is made."""
+    one "/", or an absolute URL on `origin`; no backslash, whitespace or control character either way,
+    and no "#" (AGP-081, no_fragment). Anything else is refused before a request is made."""
     def refuse():
         return ChannelError("seller_url", "the seller's URL is not on its own origin; refused before any request")
     if not isinstance(value, str) or not value:
         raise refuse()
-    if any(c == "\\" or c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+    if any(c in "\\#" or c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in value):
         raise refuse()
     if value.startswith("/") and not value.startswith("//"):
         return origin + value

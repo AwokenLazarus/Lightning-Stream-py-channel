@@ -178,6 +178,10 @@ class Fragment(unittest.TestCase):
         # an origin that was never paid is not opened for one either
         self.assertEqual(code_of(self, c.request, "GET", "https://other.example/v1/q#x"), "bad_request")
         self.assertNotIn("https://other.example", c.channels)
+        # nor is a seller's own open or close URL taken with one
+        from xbt402.x402_channel import same_origin_url
+        for given in ("/x402/xbt-channel/open#x", O + "/x402/xbt-channel/open#x"):
+            self.assertEqual(code_of(self, same_origin_url, O, given), "seller_url")
         # the digest itself is unchanged (published vectors): it still drops the fragment
         self.assertEqual(xc.request_digest_v2("GET", O + "/v1/q#x", b""), xc.request_digest_v2("GET", O + "/v1/q", b""))
 
