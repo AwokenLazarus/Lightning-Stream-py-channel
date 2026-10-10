@@ -16,7 +16,8 @@ scripts/mainnet_provider.example.json. The same script runs the regtest rehearsa
 the RPC port, the paths and the port change.
 
 Safety rails:
-  * `host` must be a loopback address; anything else is refused.
+  * `host` must be a loopback address; anything else is refused. uvicorn has no header deadline and
+    no connection cap (AGP-081, xbt402/asgi.py): what is public is the reverse proxy in front.
   * the node's `getblockchaininfo.chain` must equal the config's `chain`.
   * on mainnet the network id is `network_id(getblockhash(961640))` and must equal XBT_MAINNET; the
     node must be out of initial block download.

@@ -119,10 +119,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
-from . import adaptor, ecc
+from . import adaptor, ecc, x402_channel
 from .channel import (DUST, FEE_PAYERS, RBF_SEQUENCE, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams,
                       canonical_chan, settle_due)
-from .funding import FundingPolicy
+from .funding import FundingPolicy, offer_expiry_terms, open_expiry_floor
 from .hub_keys import WRAP_KEY_FILE, WrapKey
 from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
                     fee_due, find_spend, hub_channel_message, next_cum, route_ok)
@@ -343,8 +343,8 @@ class HubConfig:
     "payer": the client pays its own channel's close, as on any plain channel).
 
     A provider's /terms are bounded before the hub funds a ch2 (AGP-037), or it is refused bad_terms:
-    minExpiryBlocks + 6 <= ch2_max_expiry_blocks (0: 2 x ch2_expiry_blocks; the expiry is clamped to it
-    too), closeFeeSat <= ch2_max_close_fee_sat and ch2_close_fee_multiple x closeFeeSat <= capacity,
+    minExpiryBlocks + minConf + closeMarginBlocks <= ch2_max_expiry_blocks (0: 2 x ch2_expiry_blocks; the
+    expiry is clamped to it too), closeFeeSat <= ch2_max_close_fee_sat and ch2_close_fee_multiple x closeFeeSat <= capacity,
     minConf <= ch2_max_min_conf, minCapacity <= ch2_max_min_capacity (0: ch2_capacity), settleMultiple
     <= ch2_max_settle_multiple. Refunds: refund_grace_blocks past expiry for a signed ch2, fee
     estimatesmartfee(refund_conf_target) x vsize, at least refund_min_feerate sat/vB, at most
@@ -590,6 +590,8 @@ class RouteHub:
     def serve(self, method: str, path: str, headers: dict, body: bytes, url: str = "", max_body: int = None):
         if len(body or b"") > self.body_limit(path, max_body):
             return 400, {}, b"bad request framing or body over MAX_BODY"
+        if "#" in path:                                     # as the provider does (AGP-081, review T2)
+            return 400, {}, x402_channel.FRAGMENT_REFUSED
         if path.split("?", 1)[0] == HUB_ROUTE_PATH:
             hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
             if method == "POST" and hdr:
@@ -649,8 +651,8 @@ class RouteHub:
         self.events.append(ev)
         return ev
 
-    def http_server(self, port: int):
-        return XbtChannelProvider.http_server(self, port)
+    def http_server(self, port: int, **limits):
+        return XbtChannelProvider.http_server(self, port, **limits)
 
     # --- POST /x402/route --------------------------------------------------------------------------
     @staticmethod
@@ -668,6 +670,8 @@ class RouteHub:
                 raise TypeError
             d, f, lock_id = int(rt["amount"]), int(rt["fee"]), str(rt["lockId"])
             provider = canon_origin(str(rt["provider"]))
+            if "#" in provider:     # the lock sent on is bound to provider + /x402/xbt-channel/lock (AGP-081, T2)
+                raise ValueError("provider")
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._err("bad_payload")
         ib = self.inbound
@@ -1176,10 +1180,13 @@ class RouteHub:
             if not isinstance(terms["payTo"], str) or len(bytes.fromhex(terms["payTo"])) != 33:
                 raise ValueError("payTo")
             close_fee, min_cap = int(ex["closeFeeSat"]), int(ex["minCapacity"])
-            lo, hi = int(ex["minExpiryBlocks"]) + 6, int(ex["maxExpiryBlocks"]) - 1
-            min_conf, mult = int(ex.get("minConf", 1)), int(ex.get("settleMultiple", 20))
-        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            min_exp, max_exp, min_conf, margin = offer_expiry_terms(ex)
+            mult = int(ex.get("settleMultiple", 20))
+        except (KeyError, TypeError, ValueError, AttributeError, ChannelError) as e:
             raise ChannelError("bad_terms", f"malformed /terms: {type(e).__name__} {e}") from None
+        # the payer's rule (AGP-076): the ch2 funding gets minConf plus the provider's own close margin to
+        # confirm before the provider's expiry check refuses it
+        lo, hi = open_expiry_floor(min_exp, min_conf, margin), max_exp - 1
         max_blocks = c.ch2_max_expiry_blocks or 2 * c.ch2_expiry_blocks
         cap = max(capacity or self.ch2_capacity, min_cap)
         # AGP-084: AGP-064's bound (a lock is at most half of a ch2) against the capacity this ch2 is
@@ -1193,10 +1200,10 @@ class RouteHub:
             why = f"{c.ch2_close_fee_multiple} x closeFeeSat {close_fee} > capacity {cap}"
         elif not 0 <= min_cap <= (c.ch2_max_min_capacity or self.ch2_capacity):
             why = f"minCapacity {min_cap} > ch2_max_min_capacity {c.ch2_max_min_capacity or self.ch2_capacity}"
-        elif lo > max_blocks or lo > hi:
-            why = f"minExpiryBlocks + 6 = {lo} > max expiry {min(max_blocks, hi)}"
         elif not 0 <= min_conf <= c.ch2_max_min_conf:
             why = f"minConf {min_conf} > ch2_max_min_conf {c.ch2_max_min_conf}"
+        elif lo > max_blocks or lo > hi:
+            why = f"minExpiryBlocks + minConf + closeMarginBlocks = {lo} > max expiry {min(max_blocks, hi)}"
         elif not 1 <= mult <= c.ch2_max_settle_multiple:
             why = f"settleMultiple {mult} outside [1, {c.ch2_max_settle_multiple}]"
         if why:
@@ -2333,7 +2340,8 @@ def main(argv=None, serve: bool = True):
      "wrap_key_file": "~/.config/xbt-hub/hub-wrap-key",   seals the ch2 keys in ch2.json (default <datadir>/hub-wrap-key)
      "connect": ["http://provider:port", ...],                                  providers to fund ch2s to
      "hub": {HubConfig fields: fees, fee_strategy, liquidity_cap_sat, ...},
-     "watch_interval": 5}
+     "watch_interval": 5,
+     "max_per_address": 48}       connections one client address may hold (0: off, behind a reverse proxy)
     The fund hook is the node wallet named in "node" (sendtoaddress; no mining off regtest)."""
     import argparse
     from .rpc import RPC
@@ -2368,7 +2376,7 @@ def main(argv=None, serve: bool = True):
             except (ChannelError, OSError) as e:
                 sys.stderr.write(f"hub: connect {origin}: {e}\n")
     stop = hub.watch(float(conf.get("watch_interval", 5)))
-    srv = hub.http_server(int(conf["port"]))
+    srv = hub.http_server(int(conf["port"]), max_per_address=int(conf.get("max_per_address", x402_channel.MAX_PER_ADDRESS)))
     sys.stderr.write(f"xbt402 hub {hub.pay_to} on 127.0.0.1:{conf['port']} ({conf['network']})\n")
     if not serve:                                  # embedding (xbt-compute merchant --hub): caller serves
         return hub, srv, stop

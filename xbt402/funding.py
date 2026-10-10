@@ -1,4 +1,4 @@
-"""Payee-side funding checks before a channel is credited."""
+"""Payee-side funding checks before a channel is credited, and the expiry a payer opens with."""
 from dataclasses import dataclass
 
 from .channel import ChannelError, ChannelParams
@@ -56,3 +56,52 @@ def check_funding(rpc, p: ChannelParams, pol: FundingPolicy) -> int:
     if confs < need and p.capacity > pol.zero_conf_max:
         raise ChannelError("unconfirmed", f"{confs} confirmations, need {need}")
     return confs
+
+
+def open_expiry_floor(min_expiry: int, min_conf: int, close_margin: int) -> int:
+    """The fewest blocks to expiry a payer asks for when it opens on an offer: `minExpiryBlocks +
+    minConf + closeMarginBlocks`, all three from that offer (AGP-076; the same rule as xbt-rs
+    `xbt402::funding::open_expiry_floor`).
+
+    check_funding compares the blocks left with min_expiry_blocks at the provider's tip when the
+    funded open reaches it, not at the payer's tip when the payer chose the expiry. In between the
+    funding has to get `minConf` confirmations, and it may wait for the first one. So the payer adds
+    `minConf`, plus the time the provider itself allows a transaction to confirm on this chain:
+    `closeMarginBlocks`, how long before expiry it broadcasts its close. A funding that takes longer
+    would be refused bad_expiry on every retry, with the coins locked until the refund. No provider
+    check reads the margin; it is only the payer's allowance."""
+    return min_expiry + min_conf + close_margin
+
+
+def open_expiry_blocks(want: int, min_expiry: int, max_expiry: int, min_conf: int, close_margin: int) -> int:
+    """Blocks to expiry for a new channel: what the payer wants, at least open_expiry_floor, at most
+    `maxExpiryBlocks - 1`. An offer whose window is narrower than the floor gets the top of its
+    window: the open preflight answers that before anything is funded."""
+    return max(0, min(max(want, open_expiry_floor(min_expiry, min_conf, close_margin)), max_expiry - 1))
+
+
+def _block_count(v):
+    """An offer's block count: a non-negative integer, or a string of decimal digits. None otherwise."""
+    if isinstance(v, str):
+        v = v.strip()
+        v = int(v) if v.isascii() and v.isdigit() and len(v) <= 30 else None
+    return v if isinstance(v, int) and v >= 0 else None
+
+
+def offer_expiry_terms(extra: dict) -> tuple:
+    """(minExpiryBlocks, maxExpiryBlocks, minConf, closeMarginBlocks) of an offer's `extra`. `minConf`
+    absent is 1, as everywhere on this wire; the three others have no default, so an offer without
+    one (or with one that is not a block count) is refused bad_offer, before anything is funded."""
+    def need(k):
+        n = _block_count(extra.get(k))
+        if n is None:
+            raise ChannelError("bad_offer", f"extra.{k} missing or not a block count")
+        return n
+    return need("minExpiryBlocks"), need("maxExpiryBlocks"), need("minConf") if "minConf" in extra else 1, \
+        need("closeMarginBlocks")
+
+
+def offer_expiry_blocks(extra: dict, want: int) -> int:
+    """open_expiry_blocks for an offer's `extra` (offer_expiry_terms)."""
+    min_expiry, max_expiry, min_conf, close_margin = offer_expiry_terms(extra)
+    return open_expiry_blocks(want, min_expiry, max_expiry, min_conf, close_margin)

@@ -60,7 +60,7 @@ NETWORK = XBT_MAINNET
 OTHER_NETWORKS = ["bip122:" + "11" * 16,      # example regtest id (the real one is per chain: block 101)
                   "bip122:000000000933ea01ad0ee984209779ba"]   # Bitcoin testnet3's id: any other network
 TIP = 1_000                    # stub chain tip for the round trip
-EXPIRY = TIP + 1_014           # the reference client's default: minExpiryBlocks + 6
+EXPIRY = TIP + 1_014           # the reference client's default before AGP-081: minExpiryBlocks + 6
 CAPACITY = 200_000
 CLOSE_FEE = 600
 PRICE = 150

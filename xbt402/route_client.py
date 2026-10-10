@@ -29,7 +29,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Optional
 
-from . import adaptor, ecc
+from . import adaptor, ecc, x402_channel
 from .channel import ChannelError
 from .route import (AMSAT_PER_SAT, HUB_ROUTE_PATH, FeeQuote, Invoice, PriceQuote, call_auth, ceil_div, fee_due,
                     lock_auth, next_cum, session_key, state_verify)
@@ -71,7 +71,7 @@ class RoutePayer:
                  capacity: int = 200_000, expiry_blocks: int = 8_000, max_fee_ppm: int = 10_000,
                  max_fee_base_msat: int = 10_000, max_lock_sat: int = 50_000, void_grace: float = 1.0,
                  http: Callable = None):
-        self.hub_url = hub_url.rstrip("/")
+        self.hub_url = x402_channel.no_fragment(hub_url.rstrip("/"))    # every lock is bound to hub_url + /x402/route (AGP-081)
         self.network = network
         self.signer = signer or ChannelSigner(fund=fund)
         self.cc = XbtChannelClient(network, fund, height, capacity=capacity, expiry_blocks=expiry_blocks,
@@ -128,6 +128,7 @@ class RoutePayer:
     def shard(self, url: str, method: str = "POST") -> Shard:
         """Start a metered session on a routed path: verify the provider's signed price quote and
         first invoice (the hub never touches either)."""
+        x402_channel.no_fragment(url)
         c = secrets.randbelow(ecc.N - 1) + 1
         st, rh, out = self.http(method, url, b"", {"ROUTE-CLIENT": ecc.pubkey(c).hex()})
         if st != 402:
@@ -153,6 +154,7 @@ class RoutePayer:
     def call(self, sh: Shard, method: str = "POST", body: bytes = b""):
         """One metered call straight to the provider. Returns (status, headers, body); a 402 with
         error route_credit means the provider stopped serving us (its credit window ran out)."""
+        x402_channel.no_fragment(sh.url)              # before the call is numbered: ROUTE-AUTH binds sh.url
         with sh.lock:
             sh.seq += 1
             seq = sh.seq
