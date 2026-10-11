@@ -2403,6 +2403,17 @@ class RouteHub:
             gone = self._rollover_gone(oc, p)
             if gone is not None:
                 return out + gone
+        if oc.state == "rolled" and oc.close_txid:
+            # the rollover this ch2 was rolled on, in a block by one of its own two outputs: nothing left
+            # to watch, and no block is read for it (a rollover whose outputs are both spent again
+            # already is found by the scan below)
+            for n in (0, 1):
+                u = self.rpc.gettxout(oc.close_txid, n, False)
+                if u is not None and int(u.get("confirmations", 0) or 0) >= 1:
+                    with self.out.lock:
+                        oc.final = oc.spend_seen = True
+                        self.out.save()
+                    return out
         # (AGP-085: with a next ch2 written ahead the spender is read, never taken on the provider's word:
         # it may be a rollover into it)
         if (oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid
