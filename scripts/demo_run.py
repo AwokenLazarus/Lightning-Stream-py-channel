@@ -154,7 +154,7 @@ def main():
     check(pay({"chan": cid, "cum": str(signed + 5_000), "sig": relabel})[1] == "bad_sig",
           "last signature relabelled with a higher cum -> bad_sig")
     check(pay({"chan": cid, "cum": str(signed)}, {**ch.accepted, "network": "bip122:000000000019d6689c085ae165831e93"})[1]
-          == "unsupported_scheme_or_network", "SHA-256 Bitcoin network id -> refused")
+          == "unsupported_scheme_or_network", "the SHA-256 chain network id -> refused")
     check(pay({"chan": cid, "seq": 10**9, "cum": str(signed)}, auth=False)[1] == "bad_auth",
           "known channel id and cum but no request auth -> bad_auth (no bearer spending)")
     check(pay({"chan": cid, "cum": str(signed)})[1] == "insufficient_payment",

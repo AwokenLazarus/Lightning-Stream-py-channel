@@ -104,8 +104,8 @@ XBT is a Bitcoin-derived chain with these properties that matter here:
 | Node software | Bitcoin Knots with the BLAKE2b hard fork. This spec was tested against Knots **29.4.2** (`v29.4.2.knots20260508`). |
 | Script and transactions | Bitcoin's: segwit v0 (P2WPKH, P2WSH), taproot, CLTV, CSV. Amounts in satoshis (`sat`). |
 | **BIP-110 (RDTS)** | A "reduced data" soft fork, enforced as consensus. The rules this protocol depends on: an output's scriptPubKey is at most 34 bytes (83 for OP_RETURN), pushes and witness items are at most 256 bytes, and `OP_IF`/`OP_NOTIF` are invalid in tapscript. Its data limits are temporary by design. |
-| **`SIGHASH_UNIFIED`** | A signature-hash flag, `0x20`, that XBT consensus accepts and SHA-256 Bitcoin rejects. With it, a signature commits to a different message (`UnifiedSighash`, below). `ALL\|UNIFIED` is `0x21`. |
-| Replay protection | Opt-in, per signature. Coins that existed before the split exist on both chains under the same keys. A spend signed with a legacy hash type (for example `0x01`) can be replayed on SHA-256 Bitcoin. A spend signed with `0x21` cannot. |
+| **`SIGHASH_UNIFIED`** | A signature-hash flag, `0x20`, that XBT consensus accepts and the SHA-256 chain rejects. With it, a signature commits to a different message (`UnifiedSighash`, below). `ALL\|UNIFIED` is `0x21`. |
+| Replay protection | Opt-in, per signature. Coins that existed before the split exist on both chains under the same keys. A spend signed with a legacy hash type (for example `0x01`) can be replayed on the SHA-256 chain. A spend signed with `0x21` cannot. |
 | Coinbase maturity | Knots 29.4.2 relay policy requires 6,480 confirmations for **any** coinbase spend, and consensus requires it for coinbases created from block 973,440 until block 979,920. Normal outputs are unaffected. |
 
 **UnifiedSighash.** The message signed under `0x20` is `tagged_hash("UnifiedSighash", m)` (BIP340 tagged
@@ -210,7 +210,7 @@ OP_ENDIF <A> OP_CHECKSIG
 
 Rules:
 - The funding transaction MUST be signed with `0x21` whenever it spends coins that exist on both chains
-  (outputs created before the split). Signed with `0x01` it can be replayed on SHA-256 Bitcoin, locking
+  (outputs created before the split). Signed with `0x01` it can be replayed on the SHA-256 chain, locking
   the client's coins there in a script with the provider. Clients SHOULD sign every funding `0x21`.
 - A funding output MUST NOT be a coinbase output (`coinbase_funding`).
 
@@ -598,7 +598,7 @@ before funding; this draft does not propose that.
   about 1 minute (just after the proof-of-work change) to about 10, as difficulty chased a hashrate that
   moved several-fold in weeks. The 144-block margin is "about a day" only at 10-minute blocks. A
   provider SHOULD treat the margin as a block count and alert on it, not as a duration.
-- **Reorg depth.** XBT's hashrate is small next to SHA-256 Bitcoin's, so deep reorgs are cheaper. An
+- **Reorg depth.** XBT's hashrate is small next to the SHA-256 chain's, so deep reorgs are cheaper. An
   attacker can open many large channels in a block it plans to orphan and double-spend. The reference
   waits for 3 confirmations above 1,000,000 sat and suspends channels whose funding disappears (H2).
   Providers with a larger exposure SHOULD require more.

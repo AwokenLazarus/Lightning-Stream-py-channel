@@ -58,7 +58,7 @@ transaction formats are Bitcoin's. Four chain rules shape this scheme:
   `OP_IF` in tapscript. So the channel script is P2WSH, and every payout script must be P2WPKH, P2WSH
   or P2TR.
 - **`SIGHASH_UNIFIED`** (flag `0x20`, so `ALL|UNIFIED` = `0x21`) makes a signature commit to a different
-  message (`UnifiedSighash`), which XBT accepts and SHA-256 Bitcoin rejects. Coins older than the split
+  message (`UnifiedSighash`), which XBT accepts and the SHA-256 chain rejects. Coins older than the split
   exist on both chains, so a spend signed with a legacy hash type can be replayed on Bitcoin and a `0x21`
   spend cannot. Like BIP341, `UnifiedSighash` commits to every input's amount and scriptPubKey. Every
   signature in this scheme is `0x21`.
@@ -432,7 +432,7 @@ postpay server risks one request; a prepay client risks one request.
 Verifiers MUST reject non-strict-DER and high-S signatures before verifying: some ECDSA libraries accept
 BER, but segwit v0 consensus does not, and a state that verifies only in software can never be closed.
 Every state signature MUST be `0x21`. `UnifiedSighash` commits to the funding outpoint, amount and
-script, so a state cannot be moved to another channel and cannot be replayed on SHA-256 Bitcoin.
+script, so a state cannot be moved to another channel and cannot be replayed on the SHA-256 chain.
 
 ### Channel identity
 Nodes parse txids case-insensitively. A server that keys channels by the string it received can be made
