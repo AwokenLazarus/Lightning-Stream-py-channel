@@ -243,14 +243,6 @@ class CloseOneChannel(unittest.TestCase):
         chan2 = r.cl.channels[other].payer.params.channel_id
         self.assertEqual(self.code(r, chan2), "no_state")
         self.assertEqual(self.code(r, "00" * 32 + ":0"), "unknown_channel")
-        # a routed lock open on it; a hub-funded ch2
-        st.extra = {**st.extra, "route_lock": {"lockId": "l1"}}
-        self.assertEqual(self.code(r, chan), "lock_pending")
-        st.extra = {**st.extra, "route_lock": None, "stale_locks": [{"lockId": "l0"}]}
-        self.assertEqual(self.code(r, chan), "lock_pending")
-        st.extra = {"hub": "02ab"}
-        self.assertEqual(self.code(r, chan), "hub_channel")
-        st.extra = {}
         # a call being served on it
         seen = []
         r.in_handler = lambda: seen.append(self.code(r, chan))

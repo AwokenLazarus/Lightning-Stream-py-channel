@@ -19,7 +19,7 @@ and for v1.2 payee-pays channels (closeFeePayer "payee"): every state pays the p
 the payer capacity - cum, the v1.1 signature for the same cum does not verify (the payer's signature
 commits to who pays), the least state is dust + closeFee, the 0xA3 output 0 and the rollover's next
 channel are the payer's whole remainder, the conditional state's fee comes out of the payee's
-unconditional output, and a provider's /terms and hub-bound open carry closeFeePayer. Exits 0 when
+unconditional output, and a provider's /terms and its open carry closeFeePayer. Exits 0 when
 everything matches, 1 on any mismatch.
 Run it under both crypto backends: the project venv (libsecp256k1 via coincurve) and a Python without
 coincurve (the pure-Python fallback); the output names the backend.
@@ -357,14 +357,10 @@ def gen_conditional():
 
 
 # --- 6. v1.2 payee-pays (closeFeePayer "payee") -----------------------------------------------------
-HUB_SECRET = int.from_bytes(sha256(b"xbt402 test vector: hub payTo secret"), "big") % ecc.N
-
-
 def gen_payee_pays():
-    """A payee-pays channel (v1.2, the default for hub-funded routed channels): states, close, the
+    """A payee-pays channel (v1.2, a provider built with close_fee_payer="payee"): states, close, the
     0xA3 fee-input state, a rollover, a conditional state, what does not verify, and the provider's
-    /terms plus a hub-bound open that carries closeFeePayer."""
-    from xbt402.route import hub_channel_message
+    /terms plus an open that carries closeFeePayer."""
     a = PAYER_SECRETS[2]
     p = _params(a, close_fee_payer="payee")
     payee_secret = channel_payee_secret(NETWORK, PAYTO_SECRET, bytes.fromhex(p.payer_pub), p.expiry)
@@ -405,12 +401,12 @@ def gen_payee_pays():
     node = StubNode(p)
     with tempfile.TemporaryDirectory() as d:
         prov = XbtChannelProvider(node, PAYTO_SECRET, NETWORK, os.path.join(d, "ledger.sqlite"),
-                                  lambda m, path: PRICE, lambda m, path, b: (200, {}, b"{}"), close_fee=CLOSE_FEE)
+                                  lambda m, path: PRICE, lambda m, path, b: (200, {}, b"{}"), close_fee=CLOSE_FEE,
+                                  close_fee_payer="payee")
         terms = prov.terms()
         req = {"x402Version": 2, "network": NETWORK, "channel": {
             "txid": p.funding_txid, "vout": p.funding_vout, "capacity": p.capacity, "expiry": p.expiry,
-            "payerPub": p.payer_pub, "payerSpk": p.payer_spk, "redeemScript": p.script.hex(), "closeFeePayer": "payee"},
-            "hub": {"payTo": _pub(HUB_SECRET), "sig": ecc.sign(HUB_SECRET, hub_channel_message(p.channel_id)).hex()}}
+            "payerPub": p.payer_pub, "payerSpk": p.payer_spk, "redeemScript": p.script.hex(), "closeFeePayer": "payee"}}
         status, _, resp = prov.serve("POST", terms["extra"]["openUrl"], {}, json.dumps(req).encode())
         out["terms"] = terms
         out["open"] = {"request": req, "status": status, "response": json.loads(resp)}
@@ -618,12 +614,14 @@ def payee_pays_checks(v) -> list:
          "conditional: the fee is not out of the payee's unconditional output")
     need(ecc.verify(A, bytes.fromhex(c["sighash"]), bytes.fromhex(c["payerSig"])[:-1]), "conditional: payer signature")
     t = pp["terms"]["extra"]
-    need(t.get("closeFeePayer") == "payee" and "settleMultiple" in t, "terms: no closeFeePayer payee / settleMultiple")
+    need(t.get("closeFeePayer") == "payee" and "settleMultiple" in t and "rolloverGraceBlocks" in t,
+         "terms: no closeFeePayer payee / settleMultiple / rolloverGraceBlocks")
+    need("routes" not in t, "terms: a routes key (the provider offers no routed paths)")
     o = pp["open"]
     need(o["status"] == 200 and o["response"].get("closeFeePayer") == "payee"
          and o["response"].get("minCum") == str(DUST + fee) and o["response"]["chan"] == p.channel_id
-         and o["request"]["channel"]["closeFeePayer"] == "payee",
-         "open: a hub-bound payee-pays open must echo closeFeePayer and minCum")
+         and o["request"]["channel"]["closeFeePayer"] == "payee" and set(o["request"]) == {"x402Version", "network", "channel"},
+         "open: a payee-pays open carries x402Version, network and channel, and its answer echoes closeFeePayer and minCum")
     c = pp.get("close")
     if not c:
         return errs + ["payeePays: close missing"]

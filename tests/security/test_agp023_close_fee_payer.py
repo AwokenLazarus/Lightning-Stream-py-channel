@@ -1,5 +1,5 @@
-"""AGP-023: xbt402 v1.2 closeFeePayer. On routed channels the payee pays its own settlement close fee
-(Mike, 2026-09-28); plain unrouted channels keep payer-pays (v1.1).
+"""AGP-023: xbt402 v1.2 closeFeePayer. A provider may offer that the payee pays its own settlement
+close fee; channels keep payer-pays (v1.1) unless it does.
 
 A state for cumulative amount cum pays
     payer-pays (v1.1): payee cum,              payer capacity - closeFee - cum
@@ -14,13 +14,9 @@ The security claims tested here:
     committed; the payee bumps from its own output or inputs;
   * the M6 hash-locked conditional state: the fee comes out of the payee's unconditional output,
     never the hash-lock output, so a payer that reclaims the lock through CSV pays nothing of it;
-  * the M7/AGP-021 adaptor locks: a ch2 pre-signature is over the payee-pays state; one made for
-    the other mode fails the provider's pre-verify;
-  * the provider settles on its net payout (settleMultiple x closeFee), co-signs a payee-pays
-    rollover only then or near its close margin (settle_early), and the hub rolls over on that
-    rule; a v1.1 hub or client still opens payer-pays channels with every v1.1 byte unchanged.
+  * the provider settles on its net payout (settleMultiple x closeFee); a v1.1 client still opens
+    payer-pays channels with every v1.1 byte unchanged.
 """
-import json
 import os
 import sys
 import unittest
@@ -29,19 +25,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
-import routehelp as R  # noqa: E402
 from sechelp import FakeNode, make_provider  # noqa: E402
 
-from xbt402 import adaptor, ecc  # noqa: E402
+from xbt402 import ecc  # noqa: E402
 from xbt402.channel import (DUST, SIGHASH_SINGLE_ACP_UNIFIED, ChannelError,  # noqa: E402
                             ChannelParams, Payee, Payer, channel_payee_secret, cpfp_child, settle_due)
 from xbt402.conditional import ConditionalParams, sha256  # noqa: E402
-from xbt402.hub import HubConfig  # noqa: E402
-from xbt402.route import AMSAT_PER_SAT, HUB_ROUTE_PATH  # noqa: E402
-from xbt402.tx import Tx, TxIn, TxOut, p2wpkh_spk  # noqa: E402
-from xbt402.x402_channel import XbtChannelClient, unb64json  # noqa: E402
+from xbt402.tx import TxIn, TxOut, p2wpkh_spk  # noqa: E402
+from xbt402.x402_channel import XbtChannelClient  # noqa: E402
 
-NET = R.NET
+NET = "bip122:" + "11" * 16
 PAYTO, PAYER = 0xB0B, 0xA11CE
 CAP, FEE = 200_000, 600
 
@@ -186,7 +179,7 @@ class ProviderTerms(unittest.TestCase):
         self.node = FakeNode()
         self.prov = make_provider(xc, self.node)
 
-    def _open(self, fee_payer=None, hub=False, a=0x1234):
+    def _open(self, fee_payer=None, a=0x1234):
         p = ChannelParams.derive(self.prov.pay_to, ecc.pubkey(a).hex(), self.node.height + 2_000, self.prov.close_fee,
                                  network=self.prov.network, close_fee_payer=fee_payer or "payer")
         p.funding_txid, p.funding_vout, p.capacity = os.urandom(32).hex(), 0, 200_000
@@ -195,26 +188,26 @@ class ProviderTerms(unittest.TestCase):
              "redeemScript": p.script.hex()}
         if fee_payer:
             c["closeFeePayer"] = fee_payer
-        req = {"x402Version": 2, "network": self.prov.network, "channel": c}
-        if hub:
-            from xbt402.route import hub_channel_message
-            req["hub"] = {"payTo": ecc.pubkey(0x4B4B).hex(), "sig": ecc.sign(0x4B4B, hub_channel_message(p.channel_id)).hex()}
-        return p, self.prov.open(req)
+        return p, self.prov.open({"x402Version": 2, "network": self.prov.network, "channel": c})
 
-    def test_plain_402_is_v11_and_terms_offer_payee_pays(self):
+    def test_plain_402_is_v11_and_terms_name_the_fee_payer(self):
         self.assertNotIn("closeFeePayer", self.prov.requirements(150)["extra"])
         t = self.prov.terms()["extra"]
-        self.assertEqual((t["closeFeePayer"], t["settleMultiple"]), ("payee", 20))
+        self.assertEqual((t["closeFeePayer"], t["settleMultiple"]), ("payer", 20))
         self.assertIn("rolloverGraceBlocks", t)
+        self.assertNotIn("routes", t)
+        self.prov.close_fee_payer = "payee"
+        self.assertEqual(self.prov.terms()["extra"]["closeFeePayer"], "payee")
 
     def test_open_accepts_payee_pays_only_where_offered(self):
         with self.assertRaises(ChannelError) as e:
-            self._open("payee")                                  # a plain channel: not offered
+            self._open("payee")                                  # not offered
         self.assertEqual(e.exception.code, "bad_fee_payer")
-        p, r = self._open("payee", hub=True, a=0x2)
+        self.prov.close_fee_payer = "payee"
+        p, r = self._open("payee", a=0x2)
         self.assertEqual((r["closeFeePayer"], r["minCum"], r["maxCum"]), ("payee", str(DUST + 600), "200000"))
         self.assertEqual(self.prov.ledger.channels[p.channel_id].params.close_fee_payer, "payee")
-        p, r = self._open(None, hub=True, a=0x3)                 # a v1.1 hub: payer-pays is always fine
+        p, r = self._open(None, a=0x3)                           # a v1.1 client: payer-pays is always fine
         self.assertNotIn("closeFeePayer", r)
         self.assertEqual(self.prov.ledger.channels[p.channel_id].params.close_fee_payer, "payer")
 
@@ -244,102 +237,6 @@ class ProviderTerms(unittest.TestCase):
         st2 = self.prov.ledger.channels[ch.payer.params.channel_id]
         self.assertEqual(st2.best_cum, DUST + 600)
         self.assertEqual(outs(self.prov._close_tx(st2)[0], st2.params)["payee"], DUST)
-
-
-class HubAndRollover(unittest.TestCase):
-    def test_routing_extra_advertises_both_hops(self):
-        node, net, hub, provs, pay, shards = R.world(1)
-        st, h, _ = hub.serve("GET", HUB_ROUTE_PATH, {}, b"", R.HUB + HUB_ROUTE_PATH)
-        acc = unb64json(h["PAYMENT-REQUIRED"])["accepts"][0]
-        self.assertEqual((acc["extra"]["routing"]["ch1CloseFeePayer"], acc["extra"]["routing"]["ch2CloseFeePayer"]),
-                         ("payer", "payee"))
-        self.assertNotIn("closeFeePayer", acc["extra"])                   # ch1 is an ordinary v1.1 channel
-        self.assertEqual(pay.ch.payer.params.close_fee_payer, "payer")
-        self.assertEqual(hub.out.chans["http://p0.test"].p().close_fee_payer, "payee")
-        with self.assertRaises(ValueError):
-            HubConfig.from_dict({"ch2_close_fee_payer": "hub"})
-
-    def test_a_v11_provider_needs_a_payer_pays_hub(self):
-        node, net = R.RouteNode(), R.Net()
-        prov = R.provider(node, net, "http://old.test")
-        prov.route_close_fee_payer = "payer"                             # offers only v1.1 terms
-        hub = R.hub(node, net)
-        with self.assertRaises(ChannelError) as e:
-            hub.connect("http://old.test")
-        self.assertEqual(e.exception.code, "bad_fee_payer")
-        legacy = R.hub(node, net, secret=0x5151, ch2_close_fee_payer="payer")
-        legacy.connect("http://old.test")
-        node.confirm_all()
-        legacy.watch_tick()
-        oc = legacy.out.chans["http://old.test"]
-        self.assertEqual((oc.state, oc.p().close_fee_payer, oc.p().min_amount), ("open", "payer", DUST))
-
-    def test_ch2_adaptor_lock_is_over_the_payee_pays_state(self):
-        node, net, hub, provs, pay, shards = R.world(1)
-        origin = "http://p0.test"
-        prov, sh = provs[origin], shards[origin]
-        R.stream(pay, sh, 10)
-        self.assertEqual(pay.lock(sh)["status"], "paid")
-        st2 = next(s for s in prov.ledger.channels.values() if not s.closed_txid)
-        self.assertEqual(st2.best_cum, st2.params.min_amount)            # the first lock: dust + closeFee
-        tx, _ = prov._close_tx(st2)
-        self.assertEqual(outs(tx, st2.params), {"payee": DUST, "payer": st2.params.capacity - st2.params.min_amount})
-        # a hub pre-signing the payer-pays state for the same cum is refused at pre-verify
-        oc = hub.out.chans[origin]
-        wrong = ChannelParams(**{**oc.p().to_dict(), "close_fee_payer": "payer"})
-        R.stream(pay, sh, 10)
-        from xbt402.route import ROUTE_LOCK_PATH, lock_auth, next_cum
-        from xbt402.x402_channel import b64json, request_auth, request_digest_v2
-        from xbt402.channel import channel_auth_key
-        inv, d = sh.invoice, oc.p().min_amount                  # above the floor: a new state, with an adaptor
-        cum = next_cum(oc.routed, d, oc.p().min_amount)
-        pre = adaptor.presign(int(oc.secret, 16), wrong.sighash(wrong.state_tx(cum)), adaptor.dec(inv["point"]))
-        route = {"session": sh.session, "lockId": inv["lockId"], "amount": d, "hub": hub.pay_to,
-                 "lockAuth": lock_auth(sh.key, sh.session, inv["lockId"], d, inv["point"], hub.pay_to)}
-        oc.seq += 1
-        p2 = oc.p()
-        pl = {"chan": p2.channel_id, "seq": oc.seq, "cum": str(cum), "point": inv["point"], "adaptor": pre.to_json()}
-        body = json.dumps({"route": route}).encode()
-        pl["auth"] = request_auth(channel_auth_key(int(oc.secret, 16), bytes.fromhex(p2.payee_pub)), p2.channel_id,
-                                  oc.seq, pl["cum"], None, request_digest_v2("POST", origin + ROUTE_LOCK_PATH, body))
-        st, _, raw = net.http("POST", origin + ROUTE_LOCK_PATH, body,
-                              {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": {}, "payload": pl})})
-        self.assertEqual(json.loads(raw)["error"], "bad_adaptor")
-
-    def test_hub_rolls_over_on_the_net_threshold_and_the_provider_refuses_early_rollovers(self):
-        node, net, hub, provs, pay, shards = R.world(1, settle_multiple=2, amsat_per_call=40 * AMSAT_PER_SAT)
-        origin = "http://p0.test"
-        prov, sh = provs[origin], shards[origin]
-        oc = hub.out.chans[origin]
-        R.stream(pay, sh, 30)                                            # 1,200 sat: nets 600 < 2 x 600
-        self.assertEqual(pay.lock(sh)["status"], "paid")
-        self.assertFalse(any(a.get("event") == "ch2_rollover" for a in hub.watch_tick()))
-        with self.assertRaises(ChannelError) as e:                       # a hub rolling early anyway
-            hub.rollover(oc)
-        self.assertEqual(e.exception.code, "settle_early")
-        self.assertEqual(oc.state, "open")
-        R.stream(pay, sh, 20)                                            # 2,000: nets 1,400 >= 1,200
-        self.assertEqual(pay.lock(sh)["status"], "paid")
-        roll = next(a for a in hub.watch_tick() if a.get("event") == "ch2_rollover")
-        tx = Tx.parse(bytes.fromhex(node.raw[roll["txid"]]))
-        p = oc.p()
-        self.assertEqual([o.value for o in tx.outputs], [roll["amount"] - FEE, p.capacity - roll["amount"]])
-        new = hub.out.chans[origin]
-        self.assertEqual((new.p().close_fee_payer, new.p().capacity), ("payee", p.capacity - roll["amount"]))
-
-    def test_near_the_close_margin_a_small_rollover_is_accepted(self):
-        node, net, hub, provs, pay, shards = R.world(1, amsat_per_call=40 * AMSAT_PER_SAT)
-        origin = "http://p0.test"
-        prov, sh = provs[origin], shards[origin]
-        R.stream(pay, sh, 10)
-        self.assertEqual(pay.lock(sh)["status"], "paid")
-        oc = hub.out.chans[origin]
-        p = oc.p()
-        self.assertFalse(settle_due(p, oc.signed, oc.settle_multiple))
-        node.height = p.expiry - prov.close_margin - min(hub.rollover_margin, prov.rollover_grace)
-        prov._height_at = 0
-        roll = next(a for a in hub.watch_tick() if a.get("event") == "ch2_rollover")
-        self.assertEqual(roll["amount"], oc.signed)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ if idle and provider.settle_due(st.params, st.best_cum, provider.height()):
     try:
         r = provider.close_channel(chan)     # {chan, txid, cum, unpaidMsat[, payeeFee, payeeNet]}
     except ChannelError as e:
-        if e.code not in ("call_in_flight", "lock_pending", "hub_channel", "channel_closed", "no_state"):
+        if e.code not in ("call_in_flight", "channel_closed", "no_state"):
             raise
 ```
 
@@ -56,8 +56,6 @@ state when that pays more). Refused, with nothing changed:
 |---|---|
 | `unknown_channel` | not in this provider's ledger |
 | `channel_closed` | already closed or rolled over |
-| `lock_pending` | a routed lock is open on it (`route_lock`, `stale_locks`: a hub's ch1) |
-| `hub_channel` | a hub-funded ch2: its hub rolls it over or closes it, and the margin close still protects it |
 | `call_in_flight` | a paid call is between its reservation and its settlement: the best state does not cover it yet |
 | `no_state` | the payer has signed nothing |
 | `close_failed` | the node refused the broadcast (the intent stays; a later call or the watcher adopts or replaces it) |

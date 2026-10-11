@@ -1,17 +1,16 @@
 """AGP-081: the closure audit's (AGP-077) transport and channel side paths, B1 side.
   * T4c: a call that carried a payment takes its answer only with the receipt, plain and conditional;
   * T2: a URL or request target with a `#` is refused by the payer before anything is signed or sent
-    and by the provider (and the hub, both HTTP adapters) before anything is authenticated or routed;
+    and by the provider (both HTTP adapters) before anything is authenticated or routed;
     the digest is unchanged;
   * T1: the reference server caps connections per client address; the ASGI runner has none of the
     reference server's limits and listens on loopback only;
   * a payer opens at minExpiryBlocks + minConf + closeMarginBlocks, each from the offer (AGP-076), in
-    the client's open and rollover and in the hub's ch2.
+    the client's open and rollover.
 Same names as xbt-rs crates/xbt402/tests/lifecycle.rs (AGP-081) where the case exists there.
 """
 import asyncio
 import contextlib
-import dataclasses
 import hashlib
 import json
 import os
@@ -28,14 +27,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
-import routehelp as R  # noqa: E402
+import nodehelp as R  # noqa: E402
 from sechelp import FakeNode  # noqa: E402
 
 from xbt402 import funding  # noqa: E402
 from xbt402 import x402_channel as xc  # noqa: E402
 from xbt402.channel import ChannelError, ChannelParams  # noqa: E402
-from xbt402.route import TERMS_PATH  # noqa: E402
-from xbt402.route_client import RoutePayer  # noqa: E402
 from xbt402.x402_channel import XbtChannelClient, XbtChannelProvider  # noqa: E402
 
 NET = "bip122:" + "11" * 16
@@ -187,18 +184,6 @@ class Fragment(unittest.TestCase):
         # the digest itself is unchanged (published vectors): it still drops the fragment
         self.assertEqual(xc.request_digest_v2("GET", O + "/v1/q#x", b""), xc.request_digest_v2("GET", O + "/v1/q", b""))
 
-    def test_a_target_with_a_fragment_is_refused_by_the_routed_payer(self):
-        node, net, _, _, pay, shards = R.world()
-        sh = next(iter(shards.values()))
-        sent = len(net.calls)
-        self.assertEqual(code_of(self, pay.shard, sh.url + "#x"), "bad_request")
-        bad = dataclasses.replace(sh, url=sh.url + "#x")
-        self.assertEqual(code_of(self, pay.call, bad, "POST", b"{}"), "bad_request")
-        self.assertEqual((len(net.calls), bad.seq), (sent, sh.seq), "a routed call was numbered or sent")
-        with self.assertRaises(ChannelError) as e:
-            RoutePayer(R.HUB + "#x", R.NET, node.getblockcount, fund=node.fund_address, http=net.http)
-        self.assertEqual(e.exception.code, "bad_request")
-
     def test_the_mcp_tool_and_the_httpx_transport_refuse_a_fragment(self):
         from xbt402.mcp_server import xbt402_pay
         _, _, c, net, _ = rig()
@@ -234,21 +219,6 @@ class Fragment(unittest.TestCase):
                      ("GET", "/v1/q?a=1#x")):
             with self.subTest(p):
                 self.assertEqual(prov.serve(m, p, {}, b"{}", O + p)[0], 400)
-
-    def test_a_target_with_a_fragment_is_refused_by_the_hub(self):
-        _, _, hub, _, pay, shards = R.world()
-        for m, p in (("POST", "/x402/route#x"), ("POST", "/x402/route?a#x"), ("GET", "/x402/route#"),
-                     ("POST", "/x402/xbt-channel/close#x"), ("POST", "/x402/xbt-channel/rollover#x")):
-            with self.subTest(p):
-                self.assertEqual(hub.serve(m, p, {"PAYMENT-SIGNATURE": "x"}, b"{}", R.HUB + p)[0], 400)
-        # a lock is sent on bound to provider + /x402/xbt-channel/lock: no `#` in the provider either
-        sh = next(iter(shards.values()))
-        R.stream(pay, sh, 3)
-
-        def tamper(pl, route):
-            route["provider"] = sh.origin + "#x"
-        st, doc = R.route_request(pay, sh, tamper=tamper)
-        self.assertEqual((st, doc.get("error")), (400, "bad_payload"), doc)
 
     def test_a_target_with_a_fragment_is_refused_by_both_http_adapters(self):
         _, prov, _, _, _ = rig()
@@ -393,28 +363,6 @@ def without(*keys):
     return edit
 
 
-class TermsEdit:
-    """A provider or hub app whose /terms and 402 offers lose or get `extra` fields."""
-
-    def __init__(self, app, edit):
-        self.app, self.edit = app, edit
-
-    def serve(self, method, path, headers, body, url=""):
-        st, h, out = self.app.serve(method, path, headers, body, url)
-        if st == 200 and path == TERMS_PATH:
-            doc = json.loads(out)
-            self.edit(doc["extra"])
-            return st, h, json.dumps(doc).encode()
-        if st == 402:
-            doc = json.loads(out)
-            self.edit(doc["accepts"][0]["extra"])
-            return st, {**h, "PAYMENT-REQUIRED": xc.b64json(doc)}, json.dumps(doc).encode()
-        return st, h, out
-
-
-SHORT_CH2 = {"ch2_expiry_blocks": 100, "ch2_max_expiry_blocks": 2_000}    # a hub that asks for less than any floor
-
-
 class OpenExpiry(unittest.TestCase):
     def test_payers_open_at_min_expiry_plus_min_conf_plus_close_margin(self):
         blocks = funding.open_expiry_blocks
@@ -471,73 +419,6 @@ class OpenExpiry(unittest.TestCase):
             del ch.accepted["extra"]["closeMarginBlocks"]
             self.assertEqual(code_of(self, c._rollover, ch), "bad_offer")
             self.assertEqual(derive.call_count, 1, "a next channel was derived on an offer without a close margin")
-
-    def test_a_routed_open_on_an_offer_without_a_close_margin_is_refused_before_funding(self):
-        node, net = R.RouteNode(), R.Net()
-        hub = R.hub(node, net)
-        net.apps[R.HUB] = TermsEdit(hub, without("closeMarginBlocks"))
-        funded = []
-        pay = RoutePayer(R.HUB, R.NET, node.getblockcount, fund=lambda a, s: funded.append(s) or node.fund_address(a, s),
-                         http=net.http)
-        self.assertEqual(code_of(self, pay.open), "bad_offer")
-        self.assertEqual((funded, pay.ch), ([], None))
-
-    def ch2_blocks(self, **extra):
-        node, net = R.RouteNode(), R.Net()
-        origin = "http://p0.test"
-        net.apps[origin] = TermsEdit(R.provider(node, net, origin), lambda ex: ex.update(extra))
-        oc = R.hub(node, net, **SHORT_CH2).connect(origin)
-        return oc.p().expiry - node.height
-
-    def test_the_hub_opens_a_ch2_at_the_terms_floor(self):
-        # routehelp's provider: minExpiryBlocks 500, minConf 1, closeMarginBlocks 36
-        self.assertEqual(self.ch2_blocks(), 500 + 1 + 36)
-        self.assertEqual(self.ch2_blocks(closeMarginBlocks=144), 500 + 1 + 144)
-        self.assertEqual(self.ch2_blocks(closeMarginBlocks=5, minConf=0), 500 + 5)
-
-    def hostile(self, edit):
-        node, net = R.RouteNode(), R.Net()
-        origin = "http://evil.test"
-        net.apps[origin] = TermsEdit(R.provider(node, net, origin), edit)
-        hub = R.hub(node, net)
-        funded = []
-        hub.fund = lambda a, s: funded.append(a) or node.fund_address(a, s)
-        with self.assertRaises(ChannelError) as e:
-            hub.connect(origin)
-        self.assertEqual(e.exception.code, "bad_terms", str(e.exception))
-        self.assertEqual((funded, hub.out.chans, hub.committed_sat()), ([], {}, 0))
-        self.assertFalse([c for c in net.calls if c[0] == "POST"], "the provider was asked to open")
-        return str(e.exception)
-
-    def test_a_ch2_on_terms_without_a_close_margin_is_refused_before_funding(self):
-        self.assertIn("malformed /terms", self.hostile(without("closeMarginBlocks")))
-        self.assertIn("malformed /terms", self.hostile(lambda ex: ex.update(closeMarginBlocks=None)))
-        self.assertIn("malformed /terms", self.hostile(lambda ex: ex.update(closeMarginBlocks=-1)))
-        self.assertIn("minExpiryBlocks + minConf + closeMarginBlocks",
-                      self.hostile(lambda ex: ex.update(closeMarginBlocks=1_000_000)))
-
-    def test_the_hub_rolls_a_ch2_over_at_the_terms_floor(self):
-        w = RolloverWorld(self, hkw=SHORT_CH2)
-        w.near_margin()
-        ev = w.hub.rollover(w.oc())
-        self.assertEqual(ev["event"], "ch2_rollover", ev)
-        self.assertEqual(w.oc().p().expiry - w.node.height, 500 + 1 + 36)
-
-
-class RolloverWorld:
-    """routehelp's world with one provider whose ch2 carries a signed state."""
-
-    def __init__(self, test, hkw=None):
-        self.node, self.net, self.hub, provs, self.pay, shards = R.world(hkw=hkw)
-        (self.origin, self.prov), = provs.items()
-        R.stream(self.pay, shards[self.origin], 10)
-        test.assertEqual(self.pay.lock(shards[self.origin])["status"], "paid")
-
-    def oc(self):
-        return self.hub.out.chans[self.origin]
-
-    def near_margin(self):
-        self.node.height = self.oc().p().expiry - 40              # the provider co-signs near its close margin
 
 
 if __name__ == "__main__":

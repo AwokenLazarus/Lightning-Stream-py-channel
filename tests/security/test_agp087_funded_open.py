@@ -1,4 +1,4 @@
-"""AGP-087 (second closure audit, area HUB-B): the B1 client around a FUNDED open the seller answers
+"""AGP-087 (second closure audit): the B1 client around a FUNDED open the seller answers
 with an error. review C2 was closed with a preflight, which is the seller's word. As xbt-rs
 `crates/xbt402/tests/agp087_hub_b_client.rs` (same names). Each `test_hole_` FAILS on B1 21b21db.
 """

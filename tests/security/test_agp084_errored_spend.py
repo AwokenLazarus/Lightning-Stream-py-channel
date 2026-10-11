@@ -1,15 +1,13 @@
 """AGP-084: what fix wave 2 (AGP-078) found and left (in-process: a fake node + a fake HTTP transport).
-xbt-rs has the same tests, in `lifecycle.rs`, `hub_routing_safety.rs` and `routing_checks.rs`.
+xbt-rs has the same tests, in `lifecycle.rs`.
 
 A spend whose broadcast errored (AGP-078's stated limit 3): `close` and `rollover` write `close_intent`,
 then send. If the node answers with an error the answer is `close_failed`, the channel stays open and
-the fully signed transaction stays in the ledger: it can still reach the chain. A call served, or a
-lock routed, on a later state was then above what that spend pays. Now such a channel takes no new
+the fully signed transaction stays in the ledger: it can still reach the chain. A call served on a
+later state was then above what that spend pays. Now such a channel takes no new
 state (`channel_closing`) until its spend is resolved: the watcher sends a close again every tick,
 and records a spend the node shows after all; a rollover is never sent again (its client was told it
 failed and may no longer hold the next channel's key), so the client rolls over again or closes.
-Capacity (stated limit 4): `max_lock_sat` was bounded against the configured `ch2_capacity` only, and
-`connect(origin, capacity=...)` takes another one.
 """
 import json
 import os
@@ -21,10 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
-import routehelp as R  # noqa: E402
+import nodehelp as R  # noqa: E402
 import test_agp059_embedder_api as E  # noqa: E402  (Rig: a provider and the reference client)
-import test_agp064_hub_safety as T  # noqa: E402  (the AGP-064 harness: W)
-import test_agp078_hub_closure as C  # noqa: E402  (rollover_ch1)
 
 from xbt402 import ecc  # noqa: E402
 from xbt402.channel import SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams  # noqa: E402
@@ -66,7 +62,7 @@ def rollover_req(r, amount):
 def errored_spend(rollover: bool):
     """Five paid calls, then the close (or the rollover) while the node answers every broadcast with an
     error: the rig and the intent left behind."""
-    r = E.Rig(price=150, charge=None, node=R.RouteNode())
+    r = E.Rig(price=150, charge=None, node=R.MempoolNode())
     for _ in range(5):
         r.call()
     down(r.node, True)
@@ -147,78 +143,6 @@ class ErroredSpend(unittest.TestCase):
                 self.assertEqual(r.st.extra["rollover_to"], f"{txid}:1")
                 self.assertEqual(got, txid if close else "channel_closing")
                 self.assertEqual(len(r.node.sent), 1)
-
-
-class HubErroredSpend(unittest.TestCase):
-    def test_h1_no_lock_is_routed_above_a_ch1_spend_the_node_errored_on(self):
-        # the hub signs ch1's close (or co-signs its rollover), writes the intent and sends; the node
-        # answers with an error. The tx is complete and can still confirm. A lock routed meanwhile would
-        # sit above it: the hub would pay the provider on ch2 for sats ch1's spend does not hold
-        for rollover in (False, True):
-            with self.subTest(rollover=rollover):
-                w = T.W([None])
-                w.paid(0)
-                best = w.st1().best_cum
-                R.stream(w.pay, w.shards[0], 10)
-                down(w.node, True)
-                code = C.rollover_ch1(w, best)[1].get("error") if rollover else code_of(w.pay.close)
-                self.assertEqual(code, "close_failed")
-                down(w.node, False)
-                self.assertFalse(w.st1().closed_txid, "the node took nothing")
-                intent = dict(w.st1().extra["close_intent"])
-                n, best2 = w.lock_calls(), w.st2(0).best_cum
-                r = w.pay.lock(w.shards[0])
-                # the spend reaches the chain after all, and the hub's watcher records it
-                w.node.sendrawtransaction(intent["hex"])
-                self.assertEqual(w.hub.inbound.close_due(), [intent["txid"]])
-                st1 = w.st1()
-                self.assertEqual(st1.closed_txid, intent["txid"])
-                self.assertEqual((w.lock_calls(), w.st2(0).best_cum), (n, best2),
-                                 f"the hub paid the provider {w.st2(0).best_cum - best2} on ch2 for a lock above "
-                                 f"ch1's spend at {best} ({r})")
-                self.assertEqual((r.get("status"), r.get("error")), ("refused", "channel_closing"), r)
-                self.assertEqual(st1.best_cum, best, "ch1 has no state above the spend")
-
-    def test_h1_a_ch1_close_the_node_errored_on_goes_through_at_the_next_tick(self):
-        w = T.W([None])
-        w.paid(0)
-        down(w.node, True)
-        self.assertEqual(code_of(w.pay.close), "close_failed")
-        self.assertEqual(w.hub.inbound.close_due(), [])
-        down(w.node, False)
-        txid = w.st1().extra["close_intent"]["txid"]
-        self.assertEqual(w.hub.inbound.close_due(), [txid])
-        self.assertEqual(w.st1().closed_txid, txid)
-        self.assertEqual(w.pay.close()["txid"], txid, "the client asks again and gets the answer it lost")
-
-    def test_h1_a_provider_takes_no_lock_on_a_ch2_whose_spend_its_node_errored_on(self):
-        # the same on the provider's side of a ch2: the hub's rollover of it, co-signed and written
-        # ahead, that the provider's node answered with an error
-        w = T.W([None])
-        w.paid(0)
-        st2 = w.st2(0)
-        best2 = st2.best_cum
-        st2.extra = {**(st2.extra or {}), "close_intent": {"hex": "00", "txid": "ab" * 32, "cond": False,
-                                                          "next": "ab" * 32 + ":1"}}
-        r = w.lock(0)
-        self.assertEqual(r["status"], "refused", r)
-        self.assertEqual(w.st2(0).best_cum, best2, "the provider took a lock above a spend that can still confirm")
-
-
-class Config(unittest.TestCase):
-    def test_hub_bounds_max_lock_sat_against_the_capacity_a_ch2_is_opened_with(self):
-        # the bound was made against the configured ch2_capacity only, and connect() takes another
-        # capacity (max_lock_sat is 20,000 here: a ch2 of less than 40,000 breaks AGP-064's rule)
-        node, net, hub, provs, _pay, _shards = R.world(1)
-        small, live = "http://dev-small.test", next(iter(provs))
-        R.provider(node, net, small)
-        committed, sent = hub.committed_sat(), len(node.wallet_txs)
-        self.assertEqual(code_of(hub.connect, small, capacity=39_999), "bad_config")
-        # the next ch2 of a provider it already pays, funded ahead
-        self.assertEqual(code_of(hub.connect_next, live, capacity=39_999), "bad_config")
-        self.assertEqual((hub.committed_sat(), len(node.wallet_txs)), (committed, sent), "refused before anything is funded")
-        self.assertEqual(hub.connect(small, capacity=40_000).p().capacity, 40_000)
-        self.assertEqual(hub.connect_next(live, capacity=40_000).p().capacity, 40_000)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ b1's launcher already seals the payTo key, P7).
   * C2: a seller that would refuse /open is asked first ("preflight": true, no outpoint), so the
     buyer funds nothing on-chain for a channel that never opens;
   * C3: the rollover's txid is the one the payer computed from the tx it signed. b1's client has no
-    wire rollover; its hub already refuses a reply naming another tx (bad_rollover_reply);
+    wire rollover;
   * C5: one opener per ledger file, the lock gone with the ledger (and with a dead process).
 """
 import hashlib
@@ -130,8 +130,7 @@ class ReviewC2(unittest.TestCase):
 
 class ReviewC3(unittest.TestCase):
     def test_c3_a_rollover_reply_naming_another_txid_is_refused(self):
-        self.skipTest("b1's client has no wire rollover; hub.py's rollover already refuses a reply naming "
-                      "another tx (bad_rollover_reply), as xbt-rs hub.rs does")
+        self.skipTest("b1's client has no wire rollover")
 
 
 class ReviewC5(unittest.TestCase):
