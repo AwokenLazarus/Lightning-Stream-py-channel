@@ -207,8 +207,11 @@ class ZeroConfCap(unittest.TestCase):
         st.suspended = True                                        # as the racing watcher tick leaves it
         r = w.lock()                                               # still unconfirmed: refused, as it must be
         self.assertEqual((r["status"], r["error"], r["detail"]), ("refused", "route_failed", "provider refused the lock: unconfirmed"), r)
-        # the provider holds that lock's pre-signature, so this ch2 takes no more routes (AGP-064 H2)
-        self.assertEqual(w.lock()["error"], "route_blocked")
+        # AGP-094: the provider refuses at the hub's check, before anything is pre-signed (this line
+        # asserted `route_blocked`: the provider held that lock's pre-signature, AGP-064 H2). Nothing is
+        # written off, and the next lock is put to the provider again
+        self.assertTrue(not w.live.stale and not w.live.blocked)
+        self.assertEqual(w.lock()["error"], "route_failed")
         w = self.world()
         st = w.prov.ledger.channels[w.live.p().channel_id]
         st.suspended = True

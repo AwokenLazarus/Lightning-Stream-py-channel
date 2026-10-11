@@ -175,9 +175,23 @@ class RouteNode(FakeNode):
         return {"feerate": self.feerate, "blocks": target}
 
 
+def is_lock_check(path, body) -> bool:
+    """The request is a hub's check of a lock (AGP-094): the lock endpoint, `route.check` true."""
+    if path != "/x402/xbt-channel/lock":
+        return False
+    try:
+        return json.loads(body or b"{}")["route"].get("check") is True
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 class Net:
     """origin -> app with serve(method, path, headers, body, url); `http` has XbtChannelClient.http's shape.
-    `drop` maps an origin to a callable(method, path) -> True when the answer is lost after serving."""
+    `drop` maps an origin to a callable(method, path) -> True when the answer is lost after serving.
+
+    AGP-094: a hub asks a provider to check a lock before it pre-signs it, on the lock's own path. The
+    tests that count lock requests, or lose a lock's answer, mean the lock: a check is recorded under
+    `<path>?check`, and its answer is never dropped."""
 
     def __init__(self):
         self.apps, self.drop, self.calls = {}, {}, []
@@ -188,10 +202,11 @@ class Net:
         app = self.apps.get(origin)
         if app is None:
             raise OSError(f"connection refused: {origin}")
-        self.calls.append((method, origin, path))
+        check = is_lock_check(path, body)
+        self.calls.append((method, origin, path + "?check" if check else path))
         st, h, out = app.serve(method, path, dict(headers or {}), body or b"", url)
         dr = self.drop.get(origin)
-        if dr and dr(method, path):
+        if not check and dr and dr(method, path):
             raise OSError("answer lost")
         return st, {k.upper(): v for k, v in h.items()}, out
 
@@ -218,6 +233,7 @@ def hub(node, net, secret=0x4B4B, **kw):
     opts = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
                 reveal_timeout=1.0, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
                 settle_lock_multiple=0, refill_ahead_locks=0,   # AGP-057 too: off unless a test asks for it
+                spend_final_depth=1,     # AGP-094: these rigs mean one confirmation; the shipped default is 6
                 policy=FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640,
                                      close_margin=36))
     opts.update({k: v for k, v in kw.items() if v is not None})

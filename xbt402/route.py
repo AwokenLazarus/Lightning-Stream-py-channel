@@ -475,6 +475,10 @@ class RouteSession:
     valid_until: float = 0.0
     last_lock: dict = field(default_factory=dict)   # {lockId, amount, secret}: the client's receipt
     locks: int = 0
+    # AGP-094: the channel (a hub's ch2) that asked whether this window's invoice would be taken (a
+    # `check`). Until the window ends the invoice is paid over that channel and no other, and a call
+    # does not end the window before valid_until. "": nobody asked
+    bound: str = ""
 
     def owed_amsat(self) -> int:
         return self.accrued_amsat - self.paid_sat * AMSAT_PER_SAT
@@ -603,6 +607,7 @@ class RouteSeller:
         s.t, s.point = f"{t:064x}", adaptor.enc(adaptor.point_of(t)).hex()
         s.lock_id = secrets.token_hex(12)
         s.valid_until = time.time() + o.invoice_ttl
+        s.bound = ""
 
     def invoice(self, s: RouteSession) -> dict:
         """The window's signed invoice. It only changes with the window (and ECDSA signing is
@@ -655,8 +660,11 @@ class RouteSeller:
     def state(self, s: RouteSession, charge: int = 0) -> dict:
         """ROUTE-STATE: the signed running meter and the open invoice (and the last completed lock's
         t, so the client has its receipt even from a hub that withholds it)."""
-        if time.time() > s.valid_until - 1:
-            self._new_window(s)       # an expired invoice: nobody can complete it now, issue a fresh T
+        if time.time() > s.valid_until - (0 if s.bound else 1):
+            # an expired invoice: nobody can complete it now, issue a fresh T. (AGP-094: one a hub was
+            # told would be taken lives to its valid_until: a call of the client's does not end it
+            # under the lock that hub then sends)
+            self._new_window(s)
         body = {"session": s.session, "seq": s.seq, "calls": s.calls, "chargeAmsat": str(charge),
                 "accruedAmsat": str(s.accrued_amsat), "paidSat": s.paid_sat,
                 "quote": self.price_quote(s.path).quote_id(), "lastLock": s.last_lock,
@@ -807,19 +815,27 @@ class RouteSeller:
         channel's floor (546-sat dust, plus closeFee when the provider pays its own close, v1.2),
         which the hub pre-pays once per channel and later locks use up. A lock the floor
         already covers needs no new state (and carries no adaptor). A lockId completed before is
-        answered again with the same t, so the hub can retry after a lost answer or a crash."""
+        answered again with the same t, so the hub can retry after a lost answer or a crash.
+
+        AGP-094: with `route.check` the request asks whether this lock would be taken, before the hub
+        pre-signs it: every check below runs, nothing is completed, and the answer is {"check": lockId}
+        (or the refusal the lock itself would get)."""
         try:
             sid, lock_id, amount = str(route["session"]), str(route["lockId"]), int(route["amount"])
             point, auth, hub = str(pl["point"]).lower(), str(route["lockAuth"]), str(route["hub"])
             cum = int(pl["cum"])
         except (KeyError, TypeError, ValueError) as e:
             raise ChannelError("bad_payload", str(e))
+        check = bool(route.get("check"))
+        chan = st.params.channel_id
         locks = dict((st.extra or {}).get("route_locks") or {})
         with self.lock:
             done = locks.get(lock_id)
             if done:                                         # idempotent: the same answer again
                 if done["session"] != sid or done["amount"] != amount:
                     raise ChannelError("bad_invoice", "lockId already completed with other terms")
+                if check:
+                    raise ChannelError("bad_invoice", "this invoice is paid")
                 self.p.ledger.save(st)                       # the seq this answer spent (AGP-078)
                 return self._lock_answer(st, lock_id, done)
             s = self.sessions.get(sid)
@@ -838,6 +854,22 @@ class RouteSeller:
                 raise ChannelError("bad_auth", "the client did not authorise this amount for this invoice")
             if amount < 1:
                 raise ChannelError("bad_amount", "lock amount must be >= 1 sat")
+            # AGP-094 rule: once a hub was told this invoice would be taken, nothing a client does makes
+            # this provider refuse that hub's lock. So the invoice is then paid over that hub's channel
+            # alone: the same invoice sent through another hub is refused here, to the one that asks
+            # second, before it pre-signs
+            if s.bound and s.bound != chan:
+                raise ChannelError("lock_outstanding", "this invoice is being paid over another channel")
+            if check:
+                routed = int((st.extra or {}).get("routed_sat", 0))
+                need = next_cum(routed, amount, st.params.min_amount)
+                if need > st.best_cum and cum != need:
+                    raise ChannelError("bad_amount", f"lock pays {cum}, expected {need}")
+                if need > st.best_cum and need > st.params.max_amount:
+                    raise ChannelError("channel_exhausted")
+                s.bound = chan
+                self.p.ledger.save(st)                       # the seq this answer spent (AGP-078)
+                return {"check": lock_id}
             if self.no_reveal:
                 self.held.append({"lockId": lock_id, "cum": cum, "pre": pl.get("adaptor"), "chan": st.params.channel_id})
                 self.p.ledger.save(st)

@@ -99,9 +99,12 @@ class MakeBeforeBreak(_Roll):
         r = self.pay.lock(self.sh)
         self.assertEqual(r.get("error"), "route_failed", r)
         self.assertEqual(self.hub.stats["refused"].get("zero_conf_cap"), 1)
-        # the provider holds the refused lock's pre-signature: the child is not routed over again (AGP-064)
+        # AGP-094: the provider refuses at the hub's check, before anything is pre-signed (this line
+        # asserted `route_blocked`: the provider held the refused lock's pre-signature, AGP-064). Nothing
+        # is written off and the child is not blocked: the next lock is put to the provider again
+        self.assertTrue(all(not c.stale and not c.blocked for c in self.hub.out.chans.values()))
         R.stream(self.pay, self.sh, 1)
-        self.assertEqual(self.pay.lock(self.sh).get("error"), "route_blocked")
+        self.assertEqual(self.pay.lock(self.sh).get("error"), "route_failed")
         # at the parent's close margin the provider takes nothing more on the unconfirmed child (here
         # parent and child expire together, so the margin is moved rather than the tip)
         self.setUp()

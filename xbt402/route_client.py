@@ -66,6 +66,29 @@ class Shard:
         return ceil_div(self.accrued_amsat, AMSAT_PER_SAT) - max(self.paid_sat, self.locked_sat)
 
 
+class _BindOnce:
+    """The signer as ch1's open sees it (AGP-094): `attach` binds a channel to its key only if it is
+    not bound yet (a signer that has the channel signs its refund). An open that failed between the
+    two (the binding done, the refund not signed) is then finished by the next one; before, the next
+    one attached again and the signer, its issued key used up, refused it for good. Everything else
+    is the signer's own."""
+
+    def __init__(self, signer):
+        self._signer = signer
+
+    def __getattr__(self, name):
+        if name == "_signer":                       # (not set yet: a copy being built)
+            raise AttributeError(name)
+        return getattr(self._signer, name)
+
+    def attach(self, origin: str, params) -> str:
+        try:
+            self._signer.sign_refund(params.channel_id)
+            return params.channel_id
+        except Exception:  # noqa: BLE001 - not bound yet
+            return self._signer.attach(origin, params)
+
+
 class RoutePayer:
     def __init__(self, hub_url: str, network: str, height: Callable[[], int], fund: Callable = None, signer=None, *,
                  capacity: int = 200_000, expiry_blocks: int = 8_000, max_fee_ppm: int = 10_000,
@@ -85,7 +108,7 @@ class RoutePayer:
         self.network = network
         self.signer = signer or ChannelSigner(fund=fund)
         self.cc = XbtChannelClient(network, fund, height, capacity=capacity, expiry_blocks=expiry_blocks,
-                                   max_price=10 ** 12, signer=self.signer, budget_sats=10 ** 12)
+                                   max_price=10 ** 12, signer=_BindOnce(self.signer), budget_sats=10 ** 12)
         if http:
             self.cc.http = http
         self.http = self.cc.http
@@ -118,17 +141,36 @@ class RoutePayer:
         self.quote = q
 
     def open(self) -> dict:
-        """Open ch1 to the hub from its 402 (x402 v2, xbt-channel, extra.routing)."""
+        """Open ch1 to the hub from its 402 (x402 v2, xbt-channel, extra.routing). Returns {chan,
+        capacity, expiry} (and `resumed` when ch1 was on the books already).
+
+        AGP-094 rule (the library client's, AGP-090): ch1 is funded once. Its key is on the books
+        before the wallet is asked, its outpoint before the hub hears of it, and every open goes on
+        from the stage the last one reached (XbtChannelClient._ensure_open: keyed, funded, open): no
+        second key is asked for and no second funding sent while the first is unresolved, whatever the
+        hub or the wallet answered. A hub that has the channel already says duplicate_channel, which is
+        the yes that was lost. The books are this RoutePayer's (it has no ledger). A ch1 recorded and
+        never funded that is too near its expiry is refused open_unresolved until `forget_unfunded`."""
         st, rh, _ = self.http("GET", self.hub_url + HUB_ROUTE_PATH)
         if st != 402:
             raise ChannelError("bad_offer", f"hub answered {st}, expected 402")
         acc = self.cc._pick(unb64json(rh["PAYMENT-REQUIRED"]))
+        rec = self.cc.channels.get(self.hub_url)
+        if rec is not None and rec.accepted.get("payTo") != acc["payTo"]:
+            # the ch1 on the books pays the hub it was keyed for: never opened under another key's quote
+            raise ChannelError("bad_offer", "the hub's payTo changed since ch1 was recorded")
         self.hub_pay_to = acc["payTo"]
         self._refresh_quote(acc["extra"].get("routing") or {})
         self.ch = self.cc._open(self.hub_url, acc)
         self.cc.channels[self.hub_url] = self.ch
         return {"chan": self.ch.payer.params.channel_id, "capacity": self.ch.payer.params.capacity,
-                "expiry": self.ch.payer.params.expiry}
+                "expiry": self.ch.payer.params.expiry, **({"resumed": True} if rec is not None else {})}
+
+    def forget_unfunded(self) -> bool:
+        """Drop a ch1 that was recorded and never funded (its key goes with it). Call it only when the
+        wallet shows no send to its script: `open` refuses open_unresolved when such a ch1 is too near
+        its expiry to fund. True if one was dropped."""
+        return self.cc.forget_unfunded(self.hub_url) > 0
 
     def refresh_hub(self):
         st, rh, _ = self.http("GET", self.hub_url + HUB_ROUTE_PATH)
@@ -277,6 +319,46 @@ class RoutePayer:
                             "why": why})
 
     def _resync(self, doc: dict) -> bool:
+        """Adopt a hub view of ch1: the completions it proves of held locks below its best state
+        (`_drop_completed`), then the view itself (`_resync_view`). True if anything was adopted."""
+        done = self._drop_completed(doc)
+        return self._resync_view(doc) or done
+
+    def _drop_completed(self, doc: dict) -> bool:
+        """AGP-094: a held lock the hub completed BELOW its best state is in none of the view's other
+        lists. The view names it under `completed` with the t + r that completed it: with that proof (it
+        opens the lock's own T1, as for a completion at the best state) the lock stops counting as held.
+        Nothing else moves: its amount was in both bases since the hold. Without the proof it stays
+        held, so a hub cannot empty the client's max_held_locks by its word."""
+        try:
+            best = int(doc["bestCum"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        done = [x for x in (doc.get("completed") if isinstance(doc.get("completed"), list) else []) if isinstance(x, dict)]
+        held_now = doc.get("held") if isinstance(doc.get("held"), list) else []
+
+        def proved(g) -> bool:
+            for x in done:
+                if x.get("lockId") != g["lockId"]:
+                    continue
+                try:
+                    y = int(x["secret"], 16) % adaptor.N
+                    if y and adaptor.point_of(y) == adaptor.dec(g["T1"]):
+                        return True
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return False
+        # (one completed AT the best state above ours is adopted by _resync_view, with the state itself)
+        gone = [g for g in self.given_up if g.get("held") and not g.get("floor") and g.get("T1")
+                and not (g["cum"] == best and best > self.signed) and g["lockId"] not in held_now and proved(g)]
+        if not gone:
+            return False
+        self.given_up = [x for x in self.given_up if not any(x is g for g in gone)]
+        self._probe_at = 0.0
+        self.events.append({"event": "resync_completed", "lockIds": [g["lockId"] for g in gone]})
+        return True
+
+    def _resync_view(self, doc: dict) -> bool:
         """Adopt a hub view of ch1 ({bestCum, routedSat, feeUnits, feePaid, held, released}) only when it
         is one of our given-up locks, at the counters it implied:
           completed: the hub read t off the provider's ch2 close; its best state is that lock;
@@ -388,7 +470,8 @@ class RoutePayer:
         or a lock is still pending on ch1."""
         with self._lock:
             self._check_pending()
-            if self.pending:
+            if self.pending or self.ch is None or self.ch.stage != "open":
+                # (AGP-094: a ch1 the hub has not opened yet signs nothing)
                 return None
             if 0 < self.max_held_locks <= sum(1 for g in self.given_up if g.get("held")):
                 # AGP-088: nothing more is pre-signed above that many holds; a release or a completion

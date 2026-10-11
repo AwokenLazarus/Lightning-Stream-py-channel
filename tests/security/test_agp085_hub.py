@@ -97,7 +97,8 @@ class RolloverWorld:
         d = os.path.dirname(self.hub.out.path)
         opts = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
                     reveal_timeout=1.0, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
-                    settle_lock_multiple=0, refill_ahead_locks=0, policy=self.hub.inbound.policy)
+                    settle_lock_multiple=0, refill_ahead_locks=0, policy=self.hub.inbound.policy,
+                    spend_final_depth=1)                      # (AGP-094: one confirmation, as written)
         opts.update(self.hkw or {})
         self.hub.inbound.ledger.close() if hasattr(self.hub.inbound.ledger, "close") else None
         self.hub = RouteHub(self.node, 0x4B4B, R.NET, d, self.node.fund_address, http=self.net.http, **opts)

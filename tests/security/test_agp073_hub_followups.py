@@ -34,7 +34,7 @@ PRICE = 300 * 10 ** 21   # 300 sat a call: a lock (10 calls) is well above ch1's
 OPEN_PATH = "/x402/xbt-channel/open"
 OPTS = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
             reveal_timeout=0.3, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
-            settle_lock_multiple=0, refill_ahead_locks=0,
+            settle_lock_multiple=0, refill_ahead_locks=0, spend_final_depth=1,   # (AGP-094: one confirmation, as written)
             policy=FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640, close_margin=36))
 
 
@@ -49,7 +49,8 @@ class Svc:
         if path == OPEN_PATH and self.refuse_open:
             return 400, {"Content-Type": "application/json"}, b'{"error":"bad_expiry","detail":"the policy changed"}'
         r = self.inner.serve(method, path, headers, body, url)
-        if path == ROUTE_LOCK_PATH and self.refuse_lock and r[0] == 200:
+        # (AGP-094: the lock, not the hub's check of it)
+        if path == ROUTE_LOCK_PATH and not R.is_lock_check(path, body) and self.refuse_lock and r[0] == 200:
             return 400, {"Content-Type": "application/json"}, b'{"error":"refused","detail":"no"}'
         return r
 
