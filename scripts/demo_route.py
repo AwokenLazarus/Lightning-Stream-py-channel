@@ -46,7 +46,7 @@ from xbt402.tx import Tx  # noqa: E402
 from xbt402.x402_channel import XbtChannelProvider, network_id, unb64json  # noqa: E402
 
 SAT = 100_000_000
-PB = int(os.environ.get("XBT402_TEST_PORT_BASE", "34800"))
+PB = int(os.environ.get("XBT402_TEST_PORT_BASE", "32300"))   # demo_route.sh's default
 RPCPORT = int(os.environ.get("XBT402_RPCPORT", PB + 1))
 DD = os.environ["XBT402_DATADIR"]
 RUN = os.environ.get("DEMO_RUN", os.path.dirname(DD))
