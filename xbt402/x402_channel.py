@@ -276,6 +276,20 @@ def intent_open(st) -> bool:
 MAX_KEPT_INTENTS = 8    # unresolved spends a channel keeps beside its latest intent (`close_intents`, AGP-085)
 
 
+def intents_full(st) -> bool:
+    """A spend of this channel is unresolved and one slot is left among the kept ones: no request makes
+    another.
+
+    AGP-088 rule: a channel never keeps more than MAX_KEPT_INTENTS, whatever its payer asks. Each spend
+    written ahead is a signed transaction that can still confirm, so none is forgotten; the bound is
+    kept by making no new one. A new spend comes only from a rollover (another next channel or amount)
+    or from a close at another state. So once one slot is left a rollover is refused channel_closing and
+    the channel's state no longer moves (a close's payload and /x402/verify raise nothing): every close
+    is then the same transaction, and the last slot stays for the payee's own close, which is never
+    refused."""
+    return intent_open(st) and len((st.extra or {}).get("close_intents") or []) + 1 >= MAX_KEPT_INTENTS
+
+
 def set_intent(st, intent: dict):
     """Write `intent` ahead as the channel's `close_intent` (the caller saves). AGP-085: an earlier one
     for another transaction is not forgotten. It is complete and signed and can still confirm, so it
@@ -751,7 +765,8 @@ class XbtChannelProvider:
             # AGP-084: an earlier spend the node has after all is this channel's close, before a new
             # close replaces its intent
             self._adopt_intent(st)
-            if req.get("payload") and not st.closed_txid:   # after the close a state changes nothing (L10)
+            # (AGP-088: nor with the kept intents full: this close is then the one already written ahead)
+            if req.get("payload") and not st.closed_txid and not intents_full(st):   # after the close a state changes nothing (L10)
                 self._apply(st, req["payload"])
             txid = self._close_locked(st)
             report = self._close_report(st)
@@ -1252,7 +1267,9 @@ class XbtChannelProvider:
             # never queues paid calls behind it (L13)
             self._channel_payee(st.params).verify_state(cum, bytes.fromhex(pl["sig"]))
             with self.ledger.lock:
-                if cum > st.best_cum and not st.closed_txid:
+                # (AGP-088: not once the kept intents are full: a higher state would make the watcher's
+                # next close another transaction)
+                if cum > st.best_cum and not st.closed_txid and not intents_full(st):
                     st.best_cum, st.best_sig = cum, pl["sig"]
                     self.ledger.save(st)
                 # a VerifyResponse is what a resource server serves on: never isValid for a state this
@@ -1351,9 +1368,10 @@ class XbtChannelProvider:
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
-            if len((st.extra or {}).get("close_intents") or []) >= MAX_KEPT_INTENTS:
-                # AGP-085: each one is kept until the chain settles it, and a client could ask without end
-                raise ChannelError("channel_closing", f"{MAX_KEPT_INTENTS} earlier spends of this channel are unresolved: close it")
+            if intents_full(st):
+                # AGP-085: each one is kept until the chain settles it, and a client could ask without end.
+                # AGP-088: one slot short of the bound, which the payee's own close may still need
+                raise ChannelError("channel_closing", f"{MAX_KEPT_INTENTS - 1} earlier spends of this channel are unresolved: close it")
             set_intent(st, {"hex": tx.hex(), "txid": txid, "cond": False, "next": f"{txid}:1"})
             self.ledger.save(st)
             try:

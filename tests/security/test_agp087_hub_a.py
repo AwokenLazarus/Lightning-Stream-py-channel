@@ -59,17 +59,30 @@ class W(T.W):
 
 def two_written_off_locks_under_one_lock_id(tc, blocks):
     """Two written-off locks on one ch1 that carry the same lockId, each over its own ch2, both held
-    in ch1's base. p1 keeps its pre-signature and refuses the hub's close request."""
+    in ch1's base. p1 keeps its pre-signature and refuses the hub's close request.
+
+    AGP-088: the hub no longer lets the second lock in under that lockId (lock_held:
+    test_agp088_hub.py, test_a_lock_under_a_lock_id_ch1_holds_written_off_is_refused), so the audit's
+    way of making the pair (p1 names p0's lockId in its invoice) now ends at that refusal. The pair is
+    put in the ledgers as a hub from before left it: p1's lock is written off under its own lockId and
+    then carries p0's, on ch1 and on p1's ch2. The controls and everything after are the audit's."""
     w = W(blocks)
     w.paid(1)                                     # ch1 has a state to close with
     w.provs[0].refuse = True
     r = w.lock(0)
     tc.assertEqual((r["status"], r["error"]), ("refused", "route_failed"), r)
     lid = w.stale1()[0]["lockId"]
-    w.invoice_lock_id(1, lid)                     # its own T, its own ch2, the same lockId
     w.provs[1].refuse = w.provs[1].deaf = True
     r = w.lock(1)
     tc.assertEqual((r["status"], r["error"]), ("refused", "route_failed"), r)
+    # the second lock under the first one's lockId (its own T, its own ch2)
+    st1 = w.st1()
+    with w.hub.inbound.ledger.lock:
+        st1.extra["stale_locks"][1]["lockId"] = lid
+        w.hub.inbound.ledger.save(st1)
+    with w.hub.out.lock:
+        w.hub.out.chans[w.origins[1]].stale[0]["lockId"] = lid
+        w.hub.out.save()
     stale = w.stale1()
     tc.assertEqual(len(stale), 2, "control: both locks are written off and kept on ch1")
     tc.assertTrue(all(s["lockId"] == lid and isinstance(s.get("hold"), dict) for s in stale), "control: one lockId, both held")

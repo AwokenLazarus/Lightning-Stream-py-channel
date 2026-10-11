@@ -190,6 +190,20 @@ class RolloverNextChannel(unittest.TestCase):
         self.check_owned(w.oc(), tx, first["next"]["payerPub"])
         self.assertEqual(w.oc().p().capacity, old.p().capacity - first["amount"])
 
+    def test_an_earlier_attempt_adopted_reports_what_it_paid(self):
+        # AGP-088 (a nit of the AGP-085 review): the event of an adopted earlier attempt carried the
+        # amount LAST asked for; it now carries what that transaction paid the provider
+        w = RolloverWorld(self, amsat_per_call=200 * AMSAT_PER_SAT)
+        w.near_margin()
+        w.answer = lambda body, serve: REFUSED
+        w.refused(self)
+        w.pay_lock(self)
+        w.refused(self)
+        first, second = w.requests
+        tx = w.broadcast(first)
+        ev = next(a for a in w.hub.watch_tick() if a["event"] == "ch2_rollover")
+        self.assertEqual((ev["txid"], ev["amount"]), (tx.txid(), first["amount"]), f"the amount last asked for was {second['amount']}")
+
     def test_a_next_channel_too_old_to_ask_again_is_kept_and_the_ch2_closed(self):
         w = RolloverWorld(self, hkw=SHORT_CH2)
         w.near_margin()

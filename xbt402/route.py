@@ -45,6 +45,10 @@ ROUTE_LOCK_PATH = "/x402/xbt-channel/lock"
 ROLLOVER_PATH = "/x402/xbt-channel/rollover"
 TERMS_PATH = "/x402/xbt-channel/terms"
 HUB_ROUTE_PATH = "/x402/route"
+# POST with a PAYMENT-SIGNATURE on ch1 ({chan, seq, cum, auth}, an empty body): the hub's view of that
+# ch1, the one its refusals carry (AGP-088). A client at its cap on held locks asks here instead of
+# pre-signing another lock.
+HUB_VIEW_PATH = "/x402/route/view"
 ROUTE_ERRORS = ("bad_auth", "bad_point", "bad_amount", "bad_adaptor", "route_fee", "route_expiry",
                 "lock_outstanding", "bad_secret", "route_failed", "route_blocked", "bad_invoice")
 
@@ -891,15 +895,19 @@ def next_cum(routed: int, amount: int, floor: int = DUST) -> int:
     return max(int(routed) + int(amount), int(floor))
 
 
-def find_spend(rpc, txid: str, vout: int, from_height: int):
-    """The transaction spending txid:vout, from the mempool or blocks at or above `from_height`, as a
-    Tx; None if nothing spends it. Needs no txindex (the hub's node may be pruned)."""
+def find_spend_at(rpc, txid: str, vout: int, from_height: int):
+    """(the transaction spending txid:vout, how deep it is), from the mempool (depth 0) or blocks at or
+    above `from_height` (depth 1 at the tip); None if nothing spends it. Needs no txindex (the hub's
+    node may be pruned). AGP-088: gettxspendingprevout sees the mempool only, so a spender it names is
+    unconfirmed; one found by reading blocks is as deep as its block. The hub never reads "in a block"
+    off gettxout answering nothing: a node answers nothing for an output of an unconfirmed transaction
+    too."""
     from .tx import Tx
     try:
         r = rpc.gettxspendingprevout([{"txid": txid, "vout": vout}])
         spender = (r[0] if r else {}).get("spendingtxid")
         if spender:
-            return Tx.parse(bytes.fromhex(rpc.getrawtransaction(spender, False)))
+            return Tx.parse(bytes.fromhex(rpc.getrawtransaction(spender, False))), 0
     except Exception:  # noqa: BLE001 - older node or no mempool entry
         pass
     tip = rpc.getblockcount()
@@ -908,8 +916,14 @@ def find_spend(rpc, txid: str, vout: int, from_height: int):
         for tx in blk.get("tx", []):
             for i in tx.get("vin", []):
                 if i.get("txid") == txid and i.get("vout") == vout:
-                    return Tx.parse(bytes.fromhex(tx["hex"]))
+                    return Tx.parse(bytes.fromhex(tx["hex"])), tip - h + 1
     return None
+
+
+def find_spend(rpc, txid: str, vout: int, from_height: int):
+    """The transaction spending txid:vout (`find_spend_at` without the depth); None if nothing does."""
+    found = find_spend_at(rpc, txid, vout, from_height)
+    return found[0] if found else None
 
 
 def hub_channel_message(chan: str) -> bytes:

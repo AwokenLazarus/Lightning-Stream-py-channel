@@ -249,8 +249,8 @@ class ReconcileEveryCh2(_World):
         secret is on that close and the next tick may find it."""
         oc = self.oc()
         self.provider_closes()
-        real = hubmod.find_spend
-        hubmod.find_spend = lambda *a: None
+        real = hubmod.find_spend_at             # (AGP-088: the reconcile's lookup, with the spender's depth)
+        hubmod.find_spend_at = lambda *a: None
         try:
             oc.stale = [{"lockId": "x", "cum": oc.signed, "pre": None, "T": "", "d": 1, "ch1": ""}]
             # the early close of a written-off ch2 (AGP-073) gets no answer: the chain alone decides
@@ -266,7 +266,7 @@ class ReconcileEveryCh2(_World):
             self.hub.watch_tick()
             self.assertEqual((oc.state, oc.close_txid, oc.final), ("closed", "", False))   # confirmed, txid still unknown
         finally:
-            hubmod.find_spend = real
+            hubmod.find_spend_at = real
         self.hub.watch_tick()                                    # found later: the real txid
         self.assertEqual(oc.close_txid, self.node.spenders[(oc.p().funding_txid, oc.p().funding_vout)])
 
