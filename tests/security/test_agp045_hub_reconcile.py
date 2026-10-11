@@ -269,7 +269,8 @@ class CloseOnConfirmedOnly(_World):
         ev = next(a for a in acts if a["event"] == "ch2_close_vanished")
         self.assertEqual(ev["state"], "closing")
         self.assertEqual((oc.state, oc.close_txid), ("closing", ""))
-        self.assertEqual(self.hub.committed_sat(), 0)            # never routed or rolled over again
+        # AGP-088: its coins are in that ch2 again and count until this node sees them leave (the refund)
+        self.assertEqual(self.hub.committed_sat(), oc.p().capacity)
         self.hub.watch_tick()
         self.assertEqual(len(self.events("ch2_close_vanished")), 1)
         self.node.height = oc.p().expiry + self.hub.config.refund_grace_blocks

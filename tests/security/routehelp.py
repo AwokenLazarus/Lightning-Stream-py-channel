@@ -20,7 +20,10 @@ HUB = "http://hub.test"
 
 
 class RouteNode(FakeNode):
-    """FakeNode plus what the hub's watcher reads: gettxspendingprevout and raw tx hex. A conflicting
+    """FakeNode plus what the hub's watcher reads: gettxspendingprevout (the mempool's spends only, as a
+    node answers it: AGP-088. It named mined spenders too, so the watcher never read a block and "in a
+    block" could only be guessed from gettxout), getblockhash/getblock for the spends in blocks, and
+    raw tx hex. A conflicting
     spend is refused unless it replaces a mempool spend by BIP125 (the old one signals, the new one pays
     its fee + 1 sat/vB more: AGP-044); blocks take only txs paying block_min_feerate sat/vB. It is also the
     hub's fund wallet (AGP-045): fund_address is a wallet send (listtransactions, gettransaction, which
@@ -29,6 +32,7 @@ class RouteNode(FakeNode):
     def __init__(self, height=1000):
         super().__init__(height)
         self.spenders, self.raw, self.mined = {}, {}, set()
+        self.mined_at = {}                # (txid, vout) -> the height of the block its spend is in
         self.feerate = None               # estimatesmartfee's BTC/kvB (None: no estimate)
         self.fees = {}                    # txid -> (fee, vsize) of every broadcast tx
         self.block_min_feerate = 0.0
@@ -114,15 +118,31 @@ class RouteNode(FakeNode):
         return super().getrawtransaction(txid, verbose)
 
     def gettxspendingprevout(self, outs):
+        def mempool(k):
+            return k in self.spenders and k not in self.mined
         return [{"txid": o["txid"], "vout": o["vout"],
-                 **({"spendingtxid": self.spenders[(o["txid"], o["vout"])]}
-                    if (o["txid"], o["vout"]) in self.spenders else {})} for o in outs]
+                 **({"spendingtxid": self.spenders[(o["txid"], o["vout"])]} if mempool((o["txid"], o["vout"])) else {})}
+                for o in outs]
+
+    def getblockhash(self, height):
+        return f"{int(height):064x}"
+
+    def getblock(self, blockhash, verbosity=1):
+        """The spends mined at that height, as getblock(hash, 2) shows them (txid, hex, vin)."""
+        h, txs = int(blockhash, 16), {}
+        for k, at in self.mined_at.items():
+            txid = self.spenders.get(k)
+            if at == h and k in self.mined and txid in self.raw:
+                txs.setdefault(txid, {"txid": txid, "hex": self.raw[txid], "vin": []})["vin"].append({"txid": k[0], "vout": k[1]})
+        return {"hash": blockhash, "height": h, "tx": list(txs.values())}
 
     def confirm_all(self):
         for txid, t in self.txs.items():
             if not self._held(txid):
                 t["confirmations"] = max(t.get("confirmations", 0), 1)
-        self.mined |= {k for k, v in self.spenders.items() if not self._held(v)}
+        for k in [k for k, v in self.spenders.items() if not self._held(v) and k not in self.mined]:
+            self.mined.add(k)
+            self.mined_at[k] = self.height
 
     def mine(self, n=1):
         """n blocks: every mempool tx and spend confirms."""

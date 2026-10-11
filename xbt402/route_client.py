@@ -31,7 +31,7 @@ from typing import Callable, Dict, Optional
 
 from . import adaptor, ecc, x402_channel
 from .channel import ChannelError
-from .route import (AMSAT_PER_SAT, HUB_ROUTE_PATH, FeeQuote, Invoice, PriceQuote, call_auth, ceil_div, fee_due,
+from .route import (AMSAT_PER_SAT, HUB_ROUTE_PATH, HUB_VIEW_PATH, FeeQuote, Invoice, PriceQuote, call_auth, ceil_div, fee_due,
                     lock_auth, next_cum, session_key, state_verify)
 from .signer import ChannelSigner
 from .x402_channel import XbtChannelClient, b64json, request_digest_v2, same_origin_url, unb64json
@@ -70,7 +70,17 @@ class RoutePayer:
     def __init__(self, hub_url: str, network: str, height: Callable[[], int], fund: Callable = None, signer=None, *,
                  capacity: int = 200_000, expiry_blocks: int = 8_000, max_fee_ppm: int = 10_000,
                  max_fee_base_msat: int = 10_000, max_lock_sat: int = 50_000, void_grace: float = 1.0,
-                 http: Callable = None):
+                 http: Callable = None, max_held_locks: int = 2, held_probe_secs: float = 5.0):
+        """What the client believes of its hub (AGP-088). A hub that says one of our given-up locks was
+        COMPLETED proves it: the view carries the t + r that opens that lock's own point, which only its
+        completion yields. A hub that says a given-up lock is HELD (its ch2 pre-signature is out, so it
+        stays in ch1's base) cannot prove it, and each hold we adopt raises what our next lock signs by
+        that lock. So at most `max_held_locks` are adopted at a time, and at that many nothing more is
+        pre-signed until one resolves: the client only asks the hub for its view (at most every
+        `held_probe_secs`). The trust that remains: a hub that lies about holds gets us to sign
+        max_held_locks - 1 locks (each at most max_lock_sat plus its fee) above what we owe; with
+        max_held_locks 1, none, and one refusing provider then pauses our payments to the others until
+        its ch2 resolves. 0: no hold is ever adopted."""
         self.hub_url = x402_channel.no_fragment(hub_url.rstrip("/"))    # every lock is bound to hub_url + /x402/route (AGP-081)
         self.network = network
         self.signer = signer or ChannelSigner(fund=fund)
@@ -81,6 +91,8 @@ class RoutePayer:
         self.http = self.cc.http
         self.max_fee_ppm, self.max_fee_base_msat, self.max_lock_sat = max_fee_ppm, max_fee_base_msat, max_lock_sat
         self.void_grace = void_grace
+        self.max_held_locks, self.held_probe_secs = int(max_held_locks), float(held_probe_secs)
+        self._probe_at = 0.0        # when the hub may next be asked for its view (at max_held_locks)
         self.ch = None
         self.quote: Optional[FeeQuote] = None
         self.hub_pay_to = ""
@@ -251,8 +263,9 @@ class RoutePayer:
     def _void(self, p: dict, why: str):
         if not p["floor"]:
             self.signer.void_lock(self.chan)
+        # T1 (AGP-088): the lock's own point, which a hub's claim that it completed the lock must open
         self.given_up.append({"cum": p["cum"], "lockId": p["lockId"], "d": p["d"], "f": p["f"], "floor": p["floor"],
-                              "held": False, "before": (self.routed, self.fee_units, self.fee_paid),
+                              "held": False, "T1": p.get("T1", ""), "before": (self.routed, self.fee_units, self.fee_paid),
                               "after": (self.routed + p["d"] + p["f"], p["units"], self.fee_paid + p["f"])})
         if len(self.given_up) > 16:
             # a held lock is kept until its release or completion: without it a release could not be adopted
@@ -271,7 +284,9 @@ class RoutePayer:
             ch2 resolves; our counters become its `after`, our signed state stays;
           released: its ch2 resolved unpaid; the hold leaves our counters, so our next locks are quoted
             below our signed state (the dust floor) until what we paid ahead for it is used.
-        AGP-085: a release may come in the same view as a completion or a hold; see `gone` below."""
+        AGP-085: a release may come in the same view as a completion or a hold; see `gone` below.
+        AGP-088: a completion is adopted only with its proof (the view's `secret` opens that lock's T1),
+        and a hold only while fewer than max_held_locks are held (see __init__)."""
         try:
             best = int(doc["bestCum"])
             hub = (int(doc["routedSat"]), int(doc["feeUnits"]), int(doc["feePaid"]))
@@ -299,8 +314,20 @@ class RoutePayer:
         def drop(*gs):
             self.given_up = [x for x in self.given_up if not any(x is g for g in gs)]
 
+        def opens(g) -> bool:
+            # only the lock's completion gives the hub t + r (a lock from before has no point kept)
+            if not g.get("T1"):
+                return True
+            try:
+                y = int(doc["secret"], 16) % adaptor.N
+                return bool(y) and adaptor.point_of(y) == adaptor.dec(g["T1"])
+            except (KeyError, TypeError, ValueError):
+                return False
+
         if best > self.signed:
             for g in (g for g in self.given_up if not g.get("floor") and g["cum"] == best):
+                if not opens(g):
+                    continue
                 rel = [x for x in gone if x is not g]
                 if tuple(g["after"]) == hub or (g.get("held") and hub == ours):
                     rel = []
@@ -337,6 +364,11 @@ class RoutePayer:
             rel = gone
         if g is None:
             return False
+        # the hub's word is all there is for a hold: no more than max_held_locks at a time
+        if sum(1 for x in self.given_up if x.get("held") and not any(x is r for r in rel)) >= self.max_held_locks:
+            self.events.append({"event": "hold_not_adopted", "lockId": g["lockId"], "max": self.max_held_locks})
+            return False
+        self._probe_at = 0.0
         if rel:
             # as if the release had been adopted first: the lock was given up on the base without them
             g["before"], g["after"] = less(ours), hub
@@ -358,6 +390,10 @@ class RoutePayer:
             self._check_pending()
             if self.pending:
                 return None
+            if 0 < self.max_held_locks <= sum(1 for g in self.given_up if g.get("held")):
+                # AGP-088: nothing more is pre-signed above that many holds; a release or a completion
+                # of one of them is learnt from the hub's view
+                return {"status": "resynced"} if self._probe_view() else None
             d = sh.due_sat()
             inv = dict(sh.invoice)
             # the hub may wait revealTimeoutSec for the provider: lock only with that much invoice left;
@@ -445,6 +481,27 @@ class RoutePayer:
                 detail = doc.get("detail")
                 return {"status": "refused", "error": code, "detail": detail if isinstance(detail, str) else ""}
             return {"status": "pending", "http": st}
+
+    def _probe_view(self) -> bool:
+        """Under self._lock (AGP-088): ask the hub for its view of ch1 (POST /x402/route/view) and adopt
+        it, without signing a state. True if the view was adopted (a release, or a completion with its
+        proof). At most once every held_probe_secs, the first right after a hold was adopted."""
+        if time.time() < self._probe_at or self.ch is None:
+            return False
+        self._probe_at = time.time() + self.held_probe_secs
+        self.ch.seq += 1
+        pl = {"chan": self.chan, "seq": self.ch.seq, "cum": str(self.signed)}
+        self.cc._auth(self.ch, pl, "POST", self.hub_url + HUB_VIEW_PATH, b"")
+        try:
+            st, _, raw = self.http("POST", self.hub_url + HUB_VIEW_PATH, b"",
+                                   {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": self.ch.accepted, "payload": pl})})
+            doc = json.loads(raw)
+        except (OSError, ValueError):
+            return False
+        if st != 200 or not isinstance(doc, dict) or not self._resync(doc):
+            return False
+        self.events.append({"event": "view_adopted", "routedSat": self.routed, "signed": self.signed})
+        return True
 
     # --- background locking ------------------------------------------------------------------------
     def tick(self):

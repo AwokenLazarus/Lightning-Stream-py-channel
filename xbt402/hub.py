@@ -125,8 +125,8 @@ from .channel import (DUST, FEE_PAYERS, RBF_SEQUENCE, SIGHASH_ALL_UNIFIED, Chann
                       canonical_chan, settle_due)
 from .funding import FundingPolicy, offer_expiry_terms, open_expiry_floor
 from .hub_keys import WRAP_KEY_FILE, WrapKey
-from .route import (HUB_ROUTE_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
-                    fee_due, find_spend, hub_channel_message, next_cum, route_ok)
+from .route import (HUB_ROUTE_PATH, HUB_VIEW_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
+                    fee_due, find_spend, find_spend_at, hub_channel_message, next_cum, route_ok)
 from .rpc import RPCError
 from .tx import Tx, address_to_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, closing, request_auth, request_digest_v2,
@@ -173,6 +173,16 @@ class OutChannel:
     rolled_at: float = 0.0       # when the rollover that funds it was co-signed (AGP-056: relay grace)
     fund_seen: bool = False      # the hub's node has shown that rollover (mempool or a block)
     retired: bool = False        # replaced by the origin's next ch2 (AGP-057): the watcher has it closed
+    # AGP-088: the watcher's last look at the unspent funding showed it in a block. With it, gettxout
+    # answering nothing later means spent in a block; without it, it may only mean that the funding (a
+    # rollover) is itself unconfirmed
+    fund_confirmed: bool = False
+    # AGP-088: the hub's own node showed a spender of the funding at the watcher's last look. A `closing`
+    # ch2 without it is closing on the provider's word alone: its coins still count
+    spend_seen: bool = False
+    # AGP-088: a close was asked for with a refill, and this node did not show the close yet: the refill
+    # follows when the watcher sees it
+    refill_owed: bool = False
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
@@ -181,7 +191,10 @@ class OutChannel:
 LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
 WATCH_WAIT_ONE, WATCH_WAIT_BUDGET = 0.25, 1.0    # a watcher tick waits for one busy provider's mutex, and for all (AGP-053)
 ROLLOVER_GONE = "the rollover that funds this ch2 is in no block and not in the mempool"   # AGP-053
-NONFINAL = ("funded", "open", "refunded", "closing", "closed")   # the watcher reconciles these until final
+# the watcher reconciles these until final. AGP-088: `rolled` too. A ch2 is rolled on the provider's answer
+# or on a rollover in the mempool, and stays watched (and refundable) until that rollover is in a block:
+# no answer takes a funded output away from the watcher
+NONFINAL = ("funded", "open", "refunded", "closing", "closed", "rolled")
 
 
 def watched(r: dict) -> bool:
@@ -195,6 +208,30 @@ def watched(r: dict) -> bool:
 COUNTERS = (("routed_sat", "routed"), ("fee_units", "units"), ("fee_paid", "paid"))   # ch1's base, a lock's `after`
 
 
+def ch2_key(oc) -> str:
+    """The ch2 a ch1 lock went over, as the lock records it (`ch2`): that ch2's payer key, which a ch2
+    keeps from its funding to its end and shares with no other."""
+    return str(oc.params.get("payer_pub", "")).lower()
+
+
+def is_lock(lock: dict, lock_id, oc) -> bool:
+    """AGP-088 rule: a lock on ch1 is the lock of ONE ch2, and only that ch2's fate moves it. It leaves
+    ch1 when a t read off that ch2 completes it, or when that ch2 resolves without paying it. So it is
+    found by its lockId AND the ch2 it went over, never by the lockId alone: the lockId is the
+    provider's choice, and two providers (or one provider on two ch2s) can name the same one. A lock
+    written before it recorded `ch2` is matched by its provider's origin."""
+    if not isinstance(lock, dict) or lock.get("lockId") != lock_id:
+        return False
+    if isinstance(lock.get("ch2"), str):
+        return lock["ch2"].lower() == ch2_key(oc)
+    return lock.get("provider") == oc.origin
+
+
+def is_ch2_lock(lock: dict, ch1: str, lock_id) -> bool:
+    """A ch2 record's lock (`pending`, or one of `stale`) is the lock `lock_id` of `ch1`."""
+    return isinstance(lock, dict) and lock.get("lockId") == lock_id and lock.get("ch1") == ch1
+
+
 def lock_adds(lock: dict) -> Optional[dict]:
     """What a ch1 lock adds to the base (AGP-085): d + f, its fee units (`unitsBy`, written at admission)
     and f. None for a lock written before AGP-085, which has only the totals fixed at admission."""
@@ -206,7 +243,10 @@ def lock_adds(lock: dict) -> Optional[dict]:
 def hold_in_base(ex: dict, lock: dict):
     """AGP-064 (H2): a lock written off after its ch2 pre-signature left stays in ch1's base until that
     ch2 resolves. Raise the counters by what the lock adds (`lock_adds`) and record that on it (`hold`),
-    so a release takes back exactly that, whatever came after."""
+    so a release takes back exactly that, whatever came after. AGP-088: its lockId leaves ch1's
+    `released` list, which a client reads by lockId: a lock held now is not a released one."""
+    if lock.get("lockId") in (ex.get("released") or []):
+        ex["released"] = [x for x in ex["released"] if x != lock.get("lockId")]
     hold = {}
     add = lock_adds(lock)
     for k, a in COUNTERS:
@@ -223,12 +263,18 @@ def hold_in_base(ex: dict, lock: dict):
 
 def ch1_view(st1) -> dict:
     """ch1 as the hub counts it, for a client to resync on: the held locks, and the last ones
-    released (AGP-064)."""
+    released (AGP-064). AGP-088: `secret` is the t + r that completed the lock at bestCum, when a lock
+    set it: the proof a client asks for before it counts a lock it gave up as paid (only its completion
+    yields it)."""
     ex = st1.extra or {}
-    return {"bestCum": st1.best_cum, "routedSat": int(ex.get("routed_sat", 0)), "feeUnits": int(ex.get("fee_units", 0)),
+    view = {"bestCum": st1.best_cum, "routedSat": int(ex.get("routed_sat", 0)), "feeUnits": int(ex.get("fee_units", 0)),
             "feePaid": int(ex.get("fee_paid", 0)),
             "held": [s["lockId"] for s in ex.get("stale_locks", []) if isinstance(s.get("hold"), dict)],
             "released": list(ex.get("released", []))}
+    best = ex.get("best_lock") or {}
+    if best.get("cum") == st1.best_cum and best.get("secret"):
+        view["secret"] = best["secret"]
+    return view
 
 
 def refund_booked(r: dict) -> bool:
@@ -277,6 +323,11 @@ class OutBook:
             self.chans = {k: OutChannel(**v) for k, v in raw.get("chans", {}).items()}
             self.next_chans = {k: OutChannel(**v) for k, v in raw.get("next_chans", {}).items()}
             self.archived = raw.get("archived", [])
+            for r in self.archived:
+                if r.get("state") == "rolled" and "fund_confirmed" not in r:
+                    # a ch2 rolled before AGP-088 was never watched again: it stays as it was (final),
+                    # not read against the chain from its first block on every tick
+                    r["final"] = True
             self.origins = {k: str(v) for k, v in raw.get("origins", {}).items()}
         self.mutex: Dict[str, threading.Lock] = {}
         if self.legacy_sealed:
@@ -501,6 +552,9 @@ class RouteHub:
         self._quote: Optional[FeeQuote] = None
         self._quote_seq = int(time.time())
         self.withhold = ""           # tests/demo: "" | "receipt" (keep t + r from the client) | "all"
+        # tests: the step at which the hub stops as a crash would ("": never). "release": between a
+        # written-off lock leaving ch1 and leaving its ch2 record
+        self.stop_at = ""
         self.events: list = []
         if self.out.legacy_sealed:
             print(f"hub: sealed {self.out.legacy_sealed} plaintext ch2 keys in ch2.json (AGP-073); older copies of that "
@@ -536,12 +590,16 @@ class RouteHub:
 
     # ---------------------------------------------------------------------------------------------
     def committed_sat(self) -> int:
-        """The hub's own coins in live ch2s (funding, funded or open): every origin's live one, its next
-        one funded ahead (AGP-057), and a retired one until its close is out."""
+        """The hub's own coins in ch2s: every record, live, next or archived, whose funding the hub made
+        or is making and has not seen spent. AGP-088 rule: coins count against liquidity_cap_sat until
+        the hub's own node shows them leaving. A provider's answer that it closed frees nothing
+        (`closing` without spend_seen), and neither does moving a record to the archive (a retired ch2,
+        a next ch2 adopted there)."""
+        def counts(r: dict) -> bool:
+            return not r.get("final") and (r.get("state") in LIVE or (r.get("state") == "closing" and not r.get("spend_seen")))
         with self.out.lock:
-            live = [c for c in list(self.out.chans.values()) + list(self.out.next_chans.values()) if c.state in LIVE]
-            return sum(c.p().capacity for c in live) + sum(
-                int(r["params"]["capacity"]) for r in self.out.archived if r.get("retired") and r.get("state") in LIVE)
+            recs = [asdict(c) for c in list(self.out.chans.values()) + list(self.out.next_chans.values())] + list(self.out.archived)
+            return sum(int(r["params"]["capacity"]) for r in recs if counts(r))
 
     def refund_fees_sat(self) -> int:
         """Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings."""
@@ -616,6 +674,11 @@ class RouteHub:
             doc["accepts"][0]["extra"]["routing"] = self.routing_extra()
             h["PAYMENT-REQUIRED"] = b64json(doc)
             return 402, h, json.dumps(doc).encode()
+        if path.split("?", 1)[0] == HUB_VIEW_PATH:
+            hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
+            if method == "POST" and hdr:
+                return self.view(method, binding_url(url, HUB_VIEW_PATH), hdr, body)
+            return self._err("bad_payload")
         # a rollover spends ch1's funding as a close does (AGP-078): the same sweep before either
         if method == "POST" and path.split("?", 1)[0] in ("/x402/xbt-channel/close", "/x402/xbt-channel/rollover"):
             try:
@@ -642,12 +705,14 @@ class RouteHub:
             return None
         try:
             with self.out.lock:
+                # AGP-088: this ch1's lock, not any lock of that lockId, and wherever its ch2 record is
+                # now: one archived with the lock still pending is not an orphan's
                 live = [c for c in (self.out.chans.get(origin), self.out.next_chans.get(origin)) if c is not None]
-                if any(c.pending.get("lockId") == lid for c in live):
+                old = [r for r in self.out.archived if r.get("origin") == origin and not r.get("final")]
+                if any(is_ch2_lock(c.pending, ch1, lid) for c in live) or any(is_ch2_lock(r.get("pending"), ch1, lid) for r in old):
                     return None
-                written_off = (any(not c.final and any(s.get("lockId") == lid for s in c.stale) for c in live)
-                               or any(r.get("origin") == origin and not r.get("final")
-                                      and any(s.get("lockId") == lid for s in r.get("stale") or []) for r in self.out.archived))
+                written_off = (any(not c.final and any(is_ch2_lock(s, ch1, lid) for s in c.stale) for c in live)
+                               or any(any(is_ch2_lock(s, ch1, lid) for s in r.get("stale") or []) for r in old))
             with self.inbound.ledger.lock:
                 ex = st1.extra or {}
                 if (ex.get("route_lock") or {}).get("lockId") != lid:
@@ -674,6 +739,30 @@ class RouteHub:
     def _err(code: str, detail: str = "", status: int = 400, **extra):
         return status, {"Content-Type": "application/json"}, json.dumps(
             {"error": code, "detail": detail, **extra}).encode()
+
+    def view(self, method: str, bind: str, hdr: str, body: bytes):
+        """POST /x402/route/view (AGP-088): ch1 as the hub counts it, for the client that holds its key.
+        Authenticated like a route (the request HMAC and a fresh seq, which is saved before the answer
+        leaves); it changes nothing else."""
+        try:
+            pl = unb64json(hdr)["payload"]
+            if not isinstance(pl, dict):
+                raise TypeError
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self._err("bad_payload")
+        ib = self.inbound
+        with ib.ledger.lock:
+            try:
+                st1 = ib.ledger.channels.get(canonical_chan(pl.get("chan")))
+            except ChannelError:
+                st1 = None
+            if st1 is None:
+                return self._err("unknown_channel")
+            if not ib._authentic(st1, pl, method, bind, body):
+                return self._err("bad_auth", status=401)
+            st1.seq = int(pl["seq"])
+            ib.ledger.save(st1)
+            return 200, {"Content-Type": "application/json"}, json.dumps(ch1_view(st1)).encode()
 
     def route(self, method: str, bind: str, hdr: str, body: bytes):
         """`bind`: the request's URL as request_digest_v2 binds it."""
@@ -826,10 +915,18 @@ class RouteHub:
         if why:
             mtx.release()
             return None, self._err(*why)
+        # AGP-088: one unresolved lock per lockId on a ch1. The lockId is the provider's choice, and the
+        # client is told of its held and released locks by lockId. A ch2 that could take this lock
+        # (another provider's, or this provider's next one) does not take it under a lockId that ch1
+        # still holds written off: refused before anything is pre-signed on it, with our view, so a
+        # client that lost the first refusal adopts the hold
+        if any(s.get("lockId") == lock_id for s in ex1.get("stale_locks") or []):
+            mtx.release()
+            return None, self._err("lock_held", "a written-off lock with this lockId is unresolved on this channel", **view)
         # write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
         lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
                  "T": rt["point"], "T1": pl.get("point"), "r": f"{r:064x}", "d": d, "f": f, "units": units,
-                 "provider": provider, "at": round(time.time(), 3), "session": rt.get("session"),
+                 "provider": provider, "ch2": ch2_key(oc), "at": round(time.time(), 3), "session": rt.get("session"),
                  "after": {"routed": routed1 + d + f, "units": units, "paid": int(ex1.get("fee_paid", 0)) + f},
                  # the fee units it adds (AGP-085): ch1's base may move under a lock in flight (a release)
                  "unitsBy": units - int(ex1.get("fee_units", 0))}
@@ -906,10 +1003,14 @@ class RouteHub:
         live one takes no lock any more. The ch2 it replaces goes to the archive; while its coins are
         still committed (funded, open) it is `retired`: the watcher has the provider close it."""
         with self.out.lock:
+            old = self.out.chans.get(origin)
+            if old is not None and old.pending:
+                # AGP-088: not from under a pending lock. A ch2 keeps its place until its lock is
+                # completed or written off, so the route that sent it still finds it
+                return None
             nxt = self.out.next_chans.pop(origin, None)
             if nxt is None:
                 return None
-            old = self.out.chans.get(origin)
             if old is not None:
                 if old.state in LIVE:
                     old.retired = True
@@ -1035,7 +1136,7 @@ class RouteHub:
         # ch1 first (AGP-073): a stop between the two leaves the ch2 lock pending, which the provider's
         # answer or its close completes again; the other order left a ch1 lock with no ch2 lock, which
         # the watcher's sweep would drop unpaid
-        done = self._complete_ch1(ch1, pend["lockId"], t, via="provider")
+        done = self._complete_ch1(ch1, pend["lockId"], oc, t, via="provider")
         with self.out.lock:
             if oc.pending.get("lockId") == pend["lockId"]:
                 oc.signed = max(oc.signed, pend["cum"])
@@ -1045,23 +1146,30 @@ class RouteHub:
                 self.out.save()
         return done
 
-    def _complete_ch1(self, ch1: str, lock_id: str, t: int, via: str) -> Optional[dict]:
-        """Complete ch1's lock `lock_id` (its current one or a written-off one) with t + r. A lock it
-        completed already gets the same answer again (a stop between this and the ch2 write)."""
+    def _complete_ch1(self, ch1: str, lock_id: str, oc: OutChannel, t: int, via: str) -> Optional[dict]:
+        """Complete ch1's lock `lock_id` over the ch2 `oc` (its current one or a written-off one) with
+        t + r. A lock it completed already gets the same answer again (a stop between this and the ch2
+        write). AGP-088: the lock of THAT ch2 (`is_lock`), and only with the t that opens its own T; a
+        written-off lock of another ch2 under the same lockId stays where it is."""
         ib = self.inbound
         with ib.ledger.lock:
             st1 = ib.ledger.channels.get(ch1)
             if st1 is None:
                 return None
             ex = st1.extra or {}
-            lock1 = ex.get("route_lock") if (ex.get("route_lock") or {}).get("lockId") == lock_id else None
+            lock1 = ex.get("route_lock") if is_lock(ex.get("route_lock"), lock_id, oc) else None
             stale = False
             if lock1 is None:
-                lock1 = next((s for s in ex.get("stale_locks", []) if s["lockId"] == lock_id), None)
+                lock1 = next((s for s in ex.get("stale_locks", []) if is_lock(s, lock_id, oc)), None)
                 stale = True
             if lock1 is None:
                 done = (ex.get("route_done") or {}).get(lock_id)
                 return done or next((r for r in ex.get("recovered", []) if r.get("lockId") == lock_id), None)
+            try:
+                if adaptor.point_of(t) != adaptor.dec(lock1["T"]):
+                    return None
+            except (KeyError, TypeError, ValueError):
+                return None
             s1 = (t + int(lock1["r"], 16)) % adaptor.N
             # ch1 closed below this lock (an operator's close, or the margin close past its wait): the
             # provider is paid and the client is not charged. Never counted as routed (AGP-064 H1)
@@ -1072,10 +1180,13 @@ class RouteHub:
                 if lock1["cum"] > st1.best_cum and not st1.closed_txid:
                     ib._payee(st1).accept(lock1["cum"], sig1)
                     st1.best_cum, st1.best_sig = lock1["cum"], sig1.hex()
+                    # AGP-088: what a client checks before it counts this lock as paid (`ch1_view`)
+                    ex["best_lock"] = {"cum": lock1["cum"], "secret": f"{s1:064x}"}
             ans = {"lockId": lock_id, "secret": f"{s1:064x}", "cum": str(max(lock1["cum"], st1.best_cum)),
                    "fee": lock1["f"], "amount": lock1["d"], "via": via}
             if stale:
-                ex["stale_locks"] = [s for s in ex.get("stale_locks", []) if s["lockId"] != lock_id]
+                # this one lock leaves, by itself: never every lock that carries its lockId
+                ex["stale_locks"] = [s for s in ex.get("stale_locks", []) if s is not lock1]
                 ex.setdefault("recovered", []).append({**ans, "at": round(time.time(), 3)})
                 # a held lock is in the base already (AGP-064); one written off before that is counted
                 # once it is our best state
@@ -1112,17 +1223,22 @@ class RouteHub:
         return ans
 
     def _void(self, st1, oc: OutChannel, lock1: dict, why: str, block: str) -> dict:
-        """Write both locks off. If the ch2 pre-signature may have left (the lock was pending on ch2),
-        they are kept for on-chain recovery, and ch1's lock stays in its base until that ch2 resolves
-        (AGP-064 H2): a later lock is quoted above it, so a t read off the ch2 close later still
-        collects, and routing over that ch2 or rolling it over waits. Otherwise nothing can complete
-        the lock and ch1's is dropped. Returns ch1's view for the client when the lock is held."""
+        """Write both locks off: ch1's lock `lock1` and the one pending on the ch2 `oc`. If the ch2
+        pre-signature may have left (that lock was pending on the ch2), they are kept for on-chain
+        recovery, and ch1's lock stays in its base until that ch2 resolves (AGP-064 H2): a later lock is
+        quoted above it, so a t read off the ch2 close later still collects, and routing over that ch2
+        or rolling it over waits. Otherwise nothing can complete the lock and ch1's is dropped. Returns
+        ch1's view for the client when the lock is held.
+
+        AGP-088: `oc` may be any record (a ch2 that is closing or was replaced keeps its pending lock
+        until the watcher writes it off), and ch1's route_lock is touched only if it is this lock."""
         ib = self.inbound
+        ch1, lock_id = st1.params.channel_id, lock1.get("lockId")
         with self.out.lock:
-            pend_id = None
+            out = False
             if oc.pending:
                 # a ch2 already resolved for good (its close or refund confirmed) can pay nothing more
-                pend_id = None if oc.final else oc.pending.get("lockId")
+                out = not oc.final and is_ch2_lock(oc.pending, ch1, lock_id)
                 oc.stale.append({**oc.pending, "voided": round(time.time(), 3), "why": why})
                 oc.pending = {}
             if block:
@@ -1130,64 +1246,92 @@ class RouteHub:
             self.out.save()
         view, held = {}, False
         with ib.ledger.lock:
-            st1 = ib.ledger.channels[st1.params.channel_id]
+            st1 = ib.ledger.channels[ch1]
             ex = st1.extra or {}
             rl = ex.get("route_lock")
-            if rl:
+            if rl and is_lock(rl, lock_id, oc):
                 ex["route_lock"] = None
-                if pend_id is not None and rl.get("lockId") == pend_id:
+                if out:
                     rl = {**rl, "voided": round(time.time(), 3)}
                     hold_in_base(ex, rl)
                     ex.setdefault("stale_locks", []).append(rl)
                     held = True
-            st1.extra = ex
-            ib.ledger.save(st1)
+                st1.extra = ex
+                ib.ledger.save(st1)
             if held:
                 view = ch1_view(st1)
-        self.events.append({"event": "void", "provider": oc.origin, "lockId": lock1.get("lockId"), "why": why,
+        self.events.append({"event": "void", "provider": oc.origin, "lockId": lock_id, "why": why,
                             "blocked": bool(block), "held": held})
         return view
 
-    def _release_unpaid(self, locks: list) -> list:
-        """AGP-064: written-off locks whose ch2 resolved without paying them (a confirmed refund, a
-        confirmed close that does not reveal their t). Each (ch1, lockId) leaves ch1's stale_locks, and
-        its hold leaves the base: the client is quoted below its best state again (the floor), so what
-        it paid ahead for that lock pays its next ones. The lockId goes on ch1's `released` list, the
-        last 64, for the client to resync on."""
+    def _release_unpaid(self, locks: list, oc: OutChannel) -> list:
+        """AGP-064: written-off locks of the ch2 `oc`, which resolved without paying them (a confirmed
+        refund, a confirmed close that does not reveal their t). Each (ch1, lockId) leaves ch1's
+        stale_locks, and its hold leaves the base: the client is quoted below its best state again (the
+        floor), so what it paid ahead for that lock pays its next ones. The lockId goes on ch1's
+        `released` list, the last 64, for the client to resync on.
+
+        AGP-088: only the locks of THAT ch2 (`is_lock`), each with its own hold. An error (ch1's ledger
+        did not take the write) leaves the rest for the next tick: the caller has not cleared the ch2
+        record yet."""
         out, ib = [], self.inbound
-        with ib.ledger.lock:
-            for ch1, lid in locks:
-                st1 = ib.ledger.channels.get(ch1)
-                if st1 is None:
-                    continue
-                ex = st1.extra or {}
-                gone = next((s for s in ex.get("stale_locks", []) if s.get("lockId") == lid), None)
-                if gone is None:
-                    continue
-                ex["stale_locks"] = [s for s in ex["stale_locks"] if s is not gone]
-                ev = {"event": "lock_released", "chan": ch1, "lockId": lid, "held": False}
-                hold = gone.get("hold")
-                if isinstance(hold, dict):
-                    for k, a in COUNTERS:
-                        ex[k] = max(0, int(ex.get(k, 0)) - int(hold.get(a, 0)))
-                    ex["released"] = (list(ex.get("released", [])) + [lid])[-64:]
-                    ev.update(held=True, hold=hold)
-                st1.extra = ex
-                ib.ledger.save(st1)
-                out.append(ev)
-        self.events.extend(out)
+        try:
+            with ib.ledger.lock:
+                for ch1, lid in locks:
+                    st1 = ib.ledger.channels.get(ch1)
+                    if st1 is None:
+                        continue
+                    ex = st1.extra or {}
+                    gone = [s for s in ex.get("stale_locks", []) if is_lock(s, lid, oc)]
+                    if not gone:
+                        continue
+                    ex["stale_locks"] = [s for s in ex["stale_locks"] if not any(s is g for g in gone)]
+                    evs = []
+                    for g in gone:
+                        ev = {"event": "lock_released", "chan": ch1, "lockId": lid, "held": False}
+                        hold = g.get("hold")
+                        if isinstance(hold, dict):
+                            for k, a in COUNTERS:
+                                ex[k] = max(0, int(ex.get(k, 0)) - int(hold.get(a, 0)))
+                            ex["released"] = (list(ex.get("released", [])) + [lid])[-64:]
+                            ev.update(held=True, hold=hold)
+                        evs.append(ev)
+                    st1.extra = ex
+                    ib.ledger.save(st1)
+                    out += evs
+        finally:
+            self.events.extend(out)
         return out
 
     def _release_stale(self, oc: OutChannel) -> list:
         """Release the written-off locks still on `oc` (its ch2 resolved without revealing them) and
-        clear them from the ch2 record."""
+        clear them from the ch2 record. AGP-088: ch1 first, and the caller makes the record final only
+        after this. A stop after the ch1 write leaves the ch2 record with its locks, not final, and the
+        next tick does it again (a lock already released is not found and nothing moves twice); the other
+        order left a held lock on ch1 that nothing would ever release."""
         with self.out.lock:
             locks = [(s.get("ch1"), s.get("lockId")) for s in oc.stale]
-            if not locks:
-                return []
+        if not locks:
+            return []
+        out = self._release_unpaid(locks, oc)
+        if self.stop_at == "release":
+            raise ChannelError("test_stop", "release")
+        with self.out.lock:
             oc.stale = []
             self.out.save()
-        return self._release_unpaid(locks)
+        return out
+
+    def _release_rolled(self, oc: OutChannel, why: str) -> list:
+        """The locks on a ch2 whose funding a confirmed spend took without revealing their t (AGP-085: a
+        rollover; AGP-088: any close or refund, so no ch2 ends with a lock still pending on it): a
+        pending lock is written off (`why`) and every written-off lock is released. ch1's own lock in
+        flight, if the route that sent it is gone, is then an orphan and the sweep drops it."""
+        with self.out.lock:
+            if oc.pending:
+                oc.stale = oc.stale + [{**oc.pending, "voided": round(time.time(), 3), "why": why}]
+                oc.pending = {}
+                self.out.save()
+        return self._release_stale(oc)
 
     # --- hub-funded ch2 -----------------------------------------------------------------------------
     def ch2_terms(self, terms: dict, capacity: int = None, expiry_blocks: int = None) -> tuple:
@@ -1330,6 +1474,10 @@ class RouteHub:
             elif old is not None and old.state in LIVE and old.pay_to.lower() == pay_to:
                 # one live ch2 per origin, checked with the insert (racing connects)
                 raise ChannelError("ch2_funding", f"a live ch2 to {origin} exists")
+            elif old is not None and old.pending:
+                # AGP-088: the ch2 this would replace (its payTo changed, or it is closing) has a lock
+                # pending: it keeps its place until that lock is completed or written off
+                raise ChannelError("lock_pending", f"a lock is pending on the ch2 to {origin} this would replace")
             others = [k for k in self.out.live_keys(pay_to) if k != origin]
             limit = int(self.config.ch2_max_per_pay_to)
             if limit and len(others) >= limit:
@@ -1708,24 +1856,72 @@ class RouteHub:
         if st != 200:
             raise ChannelError("provider_error", str(doc)[:200])
         txid, cum = self._check_close_reply(oc, doc)
+        # AGP-088 rule: the provider's answer frees no coins and starts no funding; this node showing
+        # the funding spent does. A hub on the provider's node sees the close at once
+        shown = self._spend_shown(oc)
         with self.out.lock:
-            oc.state, oc.close_prev, oc.close_txid = "closing", oc.state, txid
+            oc.state, oc.close_prev, oc.close_txid, oc.spend_seen = "closing", oc.state, txid, shown
             self.out.save()
         ev = {"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "amount": cum,
               "payeeFee": p.payee_fee, "payeeNet": max(0, cum - p.payee_fee)}
         self.events.append(ev)
-        if refill and self.out.next_chans.get(oc.origin) is not None:
+        # (no new coins: the next ch2 was funded ahead, under the cap, while this one was open)
+        nxt = self._promote(oc.origin, "closed") if refill and self.out.next_chans.get(oc.origin) is not None else None
+        if nxt is not None:
             # funded ahead (AGP-057): the next ch2 takes over, nothing more to fund
-            nxt = self._promote(oc.origin, "closed")
-            if nxt is not None:
-                ev["next"] = nxt.p().channel_id
+            ev["next"] = nxt.p().channel_id
+        elif refill and self.out.next_chans.get(oc.origin) is not None:
+            pass                                    # its next ch2 waits for this one's pending lock (AGP-088)
+        elif refill and shown:
+            err = self._refill_now(oc.origin)
+            if err:                                 # the close stands; the refill is reported
+                ev["refillError"] = err
         elif refill:
-            try:
-                self.refill(oc.origin)
-            except Exception as e:  # noqa: BLE001 - the close stands; the refill is reported
-                ev["refillError"] = f"{type(e).__name__}: {e}"[:200]
-                self.events.append({"event": "ch2_refill_failed", "provider": oc.origin, "error": ev["refillError"]})
+            # the close is the provider's word so far: the refill is owed, and the watcher funds it when
+            # its reconcile sees the funding spent
+            with self.out.lock:
+                oc.refill_owed = True
+                self.out.save()
+            ev["refillError"] = "deferred: this node does not show the close yet (the refill follows when the watcher sees it)"
+            self.events.append({"event": "ch2_refill_deferred", "provider": oc.origin, "chan": p.channel_id, "txid": txid})
         return ev
+
+    def _spend_shown(self, oc: OutChannel) -> bool:
+        """This node shows a spender of `oc`'s funding (mempool or a block). Not: gettxout answers nothing
+        for it, which is also true of a funding that is not there."""
+        p = oc.p()
+        try:
+            return (self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None
+                    and find_spend(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to) is not None)
+        except Exception:  # noqa: BLE001 - the node did not answer: not shown
+            return False
+
+    def _refill_now(self, origin: str) -> str:
+        """Fund the ch2 that replaces a closed one, through the `refill` hook (default `connect`). The
+        error, reported (ch2_refill_failed), as text; "" when it was funded."""
+        try:
+            self.refill(origin)
+            return ""
+        except Exception as e:  # noqa: BLE001 - reported, never raised: the close stands
+            msg = f"{type(e).__name__}: {e}"[:200]
+            self.events.append({"event": "ch2_refill_failed", "provider": origin, "error": msg})
+            return msg
+
+    def _refill_if_owed(self, oc: OutChannel) -> list:
+        """AGP-088: the refill a close left owed (refill_owed), now that this node shows that close.
+        Once, as at the close: a refusal (the cap, the provider's /terms) is reported and not tried
+        again. Called last by the reconcile: the refill moves this record to the archive."""
+        if not oc.refill_owed or self.out.chans.get(oc.origin) is not oc:
+            return []
+        with self.out.lock:
+            oc.refill_owed = False
+            self.out.save()
+        ev = {"event": "ch2_refill", "provider": oc.origin, "after": oc.p().channel_id}
+        err = self._refill_now(oc.origin)
+        if err:
+            ev["refillError"] = err
+        self.events.append(ev)
+        return [ev]
 
     def _check_close_reply(self, oc: OutChannel, doc) -> tuple:
         p = oc.p()
@@ -1783,7 +1979,9 @@ class RouteHub:
         return oc.refund_fee if f < step else f
 
     def _refund_due(self, oc: OutChannel, tip: int) -> bool:
-        if oc.state not in ("funded", "open", "closing", "closed") or oc.pending or not oc.p().funding_txid:
+        # (AGP-088: `rolled` too. A ch2 rolled on the provider's answer whose rollover never reached the
+        # chain is refunded like any ch2)
+        if oc.state not in ("funded", "open", "closing", "closed", "rolled") or oc.pending or not oc.p().funding_txid:
             return False
         p = oc.p()
         grace = self.config.refund_grace_blocks if oc.signed >= p.min_amount else 0
@@ -2095,8 +2293,7 @@ class RouteHub:
                     out.append({"event": "lock_settled_late", "provider": oc.origin})
                 else:
                     st1 = self.inbound.ledger.channels[oc.pending["ch1"]]
-                    lock1 = (st1.extra or {}).get("route_lock") or {"lockId": oc.pending["lockId"]}
-                    self._void(st1, oc, lock1, "no reveal within revealTimeoutSec",
+                    self._void(st1, oc, {"lockId": oc.pending["lockId"]}, "no reveal within revealTimeoutSec",
                                block="the provider did not reveal a lock in time")
                     out.append({"event": "lock_written_off", "provider": oc.origin})
             return out
@@ -2157,14 +2354,35 @@ class RouteHub:
         real txid and the refund fee is taken back if our refund lost. A `closing` ch2 whose spender left
         the mempool is `refunded` again if it was (the fee re-booked), else it stays `closing` and is
         refunded at expiry unless the close comes back. Spent, spender not found: with locks outstanding
-        leave it (their secrets are on that tx); without, closing (closed once confirmed), txid unknown."""
+        leave it (their secrets are on that tx); without, closing (closed once confirmed), txid unknown.
+
+        AGP-088: "confirmed" is `_spent_in_block`, never gettxout answering nothing alone; a `rolled` ch2
+        is watched here until its rollover is in a block, and refunded like any other if that rollover
+        never comes; a lock still pending on a ch2 that is no longer open is written off; and the locks a
+        confirmed spend did not pay leave ch1 BEFORE the record is final."""
         if oc.final or oc.state not in NONFINAL:
             return []
         p = oc.p()
         if not p.funding_txid:
             return []
         out = []
-        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is not None:
+        if oc.pending and oc.state != "open" and time.time() - float(oc.pending.get("at", 0)) >= self.reveal_timeout:
+            # AGP-088: the watcher asks again for a pending lock only on an open ch2. On any other
+            # (closing on the provider's close, a restart in between) nobody would write it off: ch1 kept
+            # its lock in flight until its margin, and the ch2 ended with it pending. Its pre-signature
+            # may be out, so it is held on ch1 like any written-off lock
+            st1 = self.inbound.ledger.channels.get(oc.pending.get("ch1"))
+            if st1 is not None:
+                self._void(st1, oc, {"lockId": oc.pending.get("lockId")}, "its ch2 is no longer open", block="")
+                out.append({"event": "lock_written_off", "provider": oc.origin, "chan": p.channel_id})
+        utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, True)
+        if utxo is not None:
+            # what the node shows of the unspent funding, kept for the day it is spent (AGP-088)
+            conf = int(utxo.get("confirmations", 0) or 0) >= 1
+            if oc.fund_confirmed != conf or oc.spend_seen:
+                with self.out.lock:
+                    oc.fund_confirmed, oc.spend_seen = conf, False
+                    self.out.save()
             if oc.rolled_from and not oc.fund_seen:          # our node shows the rollover (AGP-056)
                 with self.out.lock:
                     oc.fund_seen = True
@@ -2185,19 +2403,30 @@ class RouteHub:
             gone = self._rollover_gone(oc, p)
             if gone is not None:
                 return out + gone
-        confirmed = self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is None
+        if oc.state == "rolled" and oc.close_txid:
+            # the rollover this ch2 was rolled on, in a block by one of its own two outputs: nothing left
+            # to watch, and no block is read for it (a rollover whose outputs are both spent again
+            # already is found by the scan below)
+            for n in (0, 1):
+                u = self.rpc.gettxout(oc.close_txid, n, False)
+                if u is not None and int(u.get("confirmations", 0) or 0) >= 1:
+                    with self.out.lock:
+                        oc.final = oc.spend_seen = True
+                        self.out.save()
+                    return out
         # (AGP-085: with a next ch2 written ahead the spender is read, never taken on the provider's word:
         # it may be a rollover into it)
-        if (oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid and confirmed
-                and not oc.next):
+        if (oc.state == "closing" and oc.close_txid and not (oc.pending or oc.stale) and not oc.refund_txid
+                and not oc.next and self._spent_in_block(oc, p, None)):
             with self.out.lock:                             # the provider's close as it told us, confirmed: done
                 oc.state, oc.final = "closed", True
                 self.out.save()
             ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": oc.close_txid, "by": "provider"}
             self.events.append(ev)
-            return [ev]
-        tx = find_spend(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
-        if tx is None:
+            return out + [ev] + self._refill_if_owed(oc)
+        found = find_spend_at(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
+        confirmed = self._spent_in_block(oc, p, found)
+        if found is None:
             # a funded one may not be visible yet; with locks, their secrets are on that tx: wait for it.
             # A closing one closes once the spend confirms, unless it was refunded (the spender may be our
             # refund: the fee stays booked until the spender is found)
@@ -2210,28 +2439,42 @@ class RouteHub:
                 if oc.state == "open":
                     oc.close_prev, oc.close_txid = "open", ""
                 oc.state = st
+                # a funding this node showed confirmed and no longer shows unspent, even counting the
+                # mempool, is being spent: its coins no longer count (AGP-088)
+                oc.spend_seen = bool(oc.fund_confirmed)
                 self.out.save()
             ev = {"event": "ch2_" + st, "provider": oc.origin, "chan": p.channel_id, "txid": oc.close_txid, "by": "unknown"}
             self.events.append(ev)
             out.append(ev)
             return out
+        tx = found[0]
+        if not oc.spend_seen:
+            # this node shows a spender: the coins are leaving, whatever the provider said (AGP-088)
+            with self.out.lock:
+                oc.spend_seen = True
+                self.out.save()
         spender = tx.txid()
-        if self._next_funded(oc, tx):
+        if oc.state == "rolled" and spender == oc.close_txid:
+            # the rollover this ch2 was rolled on: nothing left to watch once it is in a block
+            if confirmed:
+                with self.out.lock:
+                    oc.final = True
+                    self.out.save()
+            return out
+        amount = self._next_funded(oc, tx)
+        if amount is not None:
             if oc.pending or oc.stale:
                 # AGP-085: a rollover reveals no t. Its locks are unpaid once it confirms, not before (a
                 # close that shows t may still replace it in the mempool)
                 if not confirmed:
                     return out
-                with self.out.lock:
-                    if oc.pending:
-                        oc.stale = oc.stale + [{**oc.pending, "voided": round(time.time(), 3), "why": "rolled over"}]
-                        oc.pending = {}
-                    self.out.save()
-                out += self._release_stale(oc)
-            return out + [self._finish_rollover(oc, oc.signed)]
+                out += self._release_rolled(oc, "rolled over")
+            return out + [self._finish_rollover(oc, amount)]
         prev_fee = next((int(r.get("fee") or 0) for r in oc.refund_prev if r.get("txid") == spender), None)
         if spender == oc.refund_txid or prev_fee is not None:          # one of our refund versions
             fee = oc.refund_fee if prev_fee is None else prev_fee
+            # the refund proves the written-off locks unpaid: off ch1 first, then the record is final
+            released = self._release_rolled(oc, "refunded") if confirmed else []
             with self.out.lock:
                 oc.state, oc.final = "refunded", confirmed
                 if confirmed:
@@ -2244,7 +2487,7 @@ class RouteHub:
                       "txid": spender, "fee": fee, "versions": len(oc.refund_prev) + 1}
                 self.events.append(ev)
                 out.append(ev)
-                out += self._release_stale(oc)              # the refund proves the written-off locks unpaid
+                out += released
             elif self._bump_due(oc, tip):                   # stuck in the mempool: replace it at a higher fee
                 out += self._refund(oc, tip)
             return out
@@ -2254,7 +2497,7 @@ class RouteHub:
             # in the mempool: it may still be replaced or expire, so the ch2 is only closing and a refund
             # fee stays booked until it confirms
             if oc.state == "closing" and oc.close_txid == spender:
-                return out
+                return out + self._refill_if_owed(oc)
             with self.out.lock:
                 if oc.state != "closing":
                     oc.close_prev = oc.state
@@ -2264,7 +2507,9 @@ class RouteHub:
                   **({"refundAtRisk": oc.refund_txid} if refund_booked(asdict(oc)) else {})}
             self.events.append(ev)
             out.append(ev)
-            return out
+            return out + self._refill_if_owed(oc)
+        # a confirmed close that did not reveal a lock's t did not pay it: off ch1 first, then final
+        released = self._release_rolled(oc, "closed")
         lost = oc.refund_fee if oc.refund_txid else 0
         with self.out.lock:
             oc.state, oc.close_txid, oc.final, oc.next = "closed", spender, True, {}
@@ -2275,8 +2520,21 @@ class RouteHub:
               **({"refundLost": oc.refund_txid, "refundFeeReverted": lost} if oc.refund_txid else {})}
         self.events.append(ev)
         out.append(ev)
-        out += self._release_stale(oc)          # a confirmed close that did not reveal a written-off lock's t did not pay it
-        return out
+        out += released
+        return out + self._refill_if_owed(oc)
+
+    def _spent_in_block(self, oc: OutChannel, p: ChannelParams, found) -> bool:
+        """AGP-088 rule: a ch2's funding is spent for good, and its unpaid locks leave ch1, only when the
+        spend is in a block. gettxout(funding, include_mempool=False) answering nothing does not say so: a
+        node answers nothing for every output of an unconfirmed transaction, and a rollover's child takes
+        locks before its rollover confirms. So "in a block" needs the spender found in a block (`found`,
+        from find_spend_at: its depth), or, with no spender found, that the watcher saw this funding
+        confirmed while it was unspent (fund_confirmed) and the confirmed set no longer has it."""
+        if self.rpc.gettxout(p.funding_txid, p.funding_vout, False) is not None:
+            return False                            # still in the confirmed set: any spend of it is in the mempool
+        if found is not None:
+            return found[1] >= 1
+        return bool(oc.fund_confirmed)
 
     def _pays_ch2(self, new: OutChannel, tx: Tx) -> bool:
         """`tx` is a rollover into `new`: two outputs, the second to its script. Only a transaction the
@@ -2291,18 +2549,21 @@ class RouteHub:
             new.params, new.refund_hex = p.to_dict(), p.refund_tx(int(new.secret, 16)).hex()
         return True
 
-    def _next_funded(self, oc: OutChannel, tx: Tx) -> bool:
+    def _next_funded(self, oc: OutChannel, tx: Tx) -> Optional[int]:
         """`tx`, which spent this ch2's funding, is a rollover into the next ch2 written ahead
-        (`oc.next`): the attempt last asked for, or an earlier one under the same key."""
+        (`oc.next`), the attempt last asked for or an earlier one under the same key: the amount it paid
+        the provider, else None. AGP-088: read off the transaction, not `oc.signed` (an earlier attempt
+        is at another amount than the one last asked for)."""
         if not oc.next:
-            return False
+            return None
         new = OutChannel(**oc.next)
         if not self._pays_ch2(new, tx):
-            return False
+            return None
         with self.out.lock:
             oc.next = asdict(new)
             self.out.save()
-        return True
+        p = oc.p()
+        return max(0, p.capacity - p.payer_fee - tx.outputs[1].value)
 
     def _rollover_gone(self, oc: OutChannel, p: ChannelParams) -> Optional[list]:
         """A rollover child's funding output is not in the UTXO set nor the mempool (AGP-053). The
@@ -2332,9 +2593,10 @@ class RouteHub:
             ev = {"event": "ch2_rollover_vanished", "provider": oc.origin, "chan": p.channel_id, "parent": oc.rolled_from}
             self.events.append(ev)
             return [ev]
-        tx = find_spend(self.rpc, ptxid, pvout, max(0, oc.opened_at - 6))
-        if tx is None or tx.txid() == p.funding_txid:
+        found = find_spend_at(self.rpc, ptxid, pvout, max(0, oc.opened_at - 6))
+        if found is None or found[0].txid() == p.funding_txid:
             return None
+        tx, depth = found
         spender = tx.txid()
         if len(tx.outputs) == 2 and tx.outputs[1].script_pubkey == p.spk:
             # AGP-085: another attempt at the same rollover, into this ch2's script, took the place of
@@ -2343,14 +2605,10 @@ class RouteHub:
             # starts again as that transaction's child, and the watcher opens it. Locks out on the old
             # outpoint are unpaid once the replacement confirms; until then it waits
             if oc.pending or oc.stale:
-                if self.rpc.gettxout(ptxid, pvout, False) is not None:
+                # (AGP-088: in a block by its depth, not by the parent's funding answering nothing)
+                if depth < 1:
                     return []
-                with self.out.lock:
-                    if oc.pending:
-                        oc.stale = oc.stale + [{**oc.pending, "voided": round(time.time(), 3), "why": "rollover replaced"}]
-                        oc.pending = {}
-                    self.out.save()
-                out = self._release_stale(oc)
+                out = self._release_rolled(oc, "rollover replaced")
             else:
                 out = []
             was = p.channel_id
@@ -2407,14 +2665,14 @@ class RouteHub:
             if t is None:
                 continue
             # ch1 first, as in _settled (AGP-073)
-            res = self._complete_ch1(lk["ch1"], lk["lockId"], t, via=f"ch2 close {tx.txid()}")
+            res = self._complete_ch1(lk["ch1"], lk["lockId"], oc, t, via=f"ch2 close {tx.txid()}")
             with self.out.lock:
                 oc.signed = max(oc.signed, lk["cum"])
-                if oc.pending and oc.pending.get("lockId") == lk["lockId"]:
+                if oc.pending and is_ch2_lock(oc.pending, lk["ch1"], lk["lockId"]):
                     oc.routed += lk["d"]
                     oc.max_lock = max(oc.max_lock, int(lk["d"]))
                     oc.pending = {}
-                oc.stale = [s for s in oc.stale if s["lockId"] != lk["lockId"]]
+                oc.stale = [s for s in oc.stale if not is_ch2_lock(s, lk["ch1"], lk["lockId"])]
                 self.out.save()
             out.append({"event": "secret_from_close", "provider": oc.origin, "lockId": lk["lockId"],
                         "close": tx.txid(), "ch1_completed": res is not None})

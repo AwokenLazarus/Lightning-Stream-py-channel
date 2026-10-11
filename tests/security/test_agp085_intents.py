@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
 import test_agp084_hub_leftovers as L  # noqa: E402  (errored_spend, rollover_req, down, code_of)
 
+from xbt402.x402_channel import MAX_KEPT_INTENTS  # noqa: E402
+
 
 class ReplacedIntent(unittest.TestCase):
     def test_a_replaced_intent_is_still_recorded_when_it_confirms(self):
@@ -43,11 +45,13 @@ class ReplacedIntent(unittest.TestCase):
         codes = [L.code_of(r.prov.rollover, L.rollover_req(r, 750)) for _ in range(12)]
         L.down(r.node, False)
         self.assertEqual(codes[-1], "channel_closing", codes)
-        self.assertEqual((len(r.st.extra["close_intents"]), codes.count("close_failed")), (8, 8), codes)
-        self.assertEqual(len({i["txid"] for i in r.st.extra["close_intents"]}), 8)
-        # the close still goes through, and is the channel's close
+        # AGP-088: one slot short of the bound, kept for the payee's own close
+        self.assertEqual((len(r.st.extra["close_intents"]), codes.count("close_failed")), (7, 7), codes)
+        self.assertEqual(len({i["txid"] for i in r.st.extra["close_intents"]}), 7)
+        # the close still goes through, and is the channel's close: the bound holds with it
         out = r.prov.close_channel(r.st.params.channel_id)
         self.assertEqual(r.st.closed_txid, out["txid"])
+        self.assertEqual(len(r.st.extra["close_intents"]), MAX_KEPT_INTENTS)
 
 
 if __name__ == "__main__":
