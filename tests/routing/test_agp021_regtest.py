@@ -23,7 +23,7 @@ from xbt402.route import AMSAT_PER_SAT, ROUTE_LOCK_PATH  # noqa: E402
 from xbt402.tx import Tx  # noqa: E402
 from xbt402.x402_channel import network_id  # noqa: E402
 
-BIN = os.environ.get("XBT_BIN", "$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2")
+BIN = os.environ.get("XBT_BIN", os.path.expanduser("~/lazarus-regtest/b1-xbt402/knots-29.4.2"))
 DD = os.path.join(ROOT, "run", f"agp021-{os.getpid()}")
 SAT = 100_000_000
 
