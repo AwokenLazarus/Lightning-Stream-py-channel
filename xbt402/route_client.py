@@ -150,7 +150,9 @@ class RoutePayer:
         second key is asked for and no second funding sent while the first is unresolved, whatever the
         hub or the wallet answered. A hub that has the channel already says duplicate_channel, which is
         the yes that was lost. The books are this RoutePayer's (it has no ledger). A ch1 recorded and
-        never funded that is too near its expiry is refused open_unresolved until `forget_unfunded`."""
+        never funded that is too near its expiry is set aside and derived again for the same key by
+        the same call, as the library client's (AGP-096; the sentence here said "refused
+        open_unresolved until `forget_unfunded`", which the shared function no longer does)."""
         st, rh, _ = self.http("GET", self.hub_url + HUB_ROUTE_PATH)
         if st != 402:
             raise ChannelError("bad_offer", f"hub answered {st}, expected 402")
@@ -167,9 +169,9 @@ class RoutePayer:
                 "expiry": self.ch.payer.params.expiry, **({"resumed": True} if rec is not None else {})}
 
     def forget_unfunded(self) -> bool:
-        """Drop a ch1 that was recorded and never funded (its key goes with it). Call it only when the
-        wallet shows no send to its script: `open` refuses open_unresolved when such a ch1 is too near
-        its expiry to fund. True if one was dropped."""
+        """Drop a ch1 that was recorded and never funded, and the earlier scripts kept for it (their
+        keys go with them). Call it only when the wallet shows no send to their scripts. Nothing needs
+        it to go on paying (AGP-096): it only tidies the book. True if one was dropped."""
         return self.cc.forget_unfunded(self.hub_url) > 0
 
     def refresh_hub(self):

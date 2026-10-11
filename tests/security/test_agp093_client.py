@@ -238,13 +238,20 @@ class Slack(unittest.TestCase):
         s["claim"], s["mode"] = 14 * PRICE * 1000, 2
         self.assertEqual(r.get(), "bad_offer")
 
-    def test_hole_two_forged_refusals_do_not_end_the_channel(self):
-        """HOLE (Low, the remainder of the audit's item 9 for someone between payer and provider). A
-        402 is unsigned, and the client takes one as the provider's word that the request was not
-        charged (_refused). Whoever sits between lets the provider serve a paid request and answers
-        the payer with a bare 402: the charge is real and the payer has taken its quote off the
-        books. The channel's one call of slack absorbs that once; the second time every call is
-        bad_offer, for good."""
+    def test_limit_two_forged_refusals_end_the_channel(self):
+        """LIMIT (Low; the audit wrote it as test_hole_two_forged_refusals_do_not_end_the_channel,
+        AGP-096 judged it a limit and AGP-101 decided so: the name and the last assertion are turned
+        round, nothing else is changed). A 402 is unsigned, and the client takes one as the provider's
+        word that the request was not charged (_refused). Whoever sits between lets the provider
+        serve a paid request and answers the payer with a bare 402: the charge is real and the payer
+        has taken its quote off the books. The channel's one call of slack absorbs that once; the
+        second time every call is bad_offer, and the payer closes the channel at what it signed.
+
+        Why no rule fixes it (as xbt-rs agp093_client.rs, where the run is): for the channel to go on
+        the payer must take the hidden charge onto its books on an unsigned word, and then a seller
+        that serves nothing and answers every paid request with a 402 is owed a quote for each
+        (review M3, test_agp090_client). Telling the two apart needs a signed refusal, a change of the
+        protocol. Whoever can forge an answer can also drop every answer."""
         s = {"forge": 0, "last": None}
 
         def edit(path, req, headers, forward):
@@ -266,8 +273,10 @@ class Slack(unittest.TestCase):
         s["forge"] = 1
         out = [r.get() for _ in range(12)]
         charged = r.prov.ledger.channels[ch.payer.params.channel_id].spent_msat // (PRICE * 1000)
-        self.assertIn(200, out[1:], f"after a second forged refusal no call succeeds: {out}; the provider charged {charged} "
-                                    f"calls, the payer kept {len(ch.receipts)} answers")
+        self.assertEqual(out[1:], ["bad_offer"] * 11, f"after a second forged refusal a call got another answer: {out}; "
+                                                      f"the provider charged {charged} calls, the payer kept "
+                                                      f"{len(ch.receipts)} answers")
+        self.assertEqual((charged, len(ch.receipts)), (9, 7), "one unseen call each time")
 
     def test_ok_a_402_cannot_roll_the_state_back_or_move_the_seq(self):
         s, r = self.greedy()

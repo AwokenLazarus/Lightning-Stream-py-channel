@@ -604,7 +604,13 @@ class RoutedOpen(unittest.TestCase):
         out = pay.open()
         self.assertEqual((out.get("resumed"), len(fund.sends), pay.ch.stage), (True, 1, "open"))
 
-    def test_agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten(self):
+    def test_agp094_a_keyed_ch1_too_old_to_fund_is_derived_again_and_funded_once(self):
+        """AGP-101 rewrote this test; it was test_agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_
+        it_is_forgotten and failed on the wave 5 branch, where AGP-094 and AGP-096 met. B1's routed
+        client opens ch1 through XbtChannelClient._ensure_open, so it has the library client's rule
+        (AGP-096): a keyed channel too near its expiry to fund is set aside and derived again for
+        the same key by the same call, and nothing waits for forget_unfunded. (xbt-rs RoutePayer has
+        an open of its own and still refuses open_unresolved there: the two differ.)"""
         node, hub, seen, fund, pay = self.rig()
         self.assertFalse(pay.forget_unfunded(), "nothing recorded yet")
         fund.refuses = True
@@ -612,17 +618,18 @@ class RoutedOpen(unittest.TestCase):
         rec = pay.cc.channels[R.HUB]
         self.assertEqual((rec.stage, rec.payer.params.funding_txid, len(fund.sends)), ("keyed", "", 0), "recorded, unfunded")
         fund.refuses = False
-        # the same key is funded by the next open for as long as the hub would still open it ...
-        key = rec.payer.params.payer_pub
-        # ... and past that it is refused until the owner says the wallet shows no send to it
+        key, script = rec.payer.params.payer_pub, rec.payer.params.script
+        # past the blocks a funding needs, the same call derives ch1 again and funds that, once
         node.height = rec.payer.params.expiry
-        self.assertEqual([L.code_of(pay.open) for _ in range(2)], ["open_unresolved"] * 2)
-        self.assertEqual(len(fund.sends), 0)
-        node.height = 1000
+        self.assertEqual([L.code_of(pay.open) for _ in range(2)], [""] * 2)
+        p = pay.ch.payer.params
+        self.assertEqual((len(fund.sends), pay.ch.stage, p.payer_pub), (1, "open", key), "one funding, under the key issued first")
+        self.assertNotEqual(p.script, script)
+        # the script the wallet was asked to fund is kept (its fund call may have sent) until forgotten
+        self.assertEqual([c.payer.params.script for c in pay.cc.unfunded[R.HUB]], [script])
         self.assertTrue(pay.forget_unfunded())
         self.assertFalse(pay.forget_unfunded())
-        out = pay.open()
-        self.assertTrue("resumed" not in out and pay.ch.payer.params.payer_pub != key and len(fund.sends) == 1)
+        self.assertEqual((pay.open().get("resumed"), len(fund.sends)), (True, 1))
 
     def test_agp094_a_keyed_ch1_is_funded_once_by_the_next_open(self):
         node, hub, seen, fund, pay = self.rig()

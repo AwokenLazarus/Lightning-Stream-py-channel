@@ -126,12 +126,43 @@ As xbt-rs (its README, same heading); `XbtChannelClient`, `funding.py` and `sign
 - **`ChannelSigner` keeps the keys it issued** and binds one key to each channel that pays it.
 
 Stated limits, as xbt-rs: a refusal (402) is not signed, so a second charge hidden behind a forged
-refusal ends the channel with `bad_offer` (`test_hole_two_forged_refusals_do_not_end_the_channel`
-still fails and states it); a provider is believed for one quote per paid request that got no
-receipt. B1's client keeps no ledger, so "a request is counted before it leaves" is Rust only.
+refusal ends the channel with `bad_offer` (`test_limit_two_forged_refusals_end_the_channel`, which
+AGP-101 turned round from the audit's `test_hole_...`: see below); a provider is believed for one
+quote per paid request that got no receipt. B1's client keeps no ledger, so "a request is counted
+before it leaves" is Rust only.
 
 Tests: `tests/security/test_agp096_client.py` (14) and the audit's `test_agp093_client.py`.
 Changed: two tests in `test_agp090_client.py` pinned the stop at a stale keyed channel.
+
+## Fix wave 5 leftover (AGP-101)
+
+Tests and words only; no code of B1 changed.
+
+- **The second forged refusal is a limit, not a hole.** `test_agp093_client.py`'s
+  `test_hole_two_forged_refusals_do_not_end_the_channel` is now
+  `test_limit_two_forged_refusals_end_the_channel` and asserts what happens: after the second charge
+  hidden behind a forged 402 every call is `bad_offer` (the provider served nine calls, the payer
+  holds seven answers), and the payer closes at what it signed. The one small rule that would let
+  the channel go on (a refused request stays among the unanswered ones) was run in xbt-rs: it makes
+  `test_a_provider_that_refuses_every_call_cannot_claim_them` (review M3) fail there, because a seller
+  that serves nothing is then owed a quote for every 402 it answers. Telling that seller from a
+  wronged one needs a signed refusal, a change of the protocol.
+- **A funding the signer made that the client never heard of** (xbt-rs README, same heading) does
+  not exist here as a path: `ChannelSigner.fund` and the client's `fund` are the embedder's bare
+  callable, which keeps no record to ask, and `SignerSocketAdapter.fund` calls `xbt402_fund`, a
+  method neither signer serves. What B1 does when its `fund` raises after it sent is unchanged and
+  measured: the retry pays the same script a second time (two sends, one script, one key). The
+  key is on the books, so both outputs are refundable after the expiry; the client holds a refund
+  for the second only. An embedder whose `fund` can fail after it sent must make it answer the send
+  it made when asked again for the same address.
+
+- **One test of AGP-094 met AGP-096 on the wave 5 branch and failed.** B1's routed client opens ch1
+  through `XbtChannelClient._ensure_open`, so a keyed ch1 too near its expiry is derived again and
+  funded by the same call (AGP-096's rule), where AGP-094's test pinned `open_unresolved` until
+  `forget_unfunded`. The test now states the merged rule
+  (`test_agp094_a_keyed_ch1_too_old_to_fund_is_derived_again_and_funded_once`) and the two
+  docstrings in `route_client.py` say the same. xbt-rs `RoutePayer` has an open of its own and still
+  refuses `open_unresolved` there.
 
 ## Fix wave 5, the hub and the routed client (AGP-094)
 
