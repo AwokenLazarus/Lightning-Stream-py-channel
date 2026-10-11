@@ -264,7 +264,8 @@ class Binding(unittest.TestCase):
         self.assertEqual(rec["bodyHash"], body_hash(out))
         c = XbtChannelClient(prov.network, lambda a, s: ("", 0), lambda: 1000)
         from xbt402.x402_channel import ClientChannel
-        ch = ClientChannel(payer=Payer(params, payer.secret), origin=O, accepted=prov.requirements(PRICE), price=PRICE)
+        ch = ClientChannel(payer=Payer(params, payer.secret), origin=O, accepted=prov.requirements(PRICE), price=PRICE,
+                           seq=1, unanswered_msat=PRICE * 1000)    # the one call this client sent (AGP-090)
         ch.payer.sign_state(546)            # the state this call's receipt acknowledges
         resp = unb64json(hdrs["PAYMENT-RESPONSE"])
         c._receipt(ch, resp, "GET", "/v1/q", b"", (200, out))

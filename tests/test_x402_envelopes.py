@@ -54,7 +54,9 @@ class Envelopes(unittest.TestCase):
         st, h, out = self.paid()
         good = xp.unb64json(h["PAYMENT-RESPONSE"])
         client = xp.XbtChannelClient(self.prov.network, None, lambda: 1000)
-        ch = xp.ClientChannel(self.payer, "http://api.test", self.acc, price=PRICE)
+        # the one call this client sent (AGP-090: a receipt is for the seq just sent)
+        ch = xp.ClientChannel(self.payer, "http://api.test", self.acc, price=PRICE, seq=good["extra"]["receipt"]["seq"],
+                              unanswered_msat=PRICE * 1000)
         client._receipt(ch, good, "GET", "/v1/x", b"", (st, out))
         self.assertEqual(ch.receipts[-1], good["extra"]["receipt"])
         for tamper in (lambda d: d["extra"].__setitem__("chargedAmount", "1"),
