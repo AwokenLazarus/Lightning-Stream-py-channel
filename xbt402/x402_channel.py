@@ -158,6 +158,83 @@ def no_fragment(url: str) -> str:
 FRAGMENT_REFUSED = b"request target with a # fragment"      # the body of the provider's 400
 
 
+_USERINFO_OK = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!$&'()*+,;=:%")
+_HOST_OK = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+
+
+def _host_spelled_one_way(host: str) -> bool:
+    """A host as request_url returns it that every URL parser and resolver reads as written: see
+    sendable_url. (An IPv4-mapped IPv6 literal is the one place this differs from xbt-rs: each
+    language accepts the form its own standard library prints.)"""
+    if host.startswith("["):
+        try:
+            return host.endswith("]") and str(ipaddress.IPv6Address(host[1:-1])) == host[1:-1]
+        except ValueError:
+            return False
+    if not host or not set(host) <= _HOST_OK:
+        return False
+    # the WHATWG rule for "this host is an IPv4 address", which a resolver follows too: its last
+    # label is a number
+    last = host.removesuffix(".").rsplit(".", 1)[-1]
+    number = (last != "" and all(c in "0123456789" for c in last)) or \
+             (last.startswith("0x") and all(c in "0123456789abcdef" for c in last[2:]))
+    if not number:
+        return True
+    try:
+        return str(ipaddress.IPv4Address(host)) == host
+    except ValueError:
+        return False
+
+
+def sendable_url(url: str) -> str:
+    """Refuse a URL whose host could be read two ways; return it unchanged otherwise.
+
+    The rule (AGP-105 in xbt-rs, wire::sendable_url; fourth audit list 1 items 1 and 15; ported
+    here by AGP-107): the host a payer keys its book by and binds a payment to is the host the
+    request is sent to. request_url decides the host; a transport parses the string again and
+    resolves the name, and `http://127.1/`, `http://2130706433/` and `http://0x7f.0.0.1/` are
+    127.0.0.1 to a resolver and three more keys in the book: a seller that refused every funded
+    open was funded once per spelling. Refused, before anything is signed, funded or sent:
+
+    - not `scheme://...`; a backslash, whitespace or a control character anywhere;
+    - a second `@`, or userinfo with a character outside RFC 3986's set for it;
+    - an empty host, or a host with a character other than a letter, digit, `.`, `-` or `_` (so no
+      percent-encoding and no non-ASCII name);
+    - a host whose last label is a number and that is not a dotted quad in its usual form;
+    - a bracketed host that is not an IPv6 address in its usual form, or with anything but a port
+      after it; a port that is not a decimal number below 65536.
+
+    Case, a default port, a port's leading zeros and a trailing dot on a name are not refused (a
+    trailing dot is still its own key: a stated limit). xbt-rs also rebuilds the URL it hands its
+    transport, because that transport's parser reads a backslash another way; urllib reads these
+    strings as request_url does, so the caller's string is sent as it is."""
+    def refuse(why):
+        raise ChannelError("bad_request", f"the URL {why}: its host could be read two ways, so nothing is paid or sent")
+    if any(c == "\\" or c.isspace() or ord(c) < 0x20 or 0x7F <= ord(c) < 0xA0 for c in url):
+        refuse("has a backslash, a space or a control character")
+    split = split_scheme(url)
+    if split is None:
+        refuse("is not scheme://host")
+    rest = split[1].split("#", 1)[0]
+    ends = [i for i in (rest.find("/"), rest.find("?")) if i >= 0]
+    authority = rest[:min(ends) if ends else len(rest)]
+    userinfo, at, hostport = authority.partition("@")
+    if not at:
+        hostport = authority
+    elif "@" in hostport:
+        refuse("has a second @")
+    elif not set(userinfo) <= _USERINFO_OK:
+        refuse("has userinfo outside RFC 3986")
+    _, host, port, _ = request_url(url)
+    if hostport.startswith("[") and ("]" not in hostport or hostport.split("]", 1)[1][:1] not in ("", ":")):
+        refuse("has something other than a port after a bracketed host")
+    if not _host_spelled_one_way(host):
+        refuse("has a host that is not a plain name or an address in its usual form")
+    if port and not (all(c in "0123456789" for c in port) and int(port) < 65536):
+        refuse("has a port that is not a number below 65536")
+    return url
+
+
 def canonical_origin(url: str) -> str:
     """The origin of an absolute URL as request_url reads it: lowercase scheme and host, no userinfo,
     and no port when it is the scheme's default. "" for a bare target.
@@ -2438,7 +2515,7 @@ class XbtChannelClient:
         Refused: below the last signed state (bad_amount), above the channel's capacity (exhausted),
         above the receipted spend plus one call at the pinned price (too_expensive), over the daily
         budget (budget). Under the channel's minimum state with nothing signed, the call goes unsigned."""
-        no_fragment(url)
+        sendable_url(no_fragment(url))
         origin, path = split_url(url)
         own = self._extra_headers(headers)
         ch = self.channels.get(origin)
@@ -2582,7 +2659,7 @@ class XbtChannelClient:
     def request_conditional(self, method: str, url: str, body: bytes = b""):
         """Pay-on-preimage: sign a hash-locked increment, receive cipher+k, upgrade if k checks."""
         from .conditional import ConditionalParams, decrypt, sha256
-        no_fragment(url)
+        sendable_url(no_fragment(url))
         origin, path = split_url(url)
         ch = self.channels.get(origin)
         status, rh, out = self.http(method, url, body)

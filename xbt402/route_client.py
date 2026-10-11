@@ -184,7 +184,7 @@ class RoutePayer:
     def shard(self, url: str, method: str = "POST") -> Shard:
         """Start a metered session on a routed path: verify the provider's signed price quote and
         first invoice (the hub never touches either)."""
-        x402_channel.no_fragment(url)
+        x402_channel.sendable_url(x402_channel.no_fragment(url))
         c = secrets.randbelow(ecc.N - 1) + 1
         st, rh, out = self.http(method, url, b"", {"ROUTE-CLIENT": ecc.pubkey(c).hex()})
         if st != 402:

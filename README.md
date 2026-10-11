@@ -164,6 +164,34 @@ Tests and words only; no code of B1 changed.
   docstrings in `route_client.py` say the same. xbt-rs `RoutePayer` has an open of its own and still
   refuses `open_unresolved` there.
 
+## Review close-out (AGP-107) and fix wave 6 in the hub (AGP-105)
+
+The limits of this reference are in `docs/LIMITS.md`, which points at the Rust workspace's file for
+everything the two share. After fix wave 6 three of the fourth audit's tests were still red here.
+Each got one decision (xbt-rs `README.md`, "Review close-out", has the rule for a limit test):
+
+| test (as the audit named it) | audit item | does B1 have the code path | decision |
+|---|---|---|---|
+| `test_agp102_client` `Origin.test_hole_a_refusing_seller_is_funded_once_however_its_host_is_spelled` | 15 (and 1) | yes: the number forms of an IPv4 address resolve to one host and were four keys in the book | ported: `x402_channel.sendable_url`, as xbt-rs `wire::sendable_url` (AGP-105), called by `request`, `request_conditional` and the routed client's `shard`. Those spellings are refused before anything is asked or funded. The test is `test_limit_a_refusing_seller_is_funded_once_for_each_spelling_that_is_not_refused`: it pins the refusal and the limit that is left, a trailing dot on a name |
+| `test_agp102_client` `ForgedRefusal.test_hole_after_the_close_that_follows_two_forged_refusals_...` | 15 | yes, the same | limit (`test_limit_..._every_call_is_refused_until_the_record_is_removed`): `close()` leaves the record |
+| `test_agp102_hub` `RoutedOpen.test_a_ch1_funding_that_failed_after_it_was_sent_is_not_sent_again` | 6 | yes, and not the fix: `fund` is a bare callable and the routed client opens ch1 through the library client's `_fund_keyed` | limit (`test_limit_a_ch1_funding_that_failed_after_it_was_sent_is_sent_again_by_every_open`). xbt-rs asks its wallet whether it keeps a record of its sends; here that would be a new contract for every embedder's hook, and the control beside the test requires a `fund` that raised to be asked again |
+
+The backslash URL of the audit's item 1 never split here: `urllib` reads it as the book does
+(`Origin.test_limit_what_the_canonical_origin_unifies`). `sendable_url` refuses it all the same,
+with whitespace, a second `@`, percent-encoding in a host and a port that is no number, so that an
+embedder with another HTTP library is not handed such a string. New tests:
+`tests/security/test_agp107_client.py` (4), the first of which runs 9,723 authorities and checks
+that whatever the rule lets through is read alike by the book, by `urllib` and by the resolver.
+
+From fix wave 6 (AGP-105, `xbt402/hub.py`; the tests are `tests/security/test_agp105_hub.py`):
+
+- The hub's question to a provider about a lock is bounded by `reveal_timeout`, and nothing waits
+  for a provider inside ch1's ledger lock.
+- A provider that did not answer that question is set aside until it answers the watcher, which
+  asks one such provider per tick.
+- A spend the watcher found in a block is looked for in that block while it waits for depth, not
+  from the ch2's first block.
+
 ## The hub's returns (AGP-104)
 
 Before this, two kinds of coin the hub got back stayed on keys only its state files know: the hub's

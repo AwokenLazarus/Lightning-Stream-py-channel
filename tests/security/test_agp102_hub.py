@@ -1,7 +1,12 @@
 """AGP-102 fourth closure audit, area HUB (the hub and the routed client): tests written by the
 auditor on the harness of test_agp093_hub.py (W) and routehelp (world). Nothing here is a fix.
 
-Tests named after a rule fail today (each is a hole of the audit's list 1); `control_` tests pass.
+Tests named after a rule failed when the audit wrote them (each is a hole of the audit's list 1);
+`control_` tests pass.
+
+AGP-107 (close-out): every test here passes. `RoutedOpen`'s hole test, the one still red after fix
+wave 6, is a `test_limit_` test now: it says which item and which sentence of `docs/LIMITS.md` it
+pins, passes while the limit holds and fails when someone lifts it.
 xbt-rs has the same tests under the same names (crates/xbt402-interop/tests/agp102_hub.rs and
 crates/xbt402/tests/agp102_route_client.rs).
 """
@@ -177,21 +182,29 @@ class RoutedOpen(unittest.TestCase):
         pay = R.payer(node, net, signer=ChannelSigner(fund=fund))
         return node, hub, fund, pay
 
-    def test_a_ch1_funding_that_failed_after_it_was_sent_is_not_sent_again(self):
-        # HOLE (Medium by the audit's scale: coins left in a script until its expiry with no refund held
-        # and no outpoint on the books, by the owner's own wallet failing, not by a counterparty; left
-        # from before: the half of list 1 item 5's "from reading" bullet that AGP-094 did not close, its
-        # found-not-fixed 5, and AGP-101's found-not-fixed 1, which measured two sends).
-        # `fund` is a bare callable in B1, so the client cannot ask whether the first call sent
-        # (x402_channel.py `_fund_keyed`): every `open` after a `fund` that raised sends ch1's capacity
-        # again, to the same script, with no bound.
+    def test_limit_a_ch1_funding_that_failed_after_it_was_sent_is_sent_again_by_every_open(self):
+        # LIMIT (AGP-107; the fourth audit's list 1 item 6, B1's half, written down by AGP-105). The
+        # audit wrote this as test_a_ch1_funding_that_failed_after_it_was_sent_is_not_sent_again
+        # (Medium by its scale: coins left in a script until its expiry with no refund held and no
+        # outpoint on the books, by the owner's own wallet failing, not by a counterparty).
+        # xbt-rs fixed it in its routed client: a wallet says whether it keeps a record of its sends
+        # (`Wallet::knows_its_sends`), and one that cannot say is not asked twice. B1 has the code
+        # path and not the fix: `fund` is a bare callable, the routed client opens ch1 through the
+        # library client's `_fund_keyed`, and the control below and the library client's own
+        # test_limit_a_fund_that_raises_after_it_sent_... require a `fund` that raised to be asked
+        # again. Porting the rule means a new contract for every embedder's hook, so it is stated:
+        # "In the Python reference a retry after a `fund` call that raised pays the same script
+        # again: its wallet hook cannot say whether the first call sent" (docs/LIMITS.md).
+        # The test fails when a second open no longer sends: then restore the audit's assertion
+        # (assertLessEqual(len(fund.sends), 1)).
         node, hub, fund, pay = self.rig(fail=3)
         errors = [L.code_of(pay.open) for _ in range(3)]
         scripts = {a for a, _ in fund.sends}
-        self.assertLessEqual(len(fund.sends), 1,
-                             f"three calls to open ({errors}) sent ch1's funding {len(fund.sends)} times, "
-                             f"{sum(s for _, s in fund.sends)} sat in all, to {len(scripts)} script(s); the books hold no outpoint "
-                             f"({pay.cc.channels[R.HUB].payer.params.funding_txid!r}) and no refund for any of them")
+        self.assertEqual((errors, len(fund.sends), len(scripts), sum(s for _, s in fund.sends)),
+                         (["wallet_error"] * 3, 3, 1, 600_000),
+                         "the limit is lifted or moved: three opens after a fund that raised no longer send ch1's "
+                         "funding three times to one script")
+        self.assertEqual(pay.cc.channels[R.HUB].payer.params.funding_txid, "", "and the books hold no outpoint for any of them")
 
     def test_control_a_fund_that_fails_before_it_sends_is_asked_again_and_sends_once(self):
         node, hub, fund, pay = self.rig(fail=0)

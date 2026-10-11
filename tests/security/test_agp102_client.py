@@ -2,8 +2,13 @@
 (AGP-096, AGP-101). As xbt-rs `crates/xbt402/tests/agp102_client.rs` (same names where B1 has the
 code). No fix is in this file.
 
-`test_hole_*` fail today and state the rule that should hold. `test_control_*` are the honest path
-in the same rig and `test_limit_*` pin a number a reader must be told; both pass.
+`test_hole_*` failed when the audit wrote them and state the rule that should hold.
+`test_control_*` are the honest path in the same rig and `test_limit_*` pin a number a reader must
+be told; both pass.
+
+AGP-107 (close-out): every test here passes. The two `test_hole_*` tests that were still red after
+fix wave 6 are `test_limit_*` tests now: each says which item and which sentence of
+`docs/LIMITS.md` it pins, passes while the limit holds and fails when someone lifts it.
 
   cd tests/security && ~/xbt-rnd/b1/.venv/bin/python -B -m unittest test_agp102_client
 """
@@ -50,20 +55,25 @@ class ForgedRefusal(unittest.TestCase):
         self.assertEqual((r.get(), r.get()), (402, "bad_offer"))
         return r
 
-    def test_hole_after_the_close_that_follows_two_forged_refusals_the_next_call_opens_a_new_channel(self):
-        """HOLE (Low; a public sentence that is not true of the library). AGP-101's sentence says that
-        at the second forged refusal the payer "closes the channel at what it signed and opens
-        another". The client does neither by itself: every call is bad_offer until the embedder calls
-        close(), and close() leaves the closed channel on the book as "open", so every call after it
-        is refused too, until the embedder also deletes the record."""
+    def test_limit_after_the_close_that_follows_two_forged_refusals_every_call_is_refused_until_the_record_is_removed(self):
+        """LIMIT (AGP-107; the fourth audit's list 1 item 15, first bullet: "correct the sentence").
+        The audit wrote this as test_hole_..._the_next_call_opens_a_new_channel, against AGP-101's
+        sentence that at the second forged refusal the payer "closes the channel at what it signed
+        and opens another". The client does neither by itself: every call is bad_offer until the
+        embedder calls close(), and close() leaves the closed channel on the book as "open", so
+        every call after it is refused too, until the embedder also deletes the record (the control
+        below). The sentence is corrected and this is what it now says (docs/LIMITS.md, channel and
+        transport): "after the second, every call on that channel is refused until its owner closes
+        it and removes its record". The test fails when close() removes the record or the client
+        opens another channel by itself: then restore the audit's assertion (a 200 after the close)."""
         r = self.twice()
         chan = r.c.channels[O].payer.params.channel_id
         self.assertFalse(r.prov.ledger.channels[chan].closed_txid, "control: the client closed nothing by itself")
         r.c.close(O)
         after = [r.get() for _ in range(3)]
-        self.assertIn(200, after, f"after the close every call is still refused: {after}; the book still holds "
-                                  f"{r.c.channels[O].payer.params.channel_id} at stage {r.c.channels[O].stage!r}, "
-                                  f"{len(r.sends)} channel(s) funded")
+        self.assertEqual((after, r.c.channels[O].payer.params.channel_id, len(r.sends)), (["bad_offer"] * 3, chan, 1),
+                         "the limit is lifted: after the close a call was served, the record is gone or a second "
+                         "channel was funded")
 
     def test_control_after_the_close_and_the_embedder_removing_the_record_the_next_call_opens_a_new_channel(self):
         r = self.twice()
@@ -121,24 +131,36 @@ class Origin(unittest.TestCase):
         p = urllib.parse.urlsplit(url)
         self.assertEqual((one(url), f"http://{p.hostname}:{p.port}"), ("http://127.0.0.1:27761", "http://127.0.0.1:27761"))
 
-    def test_hole_a_refusing_seller_is_funded_once_however_its_host_is_spelled(self):
-        """HOLE (Low, left from before; AGP-096 fixed the five spellings the audit named). The number
-        forms of an IPv4 address reach one server (the resolver reads them as the transport's connect
-        does) and are four keys in the book: a seller that refuses every funded open is funded once
-        per spelling, up to budget_sats. A trailing dot on a name is the same case."""
+    def test_limit_a_refusing_seller_is_funded_once_for_each_spelling_that_is_not_refused(self):
+        """LIMIT (AGP-107; the fourth audit's list 1 item 15, second bullet). The audit wrote this as
+        test_hole_a_refusing_seller_is_funded_once_however_its_host_is_spelled: the number forms of
+        an IPv4 address reach one server and were four keys in the book, so a seller that refuses
+        every funded open was funded four times (800,000 sat). AGP-107 ported xbt-rs's
+        `sendable_url` (AGP-105): those spellings are refused before anything is asked or funded.
+        What is left is the stated limit (docs/LIMITS.md, channel and transport): "a trailing dot on
+        a name is a separate origin, so a seller reached under both spellings can be funded once
+        per spelling, up to the payer's budget". The last assertion fails when the book reads the
+        dotted name as the same origin: then make it 1."""
         def edit(path, req, headers, forward):
             if path == OPEN_PATH and not (req or {}).get("preflight"):
                 return 400, {}, json.dumps({"error": "bad_funding", "detail": "no"}).encode()
             return forward()
         r = Rig(edit)
-        hosts = ["127.0.0.1", "127.1", "2130706433", "0x7f.0.0.1"]
-        self.assertEqual({socket.gethostbyname(h) for h in hosts}, {"127.0.0.1"}, "control: one host, as the transport connects")
-        for h in hosts:
+        forms = ["127.1", "2130706433", "0x7f.0.0.1", "%31%32%37.0.0.1", "127.0.0.1."]
+        self.assertEqual({socket.gethostbyname(h) for h in forms[:3]}, {"127.0.0.1"}, "control: one host, as the transport connects")
+        for h in ["127.0.0.1"] + forms:
             with self.assertRaises(ChannelError) as e:
                 r.c.request("GET", f"http://{h}:8402/v1/q")
-            self.assertEqual(e.exception.code, "bad_funding", h)
-        self.assertEqual(len(r.sends), 1, f"one seller, {len(r.sends)} channels funded ({r.c.opened_sats} sat): "
-                                          f"{sorted(r.c.channels)}")
+            self.assertEqual(e.exception.code, "bad_funding" if h == "127.0.0.1" else "bad_request", h)
+        self.assertEqual((len(r.sends), sorted(r.c.channels)), (1, ["http://127.0.0.1:8402"]),
+                         "the other spellings of the address are refused before anything is funded")
+        # the limit that is left: a trailing dot on a name
+        r = Rig(edit)
+        for o in (O, O + "."):
+            with self.assertRaises(ChannelError) as e:
+                r.c.request("GET", o + "/v1/q")
+            self.assertEqual(e.exception.code, "bad_funding", o)
+        self.assertEqual((len(r.sends), sorted(r.c.channels)), (2, [O, O + "."]), "the limit is lifted: one name, one channel")
 
 
 if __name__ == "__main__":
