@@ -73,3 +73,30 @@ Tests: `tests/security/test_agp081_closure_audit.py`.
 
 Details: `docs/routing.md` (the AGP-085 note). Tests: `tests/security/test_agp085_hub.py`,
 `tests/security/test_agp085_intents.py`.
+
+## Fix wave 4, the hub (AGP-088)
+
+The hub items of the second closure audit (AGP-087), as xbt-rs agp-088 (its README has the table).
+
+- **A lock on ch1 is the lock of one ch2.** It records that ch2 (`ch2`, its payer key) and is
+  completed or released by its lockId AND that ch2 (`hub.is_lock`), never by the lockId alone, which
+  is the provider's choice. A ch2 does not take a lock under a lockId ch1 still holds written off
+  (`lock_held`, with the hub's view).
+- **"In a block" is not gettxout answering nothing** (a node answers nothing for an output of an
+  unconfirmed transaction too): it is the depth `find_spend_at` found the spender at
+  (`_spent_in_block`). The test node (`routehelp.RouteNode`) now reports a mined spend through
+  `getblock`, as a node does, and no longer through `gettxspendingprevout`.
+- **A rolled ch2 is watched until its rollover is in a block**, and refunded at its expiry if it never
+  comes. **A refill is funded when this node shows the close**, and `committed_sat` counts a ch2
+  until then (`closing` on the provider's word counts; archived records count).
+- **The routed client** adopts a completion only with the `t + r` that opens that lock (the view's
+  `secret`), and at most `max_held_locks` (2) holds; at that many it pre-signs nothing and asks for
+  the hub's view (`POST /x402/route/view`). Trust left: `max_held_locks - 1` locks.
+- **Kept intents are bounded for closes too** (`intents_full`): once one slot is left a rollover is
+  refused and the state no longer moves, so every close is the same transaction.
+- **Smaller:** the locks a confirmed spend did not pay leave ch1 before the ch2 record is final; a
+  lock pending on a ch2 that is no longer open is written off; a ch2 with a pending lock is not
+  replaced (`connect`: `lock_pending`) nor switched away from; an adopted earlier rollover attempt's
+  event carries what it paid.
+
+Tests: `tests/security/test_agp088_hub.py` (13), `test_agp087_hub_a.py`, `test_agp087_hub_b.py`.

@@ -36,6 +36,22 @@
 > one, which is then the channel's close (AGP-084's limit "a superseded intent ... is not recorded" is
 > closed). A rollover is refused `channel_closing` once 8 replaced ones are unresolved; a close is not.
 > Tests `tests/security/test_agp085_hub.py`, `tests/security/test_agp085_intents.py`.
+> Since AGP-088: (1) a ch1 lock records the ch2 it went over (`ch2`, that ch2's payer key) and is
+> completed or released by its lockId and that ch2, never by the lockId alone; a ch2 does not take a
+> lock under a lockId ch1 still holds written off (400 `lock_held`, with the view). (2) "Confirmed" is
+> the depth the spender was found at (`find_spend_at`: 0 in the mempool), never gettxout answering
+> nothing, which a node also answers for an output of an unconfirmed rollover. (3) A `rolled` ch2 is
+> watched until its rollover is in a block and refunded at expiry if it never comes; a refill is funded
+> when the hub's own node shows the close (`refillError: deferred...` until then), and a ch2 counts
+> against `liquidity_cap_sat` until its funding is seen spent, wherever its record is. (4) The hub's
+> view of ch1 carries `secret`, the t + r of the lock at `bestCum`; `POST /x402/route/view` (ch1's
+> PAYMENT-SIGNATURE, an empty body) answers the view. `RoutePayer` adopts a completion only with a
+> `secret` that opens that lock's T1 and at most `max_held_locks` (2) holds; at that many it pre-signs
+> nothing and asks for the view. (5) A channel keeps at most 8 unresolved spends: once one slot is left
+> a rollover is refused and the state stops moving (a close's payload, `/x402/verify`). (6) A lock
+> pending on a ch2 that is no longer open is written off by the watcher; a ch2 with a pending lock is
+> neither replaced (`connect`: `lock_pending`) nor switched away from. Tests
+> `tests/security/test_agp088_hub.py`.
 
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.
