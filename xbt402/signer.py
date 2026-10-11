@@ -23,26 +23,42 @@ class ChannelSigner:
                  policy: Optional[Callable[[str, int], None]] = None):
         self.fund_fn, self.policy = fund, policy
         self._secrets = {}       # chan or pending:<origin> -> int
+        self._issued = {}        # payer pub -> (origin, secret): every key issued, for as long as this lives
         self._params = {}        # chan -> ChannelParams
         self._origins = {}       # origin -> chan
         self._signed = {}        # chan -> highest amount
 
     def new_key(self, origin: str) -> str:
-        secret = secrets.randbelow(ecc.N - 1) + 1
-        self._secrets[f"pending:{origin}"] = secret
-        return ecc.pubkey(secret).hex()
+        """A payer key for a channel to `origin`.
 
-    def attach(self, origin: str, params: ChannelParams) -> str:
+        The rule for issued keys (AGP-096; as xbt-rs LocalSigner and xbt-signer's issue_key): a key
+        this signer issued is never replaced or dropped. Asking again answers the key already issued
+        for `origin` while no channel is bound to it: the caller may be retrying an open whose
+        funding failed, and coins may already pay the first answer. It used to make a new key each
+        time and forget the one before."""
         key = f"pending:{origin}"
         if key not in self._secrets:
-            raise ChannelError("bad_key", "call new_key before attach")
-        secret = self._secrets.pop(key)
-        if ecc.pubkey(secret).hex() != params.payer_pub:
+            self._secrets[key] = secrets.randbelow(ecc.N - 1) + 1
+            self._issued[ecc.pubkey(self._secrets[key]).hex()] = (origin, self._secrets[key])
+        return ecc.pubkey(self._secrets[key]).hex()
+
+    def attach(self, origin: str, params: ChannelParams) -> str:
+        """Bind the key issued for `origin` to the funded channel. One key can be bound to more than
+        one channel (a script that was derived again and the one before it); binding a channel again
+        keeps what was signed on it."""
+        key = f"pending:{origin}"
+        issued = self._issued.get(params.payer_pub)
+        if issued is None or issued[0] != origin:
+            if issued is None and key not in self._secrets:
+                raise ChannelError("bad_key", "call new_key before attach")
             raise ChannelError("bad_key", "attached params do not match issued key")
+        secret = issued[1]
+        if self._secrets.get(key) == secret:
+            del self._secrets[key]       # used: the next open of this origin gets a key of its own
         self._secrets[params.channel_id] = secret
         self._params[params.channel_id] = params
         self._origins[origin] = params.channel_id
-        self._signed[params.channel_id] = 0
+        self._signed.setdefault(params.channel_id, 0)
         return params.channel_id
 
     def _secret(self, chan: str) -> int:

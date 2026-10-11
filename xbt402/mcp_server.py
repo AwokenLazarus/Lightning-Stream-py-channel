@@ -35,7 +35,8 @@ def xbt402_pay(client, url: str, method: str = "GET", body: bytes = b"", max_sat
         body = b""
     if isinstance(body, str):
         body = body.encode()
-    origin = "/".join(url.split("/")[:3])
+    from .x402_channel import split_url
+    origin = split_url(url)[0]          # the key of the client's book (AGP-096: one origin per seller)
     price = int((client.channels.get(origin).accepted["amount"]
                  if origin in client.channels else max_sats))
     if price > max_sats:

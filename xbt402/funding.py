@@ -76,7 +76,8 @@ def open_expiry_floor(min_expiry: int, min_conf: int, close_margin: int) -> int:
 def open_expiry_blocks(want: int, min_expiry: int, max_expiry: int, min_conf: int, close_margin: int) -> int:
     """Blocks to expiry for a new channel: what the payer wants, at least open_expiry_floor, at most
     `maxExpiryBlocks - 1`. An offer whose window is narrower than the floor gets the top of its
-    window: the open preflight answers that before anything is funded."""
+    window here: the caller refuses it (offer_expiry_blocks), since a seller's yes to the preflight
+    is not a reason to fund a channel that expires at once."""
     return max(0, min(max(want, open_expiry_floor(min_expiry, min_conf, close_margin)), max_expiry - 1))
 
 
@@ -112,18 +113,46 @@ def offer_expiry_floor(extra: dict) -> int:
     return open_expiry_floor(min_expiry, min_conf, close_margin)
 
 
-def offer_expiry_blocks(extra: dict, want: int, owner_max: int = OWNER_MAX_EXPIRY_BLOCKS) -> int:
-    """open_expiry_blocks for an offer's `extra` (offer_expiry_terms), held to the owner's bound.
+def offer_retry_floor(extra: dict) -> int:
+    """The fewest blocks to expiry at which a payer still sends the funding of a channel it derived
+    earlier (a retry after a `fund` call that failed): minExpiryBlocks + minConf, plus the larger
+    half of closeMarginBlocks (as xbt-rs funding::offer_retry_floor).
 
-    The rule (AGP-090, review C2): how long a payer's coins are locked is the owner's number, never
-    only the seller's. Every term of open_expiry_floor comes from the offer, and so did the only cap
-    (maxExpiryBlocks): an offer with minExpiryBlocks 2,000,000 got a channel that refunds in 38
-    years. So the payer asks for at most `owner_max` blocks, and an offer whose floor is above that
-    is refused bad_offer here, before a key is made or anything is funded. Every payer that opens on
-    an offer comes through this function."""
+    The rule (AGP-096, audit item 6): a retry may use up to half of the time the offer allows a
+    funding to confirm, and the other half stays for the funding itself. The test used to be the
+    whole of open_expiry_floor, which is the very number a payer opens at when its own wish is below
+    it (1,153 against 1,008 with the reference provider), so a channel was too old to fund one block
+    after it was derived. Below this number the channel is derived again, never funded late."""
+    min_expiry, _, min_conf, close_margin = offer_expiry_terms(extra)
+    return open_expiry_floor(min_expiry, min_conf, close_margin - close_margin // 2)
+
+
+# The fewest blocks to expiry a payer funds on an offer, unless its owner asks for fewer: a day (as
+# xbt-rs funding::OWNER_MIN_EXPIRY_BLOCKS).
+OWNER_MIN_EXPIRY_BLOCKS = 144
+
+
+def offer_expiry_blocks(extra: dict, want: int, owner_max: int = OWNER_MAX_EXPIRY_BLOCKS) -> int:
+    """open_expiry_blocks for an offer's `extra` (offer_expiry_terms), held to the owner's bounds.
+
+    The rule (AGP-090, review C2; the lower side AGP-096, audit item 4): how long a payer's coins are
+    locked, and how long the channel they pay for lasts, are the owner's numbers, never only the
+    seller's. Every term of open_expiry_floor comes from the offer, and so did the only cap
+    (maxExpiryBlocks). From above: an offer with minExpiryBlocks 2,000,000 got a channel that refunds
+    in 38 years, so the payer asks for at most `owner_max` blocks, and an offer whose floor is above
+    that is refused. From below: an offer with maxExpiryBlocks 2 got a channel that expires in one
+    block, which no provider opens and which costs a funding fee and a refund fee, so the payer funds
+    nothing that lasts less than the offer's own floor or less than OWNER_MIN_EXPIRY_BLOCKS (or the
+    owner's `want`, if that is smaller). Both are refused bad_offer here, before a key is made or
+    anything is funded, and neither is clamped. Every payer that opens on an offer comes through
+    this function."""
     min_expiry, max_expiry, min_conf, close_margin = offer_expiry_terms(extra)
     blocks = open_expiry_blocks(min(want, owner_max), min_expiry, max_expiry, min_conf, close_margin)
     if blocks > owner_max:
         raise ChannelError("bad_offer", f"the offer needs {blocks} blocks to expiry and this payer locks its coins "
                                         f"for at most {owner_max}")
+    least = max(open_expiry_floor(min_expiry, min_conf, close_margin), min(want, OWNER_MIN_EXPIRY_BLOCKS))
+    if blocks < least:
+        raise ChannelError("bad_offer", f"the offer's window lets the channel last {blocks} blocks and this payer "
+                                        f"funds one only for {least} or more")
     return blocks

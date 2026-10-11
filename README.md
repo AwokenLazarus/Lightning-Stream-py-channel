@@ -85,7 +85,7 @@ As xbt-rs (its README, same heading); `XbtChannelClient` and `funding.py`.
   asked again on the next call and nothing is funded again; nothing is signed before `open`. A retry
   after a `fund` that raised pays the same script under the same key (`fund` is a bare callable, so
   the client cannot ask the wallet what it sent). A keyed channel too old to fund moves to
-  `unfunded` with its key (with a signer it stays: `open_unresolved`); `forget_unfunded` drops them.
+  `unfunded` and is derived again (changed by AGP-096, below).
 - **The owner bounds the expiry.** `offer_expiry_blocks(extra, want, owner_max=4032)`: an offer
   whose floor is above the bound is `bad_offer` before a key is made. `XbtChannelClient(...,
   max_expiry_blocks=4032)`.
@@ -101,6 +101,37 @@ Tests: `tests/security/test_agp087_hub_b_client.py`, `test_agp087_transport.py`,
 `test_agp090_client.py`. Changed: `test_agp081_closure_audit.py` pinned the wedge after a stripped
 receipt (now the next call goes through); `tests/test_agp068.py` and `tests/test_x402_envelopes.py`
 build a channel by hand and now say which call it sent.
+
+## Fix wave 5, the library client (AGP-096)
+
+As xbt-rs (its README, same heading); `XbtChannelClient`, `funding.py` and `signer.py`.
+
+- **A channel that holds no coins never stands in the way.** A keyed channel whose `fund` call
+  failed is retried as it is while it has `offer_retry_floor` blocks left (`minExpiryBlocks +
+  minConf` plus the larger half of `closeMarginBlocks`: 72 blocks of retries against the reference
+  provider, where AGP-090 called it too old after one). Past that it moves to `unfunded` and the
+  same call derives it again and funds that. Every channel derived for an origin until one is funded
+  pays one key (`ChannelSigner.new_key` answers the key it issued and has not bound; a local key is
+  read back from `unfunded`), so past 16 kept scripts the oldest is forgotten and its key is not.
+  Only a channel `fund` was called for is kept there (`fund_tried`). Nothing needs
+  `forget_unfunded` any more.
+- **Funded only on terms the seller offers that day.** Before a keyed channel of an earlier call is
+  funded, the offer of this call must still describe it and the provider must answer yes to its
+  preflight again; else it is set aside, derived again, and the call fails `open_unresolved` with
+  nothing funded (the next call funds the new one). `budget_sats` is checked when the coins leave.
+- **One seller, one origin.** `split_url` gives the origin as the request binding reads it
+  (`canonical_origin`), and the client's book is keyed by it.
+- **The expiry has a lower bound.** `offer_expiry_blocks` refuses a window below the offer's own
+  floor, or below 144 blocks (or the owner's wish, if smaller).
+- **`ChannelSigner` keeps the keys it issued** and binds one key to each channel that pays it.
+
+Stated limits, as xbt-rs: a refusal (402) is not signed, so a second charge hidden behind a forged
+refusal ends the channel with `bad_offer` (`test_hole_two_forged_refusals_do_not_end_the_channel`
+still fails and states it); a provider is believed for one quote per paid request that got no
+receipt. B1's client keeps no ledger, so "a request is counted before it leaves" is Rust only.
+
+Tests: `tests/security/test_agp096_client.py` (14) and the audit's `test_agp093_client.py`.
+Changed: two tests in `test_agp090_client.py` pinned the stop at a stale keyed channel.
 
 ## Fix wave 4, the hub (AGP-088)
 

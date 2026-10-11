@@ -155,33 +155,37 @@ class Open(unittest.TestCase):
         ch = r.c.channels[O]
         self.assertEqual((ch.payer.signed, ch.seq, ch.last_sig), (0, 0, ""))
 
-    def test_a_stale_unfunded_channel_keeps_its_key_and_the_next_call_opens_anew(self):
+    def test_a_stale_unfunded_channel_keeps_its_terms_and_the_call_opens_anew(self):
+        """AGP-096 rewrote this test and the next (the third audit's item 6). AGP-090 failed this call
+        open_unresolved, opened the next with a new key, and refused the origin for good at sixteen
+        kept keys; with a signer it refused every call until the embedder called forget_unfunded."""
         r = Rig()
         r.refuses = True
         self.assertEqual(r.get(), "wallet_error")
-        old = r.c.channels[O].payer.params.payer_pub
+        old = r.c.channels[O].payer.params
         r.refuses = False
         r.node.height += 900        # 1,008 blocks asked; the offer's floor is 144 + 1 + 36
-        self.assertEqual(r.get(), "open_unresolved")
-        self.assertEqual((len(r.sends), [c.payer.params.payer_pub for c in r.c.unfunded[O]]), (0, [old]))
         self.assertEqual(r.get(), 200)
-        self.assertNotEqual(r.c.channels[O].payer.params.payer_pub, old)
-        self.assertEqual(len(r.sends), 1)
+        self.assertEqual((len(r.sends), [c.payer.params for c in r.c.unfunded[O]]), (1, [old]))
+        now = r.c.channels[O].payer.params
+        self.assertEqual((now.payer_pub, now.expiry), (old.payer_pub, old.expiry + 900), "one key for the origin, a new expiry")
         self.assertEqual(r.c.forget_unfunded(O), 1)
         self.assertEqual((r.c.unfunded, r.c.channels[O].stage), ({}, "open"))
 
-    def test_a_stale_unfunded_channel_with_a_signer_waits_for_the_embedder(self):
+    def test_a_stale_unfunded_channel_with_a_signer_is_opened_anew_for_the_issued_key(self):
         r = Rig(signer=True)
         r.refuses = True
         self.assertEqual(r.get(), "wallet_error")
-        key = r.c.channels[O].payer.params.payer_pub
+        old = r.c.channels[O].payer.params
         r.refuses = False
         r.node.height += 900
-        for _ in range(3):
-            self.assertEqual(r.get(), "open_unresolved")
-        self.assertEqual((len(r.sends), r.c.channels[O].payer.params.payer_pub), (0, key), "the signer's issued key was not replaced")
-        self.assertEqual(r.c.forget_unfunded(O), 1)
         self.assertEqual(r.get(), 200)
+        self.assertEqual((len(r.sends), r.c.channels[O].payer.params.payer_pub), (1, old.payer_pub),
+                         "the signer's issued key was not replaced")
+        # had the failed call sent after all, the signer still signs that script's refund
+        old.funding_txid, old.funding_vout = "ab" * 32, 0
+        chan = r.c.signer.attach(O, old)
+        self.assertTrue(r.c.signer.sign_refund(chan))
 
 
 class Expiry(unittest.TestCase):

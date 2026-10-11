@@ -59,7 +59,7 @@ from . import ecc
 from .channel import (DERIVATION, DUST, FEE_PAYERS, SIGHASH_ALL_UNIFIED, ChannelError, ChannelParams, Payee, Payer,
                       canonical_chan, channel_auth_key, channel_payee_secret, check_payout_spk, cpfp_child, settle_due)
 from .conditional import CSV_DELTA
-from .funding import OWNER_MAX_EXPIRY_BLOCKS, FundingPolicy, check_funding, offer_expiry_blocks, offer_expiry_floor
+from .funding import OWNER_MAX_EXPIRY_BLOCKS, FundingPolicy, check_funding, offer_expiry_blocks, offer_retry_floor
 from .ledger import ChannelState, Ledger
 from .tx import segwit_address, tagged_hash
 
@@ -156,6 +156,31 @@ def no_fragment(url: str) -> str:
 
 
 FRAGMENT_REFUSED = b"request target with a # fragment"      # the body of the provider's 400
+
+
+def canonical_origin(url: str) -> str:
+    """The origin of an absolute URL as request_url reads it: lowercase scheme and host, no userinfo,
+    and no port when it is the scheme's default. "" for a bare target.
+
+    The rule (AGP-096, audit item 18; as xbt-rs wire::canonical_origin): one seller is one origin,
+    however a caller spells it. The request binding has always read HTTPS://API.example:443 and
+    https://u@api.example as https://api.example, while a payer's channel book was keyed by the
+    spelling, so one seller could be funded once per spelling."""
+    scheme, host, port, _ = request_url(url)
+    if not scheme:
+        return ""
+    if not port or (scheme, port) in (("http", "80"), ("https", "443")):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def split_url(url: str) -> tuple:
+    """(origin, "/path?query") of a URL: the key of a payer's book and the request target. The origin
+    of an absolute URL is canonical_origin; anything else is split at its third "/"."""
+    origin = canonical_origin(url)
+    if origin:
+        return origin, request_url(url)[3]
+    return "/".join(url.split("/")[:3]), "/" + "/".join(url.split("/")[3:])
 
 
 def url_origin(url: str) -> str:
@@ -1900,7 +1925,8 @@ class XbtChannelProvider:
 
 
 # --- client SDK -------------------------------------------------------------------------------
-# Most stale unfunded opens kept per origin (XbtChannelClient.unfunded), as xbt-rs client::MAX_KEPT.
+# Most earlier scripts of an open that was never funded kept per origin (XbtChannelClient.unfunded),
+# as xbt-rs client::MAX_KEPT.
 MAX_KEPT = 16
 
 
@@ -1924,7 +1950,9 @@ class ClientChannel:
     # How far the open has got (AGP-090, review C2; as xbt-rs client::Stage). "keyed": it has a key and
     # terms; its funding has not left, or the call that sends it has not answered. "funded": funded
     # and bound, the refund held; the provider has not answered the funded open. "open": the only
-    # stage a state is signed in.
+    # stage a state is signed in. A keyed channel without an outpoint is funded by a later call only
+    # if the seller still offers its terms and it is not too near its expiry; else it moves to
+    # XbtChannelClient.unfunded and a new one is derived (AGP-096).
     stage: str = "open"
     # What the paid requests the provider has not answered may have cost: one quote each, added when a
     # request leaves, taken off when the provider refuses it (a 402: not charged), cleared by a
@@ -1932,6 +1960,10 @@ class ClientChannel:
     # leaves its request here: the provider may have served it, so its spent total may be ahead of
     # ours by this much (and by what is left of slack_msat's one call).
     unanswered_msat: int = 0
+    # The wallet was asked to fund this channel (AGP-096): `fund` can fail after it sent, so the
+    # channel may hold coins though no outpoint is known. Only such a channel is kept in
+    # XbtChannelClient.unfunded when it is derived again; one the wallet never heard of is dropped.
+    fund_tried: bool = False
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1985,8 +2017,10 @@ class XbtChannelClient:
         # the most blocks to expiry this client funds, whatever an offer asks for (AGP-090)
         self.max_expiry_blocks = max_expiry_blocks
         self.channels: Dict[str, ClientChannel] = {}
-        # keyed channels whose funding call failed and that are now too near their expiry to fund,
-        # per origin: `fund` can fail after it sent, so their keys are kept (AGP-090)
+        # keyed channels that a later call could not fund as they were (too near their expiry, or on
+        # terms the seller no longer offered) and derived again, per origin: `fund` can fail after it
+        # sent, so their terms are kept (AGP-090, AGP-096). They all pay one key, the key of the
+        # origin's next channel, so past MAX_KEPT the oldest script is forgotten and its key is not.
         self.unfunded: Dict[str, list] = {}
         self.opened_sats = 0
 
@@ -2073,10 +2107,11 @@ class XbtChannelClient:
         channel only after the provider answered the funded open: a seller that said yes to the
         preflight and no to the open (or an answer lost on the way) left the coins in a script whose
         only payer key had been dropped, and every later call funded another channel."""
-        if origin not in self.channels:
+        keyed_now = origin not in self.channels
+        if keyed_now:
             self._key_channel(origin, acc)
         if self.channels[origin].stage == "keyed":
-            self._fund_keyed(origin)
+            self._fund_keyed(origin, acc, keyed_now)
         ch = self.channels[origin]
         if ch.stage == "funded":
             self._post_open(ch)
@@ -2095,9 +2130,16 @@ class XbtChannelClient:
         # or one that asks for more blocks than the owner's bound
         blocks = offer_expiry_blocks(ex, self.expiry_blocks, self.max_expiry_blocks)
         open_url = same_origin_url(origin, ex["openUrl"])
+        # One key for every channel derived for an origin until one is funded (AGP-096): a signer
+        # answers the key it issued and has not bound, and a local key is read back from `unfunded`.
+        # So no retry of an open makes a key that could be dropped.
+        kept = self.unfunded.get(origin) or []
         if self.signer:
             pub = self.signer.new_key(origin)
             secret = None
+        elif kept and kept[-1].payer.secret:
+            secret = kept[-1].payer.secret
+            pub = kept[-1].payer.params.payer_pub
         else:
             secret = secrets.randbelow(ecc.N - 1) + 1
             pub = ecc.pubkey(secret).hex()
@@ -2124,18 +2166,26 @@ class XbtChannelClient:
             c = {"txid": p.funding_txid, "vout": p.funding_vout, **c}
         return c
 
-    def _fund_keyed(self, origin: str):
+    def _fund_keyed(self, origin: str, acc: dict, keyed_now: bool):
         """Fund the keyed channel of `origin` (unless an earlier call did), bind it to its key and hold
-        its refund: stage "funded", before the provider hears of the outpoint. A retry after a `fund`
-        that raised pays the same script under the same key: `fund` is a bare callable here, so the
-        client cannot ask the wallet whether the first call sent, and whatever it did is refundable
-        with the key on the books."""
+        its refund: stage "funded", before the provider hears of the outpoint. `acc`: the offer of this
+        call. `keyed_now`: this call derived the channel from it. A retry after a `fund` that raised
+        pays the same script under the same key: `fund` is a bare callable here, so the client cannot
+        ask the wallet whether the first call sent, and whatever it did is refundable with the key on
+        the books."""
         ch = self.channels[origin]
         p = ch.payer.params
         if not p.funding_txid:
-            if p.expiry < self.height() + offer_expiry_floor(ch.accepted["extra"]):
-                self._shelve_keyed(origin)
+            if not keyed_now and not self._still_offered(origin, acc):
+                # set aside as too old: the same offer, a new expiry, funded by this call
+                self._key_channel(origin, acc)
+                return self._fund_keyed(origin, acc, True)
+            # The budget, on the day the coins leave (AGP-096): it was checked when the channel was
+            # derived, and channels to other origins may have been funded since.
+            if self.opened_sats + p.capacity > self.budget_sats:
+                raise ChannelError("budget", "channel capacity outside our budget")
             fund = self.signer.fund if self.signer and getattr(self.signer, "fund", None) else self.fund
+            ch.fund_tried = True
             txid, vout = fund(segwit_address(self.hrp_for(), p.spk), p.capacity)
             p.funding_txid, p.funding_vout = txid, vout
             self.opened_sats += p.capacity
@@ -2152,29 +2202,95 @@ class XbtChannelClient:
             self.on_open(ch)
         ch.stage = "funded"
 
-    def _shelve_keyed(self, origin: str):
-        """The keyed channel of `origin` is too near its expiry to fund now. Its key is kept in
-        `unfunded` (the call that failed may have sent) and the next call opens with a new key. A
-        signer holds one issued key per origin and a new one would replace this one, so with a signer
-        the record stays where it is until the embedder calls forget_unfunded."""
-        if self.signer or len(self.unfunded.get(origin, [])) >= MAX_KEPT:
-            raise ChannelError("open_unresolved", f"an earlier open to {origin} never learned whether its funding "
-                                                  f"was sent, and its channel is too near expiry to fund now: once "
-                                                  f"the wallet shows no send to it, call forget_unfunded")
-        self.unfunded.setdefault(origin, []).append(self.channels.pop(origin))
-        raise ChannelError("open_unresolved", f"an earlier open to {origin} was too old to fund; its key is kept, "
-                                              f"and the next call opens a new channel")
+    def _still_offered(self, origin: str, acc: dict) -> bool:
+        """Whether the keyed channel of `origin`, derived by an earlier call and not funded since, is
+        funded by this one: `acc`, the offer of this call, still describes it, the provider answers
+        yes to its terms again, and it has the blocks a funding needs.
+
+        The rule (AGP-096, audit items 6 and 18; as xbt-rs Client::still_offered): a channel is funded
+        only on terms the seller offers and says yes to in the call that funds it, and a channel that
+        holds no coins never stands between its origin and the next one. The preflight was asked
+        once, when the channel was derived, so a later call funded it on the terms of that day: after
+        a seller changed its payTo key the capacity was locked until the expiry. And a channel too
+        near its expiry stayed on the books with a signer, or was refused for good after sixteen with
+        a local key, so one failed `fund` call could end a payer's business with a seller.
+
+        A channel that fails one of the three is set aside (`unfunded`); every channel derived after
+        it pays the same key. Too near its expiry (offer_retry_floor) on an offer that is otherwise
+        the same: False, and the caller derives it again and funds that in this call. Terms the
+        seller changed or now refuses: the channel is derived again from this call's offer and the
+        call fails open_unresolved with nothing funded; the next call funds it, after this same
+        check. An answer that never came (anything but a ChannelError) says nothing about the terms:
+        it goes back to the caller and the channel stays for the next call."""
+        ch = self.channels[origin]
+        p, ex = ch.payer.params, acc["extra"]
+        now = ChannelParams.derive(acc["payTo"], p.payer_pub, p.expiry, int(ex["closeFeeSat"]), network=self.network,
+                                   close_fee_payer=ex.get("closeFeePayer", "payer"))
+        offered = (now.script == p.script and now.payee_spk == p.payee_spk and now.close_fee == p.close_fee
+                   and now.close_fee_payer == p.close_fee_payer
+                   and int(ex["minCapacity"]) <= p.capacity <= int(ex.get("maxCapacity", p.capacity))
+                   # a price above the one pinned when the channel was derived would be refused on
+                   # every call once it is open ("price raised mid-channel")
+                   and int(acc["amount"]) <= (ch.price or int(ch.accepted["amount"])))
+        if not offered:
+            why = "the seller no longer offers its terms"
+        elif p.expiry < self.height() + offer_retry_floor(ex):
+            self._set_aside(origin)
+            return False
+        else:
+            try:
+                self._preflight(same_origin_url(origin, ex["openUrl"]), self._open_terms(p), p.close_fee_payer)
+                return True
+            except ChannelError as e:
+                why = f"the seller refused its terms ({e.code})"
+        self._set_aside(origin)
+        try:
+            # derived again now, so that the next call finds the channel it funds; a seller that
+            # refuses the new terms too answers that call itself
+            self._key_channel(origin, acc)
+        except ChannelError:
+            pass
+        raise ChannelError("open_unresolved", f"an earlier open to {origin} was never funded and {why}: it is set "
+                                              f"aside, nothing was funded, and the next call opens a new channel")
+
+    def _set_aside(self, origin: str):
+        """Take `origin`'s unfunded keyed channel off the books. If the wallet was asked to fund it, it
+        moves to `unfunded`: the `fund` call that failed may have sent after all, so its terms are
+        kept. If the wallet never heard of it, it is dropped (so a seller that changes its offer on
+        every call fills nothing). Every channel derived for an origin pays one key, so past MAX_KEPT
+        the oldest script goes and its key stays, in a newer record; a record with a key of its own is
+        not dropped, except with a signer, whose keys are the signer's to keep."""
+        ch = self.channels.pop(origin)
+        if not ch.fund_tried:
+            return
+        kept = self.unfunded.setdefault(origin, [])
+        if len(kept) >= MAX_KEPT:
+            def pays(c, k):
+                return c.payer.params.payer_pub == k.payer.params.payer_pub
+            shared = [i for i, k in enumerate(kept) if any(pays(c, k) for c in kept[i + 1:] + [ch])]
+            if shared or self.signer:
+                del kept[shared[0] if shared else 0]
+        kept.append(ch)
 
     def forget_unfunded(self, origin: str) -> int:
         """Drop the channels of `origin` that were never funded: the keyed one without an outpoint, and
         those in `unfunded`. Call it only when the wallet shows no send to their scripts: their keys
-        go with them. Returns how many were dropped."""
+        go with them. Returns how many were dropped. Nothing needs it to go on paying (AGP-096): it
+        only tidies the book."""
+        origin = self._book_key(origin)
         n = len(self.unfunded.pop(origin, []))
         ch = self.channels.get(origin)
         if ch and ch.stage == "keyed" and not ch.payer.params.funding_txid:
             del self.channels[origin]
             n += 1
         return n
+
+    def _book_key(self, origin: str) -> str:
+        """The key of `origin` in the book: as given when a record is there under that spelling (an
+        embedder that filled `channels` itself), else the origin as split_url reads it."""
+        if origin in self.channels or origin in self.unfunded:
+            return origin
+        return canonical_origin(origin) or origin
 
     def _post_open(self, ch: ClientChannel):
         """Ask the provider to open the funded channel. Asked again on every call until it answers: a
@@ -2284,8 +2400,7 @@ class XbtChannelClient:
         above the receipted spend plus one call at the pinned price (too_expensive), over the daily
         budget (budget). Under the channel's minimum state with nothing signed, the call goes unsigned."""
         no_fragment(url)
-        origin = "/".join(url.split("/")[:3])
-        path = "/" + "/".join(url.split("/")[3:])
+        origin, path = split_url(url)
         own = self._extra_headers(headers)
         ch = self.channels.get(origin)
         hdrs = {}
@@ -2393,6 +2508,7 @@ class XbtChannelClient:
     def close(self, origin: str, cum: int | None = None) -> dict:
         """Cooperative close; in postpay the final state pays exactly what is owed. `cum` (AGP-059):
         the caller's own final amount, under the bounds of `request`."""
+        origin = self._book_key(origin)
         ch = self.channels[origin]
         pl = self._payload(ch, 0, chosen=cum)
         if self.signer:
@@ -2428,8 +2544,7 @@ class XbtChannelClient:
         """Pay-on-preimage: sign a hash-locked increment, receive cipher+k, upgrade if k checks."""
         from .conditional import ConditionalParams, decrypt, sha256
         no_fragment(url)
-        origin = "/".join(url.split("/")[:3])
-        path = "/" + "/".join(url.split("/")[3:])
+        origin, path = split_url(url)
         ch = self.channels.get(origin)
         status, rh, out = self.http(method, url, body)
         if status != 402:
@@ -2524,7 +2639,7 @@ class XbtChannelClient:
         """The deliverable of a signed hash lock whose paid response never arrived, from the
         provider's claim transaction (hex or Tx), which reveals k on-chain."""
         from .conditional import decrypt, preimage_from_tx
-        pc = self.channels[origin].pending_cond
+        pc = self.channels[self._book_key(origin)].pending_cond
         if not pc:
             raise ChannelError("no_state", "no pending conditional call on this channel")
         k = preimage_from_tx(tx, bytes.fromhex(pc["hash"]))
