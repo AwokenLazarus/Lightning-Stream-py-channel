@@ -2046,13 +2046,15 @@ class XbtChannelClient:
         return status, {k.upper(): v for k, v in r.headers.items()}, out
 
     @staticmethod
-    def http(method, url, body=b"", headers=None):
+    def http(method, url, body=b"", headers=None, timeout=30):
         """One request, one answer. A 3xx is returned as the answer and never followed (AGP-080 X1, as
         the Rust transport): a payer that checked the origin against an allowlist must not be sent on
-        to another host, least of all with its PAYMENT-SIGNATURE header."""
+        to another host, least of all with its PAYMENT-SIGNATURE header. `timeout` (AGP-105: the hub's
+        check of a lock asks with its revealTimeoutSec) is urllib's: for the connect and for each read,
+        not for the whole answer."""
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
-            with _NO_REDIRECT.open(req, timeout=30) as r:
+            with _NO_REDIRECT.open(req, timeout=timeout) as r:
                 return XbtChannelClient._read_capped(r, method)
         except urllib.error.HTTPError as e:
             return XbtChannelClient._read_capped(e, method)

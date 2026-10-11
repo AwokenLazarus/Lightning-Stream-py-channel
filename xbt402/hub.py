@@ -196,12 +196,28 @@ class OutChannel:
     # AGP-094: the tip when the watcher first saw this funding spent in a block, for a spend whose depth
     # the scan does not give (0: not seen so, or the funding is unspent again)
     gone_at: int = 0
+    # AGP-105: the height at (or just below) which the scan last found this funding's spender in a
+    # block (0: not found in one): RouteHub._find_funding_spend
+    spend_at: int = 0
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
 
 
 LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
+# Why a ch2 is blocked after its provider did not answer the hub's check of a lock (AGP-105, the
+# fourth audit's item 2; as xbt-rs hub.rs CHECK_UNANSWERED).
+#
+# The rule: a provider that did not answer the hub within revealTimeoutSec is not waited for again by
+# a client's lock until it has answered the hub. The check is one request bounded by revealTimeoutSec
+# (it waited the transport's 30 s, on every lock). When that time passed with no answer the ch2 gets
+# this block: nothing was pre-signed, so nothing is written off or held, and later locks for that
+# provider are refused at once (route_blocked), as an unanswered lock made them before the check
+# existed. The watcher asks one such provider per tick with a check that names no lock (_ask_again)
+# and lifts the block when it answers. A check that failed sooner (a refused connection, a lost
+# answer) cost no waiting and blocks nothing.
+CHECK_UNANSWERED = "the provider did not answer a lock check within revealTimeoutSec"
+_MUTEX_TAKEN = object()      # _admit: the provider's mutex is another request's (AGP-105)
 WATCH_WAIT_ONE, WATCH_WAIT_BUDGET = 0.25, 1.0    # a watcher tick waits for one busy provider's mutex, and for all (AGP-053)
 ROLLOVER_GONE = "the rollover that funds this ch2 is in no block and not in the mempool"   # AGP-053
 # the watcher reconciles these until final. AGP-088: `rolled` too. A ch2 is rolled on the provider's answer
@@ -588,6 +604,7 @@ class RouteHub:
         self._stale_tried: set = set()    # (chan, tip): the early close of a ch2 a written-off lock blocks (AGP-073)
         self.fee_strategy = fee_strategy or self._configured_fees
         self.http = http or XbtChannelClient.http
+        self._ask_turn = 0      # whose turn it is among the providers set aside for an unanswered check
         self._refill = refill
         self._refill_ahead = refill_ahead
         self.refund_to = refund_to
@@ -828,39 +845,71 @@ class RouteHub:
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._err("bad_payload")
         ib = self.inbound
-        with ib.ledger.lock:
-            # 1 auth ---------------------------------------------------------------------------
-            try:
-                st1 = ib.ledger.channels.get(canonical_chan(pl.get("chan")))
-            except ChannelError:
-                st1 = None
-            if st1 is None:
-                return self._err("unknown_channel")
-            if not ib._authentic(st1, pl, method, bind, body):
-                return self._err("bad_auth", status=401)
-            st1.seq = int(pl["seq"])
-            # AGP-078 (review T4): the seq this request spent is durable before its refusal (or the error
-            # that ended it) leaves. Kept only in memory it came back after a restart, and the refused
-            # header authenticated again
-            try:
-                adm, refusal = self._admit(st1, pl, rt, d, f, lock_id, provider)
-            except BaseException:
-                ib.ledger.save(st1)
-                raise
-            if adm is None:
-                ib.ledger.save(st1)
-                return refusal
-            oc, lock1, mtx = adm
+        # AGP-105 (HUB 8): the provider's mutex is waited for with ch1's ledger free. The wait (up to
+        # 500 ms, for another client's lock on that ch2 to finish) used to be inside the ledger lock,
+        # which every request of every client needs, so one hung provider held up locks to all the
+        # others. Admission then runs again from the top, on ch1 as it is then
+        held = None
+        for again in (False, True):
+            with ib.ledger.lock:
+                # 1 auth ---------------------------------------------------------------------------
+                try:
+                    st1 = ib.ledger.channels.get(canonical_chan(pl.get("chan")))
+                except ChannelError:
+                    st1 = None
+                if st1 is None:
+                    if held is not None:
+                        held.release()
+                    return self._err("unknown_channel")
+                if not again:
+                    if not ib._authentic(st1, pl, method, bind, body):
+                        return self._err("bad_auth", status=401)
+                    st1.seq = int(pl["seq"])
+                # AGP-078 (review T4): the seq this request spent is durable before its refusal (or the error
+                # that ended it) leaves. Kept only in memory it came back after a restart, and the refused
+                # header authenticated again
+                try:
+                    adm, refusal = self._admit(st1, pl, rt, d, f, lock_id, provider, held)
+                except BaseException:
+                    ib.ledger.save(st1)
+                    raise
+                if adm is not None:
+                    oc, lock1, mtx = adm
+                    break
+                if refusal is not _MUTEX_TAKEN or again:
+                    ib.ledger.save(st1)
+                    return self._err("lock_outstanding", "a lock on this provider's ch2 is pending") if refusal is _MUTEX_TAKEN else refusal
+            held = self.out.mutex_for(provider)
+            if not held.acquire(timeout=0.5):
+                with ib.ledger.lock:
+                    ib.ledger.save(st1)
+                return self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
         try:
             return self._forward(st1, oc, lock1, rt, pl, t0)
         finally:
             mtx.release()
 
-    def _admit(self, st1, pl: dict, rt: dict, d: int, f: int, lock_id: str, provider: str):
+    def _admit(self, st1, pl: dict, rt: dict, d: int, f: int, lock_id: str, provider: str, held=None):
         """Checks 2 to 7 of a /x402/route whose auth passed, and the ch1 write-ahead of its lock (the
         ledger lock is the caller's). `((oc, lock1, mtx), None)`: the ch2 the lock goes over, the lock as
         written on ch1, and that provider's mutex, held. `(None, answer)`: the answer to send instead (a
-        refusal, or a completed lock's answer again); nothing was written."""
+        refusal, or a completed lock's answer again); nothing was written. `held`: the provider's mutex
+        when the caller holds it already (it is released here on a refusal). Without it the mutex is
+        taken only if it is free, and `(None, _MUTEX_TAKEN)` says that it was not: the caller waits for
+        it outside the ledger lock and asks again (AGP-105)."""
+        got = [held] if held is not None else []     # the mutex, once this request holds it
+        try:
+            adm, refusal = self._admit_in(st1, pl, rt, d, f, lock_id, provider, got)
+        except BaseException:
+            for m in got:
+                m.release()
+            raise
+        if adm is None:
+            for m in got:
+                m.release()
+        return adm, refusal
+
+    def _admit_in(self, st1, pl: dict, rt: dict, d: int, f: int, lock_id: str, provider: str, got: list):
         ib = self.inbound
         done = ((st1.extra or {}).get("route_done") or {}).get(lock_id)
         if done:                                   # the client lost our answer: the same one again
@@ -952,8 +1001,10 @@ class RouteHub:
         if ex1.get("route_lock"):
             return None, self._err("lock_outstanding", "a lock on this ch1 is pending")
         mtx = self.out.mutex_for(key)
-        if not mtx.acquire(timeout=0.5):
-            return None, self._err("lock_outstanding", "a lock on this provider's ch2 is pending")
+        if not got:
+            if not mtx.acquire(blocking=False):
+                return None, _MUTEX_TAKEN
+            got.append(mtx)
         # re-read under the mutex: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
         # the checks that depend on the channel are made again on the one the lock will use
         oc = self.out.chans.get(key)
@@ -964,7 +1015,6 @@ class RouteHub:
             if alt is not None:
                 oc, why = alt, None
         if why:
-            mtx.release()
             return None, self._err(*why)
         # AGP-088: one unresolved lock per lockId on a ch1. The lockId is the provider's choice, and the
         # client is told of its held and released locks by lockId. A ch2 that could take this lock
@@ -972,7 +1022,6 @@ class RouteHub:
         # still holds written off: refused before anything is pre-signed on it, with our view, so a
         # client that lost the first refusal adopts the hold
         if any(s.get("lockId") == lock_id for s in ex1.get("stale_locks") or []):
-            mtx.release()
             return None, self._err("lock_held", "a written-off lock with this lockId is unresolved on this channel", **view)
         # write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
         lock1 = {"lockId": lock_id, "cum": cum, "floor": floor1, "pre": pre1.to_json() if pre1 else None,
@@ -986,7 +1035,6 @@ class RouteHub:
             ib.ledger.save(st1)
         except BaseException:
             st1.extra = ex1                              # not written: the lock is not there
-            mtx.release()
             raise
         return (oc, lock1, mtx), None
 
@@ -1112,10 +1160,13 @@ class RouteHub:
             # client authorised), and a refusal after the pre-signature left writes the lock off and
             # blocks this ch2 (AGP-064). So the provider is asked first, with nothing of the hub's out:
             # what it refuses here costs nothing and leaves the ch2 as it was
+            asked = time.monotonic()
             no = self._check_lock(oc, route2, need2, lock1["T"])
             if no is not None:
                 code, det = no
-                self._void(st1, oc, lock1, f"provider refused the check: {code}", block="")
+                # AGP-105: no answer in revealTimeoutSec sets the provider aside (CHECK_UNANSWERED)
+                late = code == "no_answer" and time.monotonic() - asked >= float(self.reveal_timeout)
+                self._void(st1, oc, lock1, f"provider refused the check: {code}", block=CHECK_UNANSWERED if late else "")
                 self.stats["refused"][code] = self.stats["refused"].get(code, 0) + 1
                 shown = code if safe_code(code) else "provider_error"
                 return self._err("route_failed", f"provider refused the lock: {shown}" + (f" ({det})" if det else ""),
@@ -1173,9 +1224,11 @@ class RouteHub:
             return doc
         return self._lock_refusal(st, doc)
 
-    def _post_lock(self, oc: OutChannel, pl: dict, route: dict) -> Optional[tuple]:
+    def _post_lock(self, oc: OutChannel, pl: dict, route: dict, within: Optional[float] = None) -> Optional[tuple]:
         """POST `pl` (a ch2 payload with its seq; the auth is added here) and the route terms to the
-        provider's lock endpoint: (status, JSON answer), None when there is none."""
+        provider's lock endpoint: (status, JSON answer), None when there is none. `within` (AGP-105, the
+        check): the shipped transport gives up after that many seconds in place of its 30; an embedder's
+        own `http` keeps its own timeout, and the caller measures the time."""
         p2 = oc.p()
         body = json.dumps({"route": route}).encode()
         key = channel_auth_key(int(oc.secret, 16), bytes.fromhex(p2.payee_pub))
@@ -1184,7 +1237,10 @@ class RouteHub:
         hdrs = {"PAYMENT-SIGNATURE": b64json({"x402Version": 2, "accepted": oc.terms, "payload": pl}),
                 "Content-Type": "application/json"}
         try:
-            st, _, raw = self.http("POST", oc.origin + ROUTE_LOCK_PATH, body, hdrs)
+            if within is not None and self.http is XbtChannelClient.http:
+                st, _, raw = self.http("POST", oc.origin + ROUTE_LOCK_PATH, body, hdrs, timeout=max(float(within), 0.001))
+            else:
+                st, _, raw = self.http("POST", oc.origin + ROUTE_LOCK_PATH, body, hdrs)
             return st, json.loads(raw)
         except (OSError, ValueError):
             return None
@@ -1208,7 +1264,7 @@ class RouteHub:
         the pre-signature (a fresh ch2 seq, saved first). None: it said yes. (code, detail): it refused,
         or did not answer ("no_answer"). A provider from before the check runs the request as a lock and
         stops at the missing pre-signature (bad_adaptor), after every check a client's fields can fail:
-        that is its yes."""
+        that is its yes. The request is given up after revealTimeoutSec (AGP-105)."""
         none = ("no_answer", "the provider did not answer the check")
         try:
             with self.out.lock:
@@ -1218,7 +1274,7 @@ class RouteHub:
         except OSError:
             return none
         pl = {"chan": oc.p().channel_id, "seq": seq, "cum": str(need2), "point": t_hex}
-        ans = self._post_lock(oc, pl, {**route, "check": True})
+        ans = self._post_lock(oc, pl, {**route, "check": True}, within=self.reveal_timeout)
         if ans is None:
             return none
         st, doc = ans
@@ -1228,6 +1284,30 @@ class RouteHub:
         if no is None:
             return none
         return None if no["error"] == "bad_adaptor" else (no["error"], no["detail"])
+
+    def _ask_again(self) -> list:
+        """AGP-105: ask one provider that is set aside for an unanswered check (CHECK_UNANSWERED) whether
+        it answers again, with a check that names no lock (the provider refuses it, after the hub's
+        channel auth: unknown_session). Any answer a check can have lifts the block. One provider per
+        tick, in turn, each waited for no longer than a check: providers that stay dark lengthen a
+        watcher tick by at most revealTimeoutSec, however many they are."""
+        with self.out.lock:
+            aside = [oc for oc in self.out.chans.values() if oc.blocked == CHECK_UNANSWERED and oc.state == "open"]
+        if not aside:
+            return []
+        self._ask_turn += 1
+        oc = aside[self._ask_turn % len(aside)]
+        no = self._check_lock(oc, {"session": "", "lockId": "", "amount": 0, "lockAuth": "", "hub": self.pay_to}, oc.signed, "")
+        if no is not None and no[0] == "no_answer":
+            return []
+        with self.out.lock:
+            if oc.blocked != CHECK_UNANSWERED:       # only this block is lifted
+                return []
+            oc.blocked = ""
+            self.out.save()
+        ev = {"event": "ch2_answers_again", "provider": oc.origin, "chan": oc.p().channel_id}
+        self.events.append(ev)
+        return [ev]
 
     def _settled(self, ch1: str, oc: OutChannel, ans: dict) -> Optional[dict]:
         """The provider revealed t: check it, fold ch2, complete ch1 with t + r."""
@@ -2308,6 +2388,10 @@ class RouteHub:
                 actions += self._watch_out(oc, tip, wait=max(0.0, min(WATCH_WAIT_ONE, until - time.time()))) or []
             except Exception as e:  # noqa: BLE001
                 self._watch_error(origin, "watch", e)
+        try:                                                # AGP-105: one provider set aside for an unanswered
+            actions += self._ask_again()                    # check is asked whether it answers again
+        except Exception as e:  # noqa: BLE001
+            self._watch_error("", "ask_again", e)
         # AGP-057: every origin's next ch2 (reconciled, opened at minConf, taking over from a live one that
         # is gone or idle), then the ones due to be funded ahead. Neither needs the origin's mutex until a
         # switch: a next ch2 takes no lock before it
@@ -2477,6 +2561,31 @@ class RouteHub:
             ev = {"event": "ch2_written_off_close_failed", "provider": oc.origin, "chan": chan, "error": str(e)[:200]}
             self.events.append(ev)
             return [ev]
+
+    def _find_funding_spend(self, oc: OutChannel, p, tip: int):
+        """The spender of `oc`'s funding and its depth (route.find_spend_at), or None.
+
+        AGP-105 rule (the fourth audit's item 11; as xbt-rs RouteHub::find_funding_spend): a spend the
+        watcher found in a block is looked for in that block, not from the ch2's first block again, on
+        every tick it waits for depth. The scan reads every block from the height it is given up to
+        the spender's, and since AGP-094 a record waits spend_final_depth blocks after its spend: about
+        600 ticks at a 5 s tick, each a pass over the ch2's whole life. The record keeps the height the
+        spender was found at (`spend_at`), and the scan starts there. It is only where to look first:
+        when nothing is found from it (a reorg moved the spend to a lower block, or out), the scan runs
+        from `scanned_to` as before, so no answer depends on it."""
+        found = None
+        if oc.spend_at > oc.scanned_to:
+            found = find_spend_at(self.rpc, p.funding_txid, p.funding_vout, oc.spend_at)
+        if found is None:
+            found = find_spend_at(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
+        # the scan's tip is ours or later, so this is the spender's height or below it: never past it
+        # (a scan that gives no depth leaves it 0)
+        at = max(int(tip) + 1 - found[1], oc.scanned_to) if found and found[1] is not None and found[1] >= 1 else 0
+        if at != oc.spend_at:
+            with self.out.lock:
+                oc.spend_at = at
+                self.out.save()
+        return found
 
     def _watch_error(self, origin: str, step: str, e: Exception):
         msg = f"{type(e).__name__}: {e}"[:200]
@@ -2672,7 +2781,7 @@ class RouteHub:
             ev = {"event": "ch2_closed", "provider": oc.origin, "chan": p.channel_id, "txid": oc.close_txid, "by": "provider"}
             self.events.append(ev)
             return out + [ev] + self._refill_if_owed(oc)
-        found = find_spend_at(self.rpc, p.funding_txid, p.funding_vout, oc.scanned_to)
+        found = self._find_funding_spend(oc, p, tip)
         # AGP-094: `confirmed` is "spent for good" (spend_final_depth deep): what it gates below (the
         # release of unpaid locks, `final`, a refund fee taken back) is not undone, so none of it happens
         # on a spend a short reorg can replace. Until then a spend in a block is treated as one in the
