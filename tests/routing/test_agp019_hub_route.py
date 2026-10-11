@@ -13,7 +13,7 @@ run/agp019-<pid>, wiped after): two real P2WSH channels,
   2. the hub withholds: the provider closes ch2 with the completed state before its margin, the hub
      reads t from that close and closes ch1, the client reads its receipt from ch1's close,
   3. the provider never reveals: neither lock can be closed with, and the client pays nothing extra.
-Run: XBT402_TEST_PORT_BASE=34700 python -m unittest discover -s tests/routing
+Run: XBT402_TEST_PORT_BASE=24700 python -m unittest discover -s tests/routing
 """
 import os
 import secrets
