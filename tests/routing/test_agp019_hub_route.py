@@ -188,7 +188,7 @@ class AdaptorLockUnit(unittest.TestCase):
         self.assertLess(ms, 5_000)
 
 
-BIN = os.environ.get("XBT_BIN", "$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2")
+BIN = os.environ.get("XBT_BIN", os.path.expanduser("~/lazarus-regtest/b1-xbt402/knots-29.4.2"))
 DD = os.path.join(ROOT, "run", f"agp019-{os.getpid()}")
 SAT = 100_000_000
 MARGIN = 5

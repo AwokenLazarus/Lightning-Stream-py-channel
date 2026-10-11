@@ -192,7 +192,7 @@ class ConditionalClose(Repro, unittest.TestCase):
         self.assertTrue(prov._cond_outstanding(chan))
 
 
-BIN = os.environ.get("XBT_BIN", "$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2")
+BIN = os.environ.get("XBT_BIN", os.path.expanduser("~/lazarus-regtest/b1-xbt402/knots-29.4.2"))
 DD = os.path.join(ROOT, "run", f"m6-{os.getpid()}")
 
 
