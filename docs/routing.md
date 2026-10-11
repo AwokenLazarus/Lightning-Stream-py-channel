@@ -52,6 +52,15 @@
 > pending on a ch2 that is no longer open is written off by the watcher; a ch2 with a pending lock is
 > neither replaced (`connect`: `lock_pending`) nor switched away from. Tests
 > `tests/security/test_agp088_hub.py`.
+> Since AGP-094: (1) before it pre-signs a ch2 state the hub POSTs the lock's own request to the
+> provider with `route.check: true` and no `adaptor`; `200 {"check": lockId}` (or `bad_adaptor` from a
+> provider that predates the check) is a yes, any other refusal or no answer is `502 route_failed`
+> with `providerError` and nothing written off, held or blocked. A provider that said yes pays that
+> invoice over that channel alone until its window ends (`lock_outstanding` to another). (2)
+> "Confirmed" is `spend_final_depth` blocks deep (HubConfig, default 6), not one. (3) The hub's view
+> of ch1 carries `completed`: the last 16 completed written-off locks as `{lockId, secret}`. (4) The
+> hub refuses an invoice with less than `revealTimeoutSec` left. Tests
+> `tests/security/test_agp094_hub.py`.
 
 Implements the AGP-019 design (`~/notes/projects/xbt-agentpay/Research/AGP-019 xbt402 hub routing.md`):
 a client pays many providers over ONE channel to a hub, using adaptor-locked states on both hops.

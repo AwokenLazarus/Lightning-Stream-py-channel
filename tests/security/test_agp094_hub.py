@@ -413,6 +413,17 @@ class TheCapCountsArchivedCh2s(unittest.TestCase):
         self.assertEqual(w.route_calls(CLOSE_PATH), asked + 1, "the watcher asked the provider to close the replaced ch2")
 
 
+    def test_agp094_a_changed_pay_to_at_the_cap_funds_nothing(self):
+        # the cap check itself (the audit's test also passes once the replaced ch2 is retired and
+        # closed): at the cap nothing is funded for a changed payTo, and the live ch2 keeps its place
+        w = A.W([None], hkw={"liquidity_cap_sat": 100_000})
+        w.paid(0)
+        old, funded = w.oc(0), len(w.node.wallet_txs)
+        w.provs[0].pay_to = ecc.pubkey(0x7777).hex()
+        self.assertEqual(L.code_of(w.hub.connect, w.origins[0]), "liquidity_cap")
+        self.assertEqual((w.hub.committed_sat(), len(w.node.wallet_txs), w.oc(0) is old, old.retired), (100_000, funded, True, False))
+
+
 class FromReading(unittest.TestCase):
     def test_agp094_a_completion_ch1_did_not_take_keeps_the_lock_on_the_ch2_record(self):
         # ch1's ledger does not take the write of a completion read off a ch2 close. The lock stays on

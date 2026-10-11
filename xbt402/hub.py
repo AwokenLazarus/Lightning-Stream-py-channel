@@ -608,7 +608,10 @@ class RouteHub:
         # not collected: only an operator's close or a margin close past its wait can do that)
         self.stats = {"routed": 0, "floor": 0, "refused": {}, "lock_ms": [], "uncollected": 0}
         # AGP-094: locks a ledger from before AGP-088 holds get their ch2 before anything matches them
-        self.name_legacy_locks()
+        try:
+            self.name_legacy_locks()
+        except Exception as e:  # noqa: BLE001 - reported; the watcher tries again on every tick
+            self._watch_error("ch1", "name_legacy_locks", e)
 
     @property
     def refill(self) -> Callable[[str], "OutChannel"]:
@@ -1207,8 +1210,6 @@ class RouteHub:
         stops at the missing pre-signature (bad_adaptor), after every check a client's fields can fail:
         that is its yes."""
         none = ("no_answer", "the provider did not answer the check")
-        if self.withhold == "all":
-            return none
         try:
             with self.out.lock:
                 oc.seq += 1
@@ -1273,10 +1274,10 @@ class RouteHub:
         write). AGP-088: the lock of THAT ch2 (`is_lock`), and only with the t that opens its own T; a
         written-off lock of another ch2 under the same lockId stays where it is.
 
-        AGP-094: it raises CH1_NOT_WRITTEN when ch1's ledger did not take the write. The lock is then still ch1's (in
-        memory as on disk), and the caller leaves it on the ch2 record too, for the next answer or
-        tick: clearing it there left a lock on ch1 that nothing would complete. None is "nothing to
-        complete"."""
+        AGP-094: it raises CH1_NOT_WRITTEN when ch1's ledger did not take the write. The lock is then
+        still ch1's (in memory as on disk), and the caller leaves it on the ch2 record too, for the next
+        answer or tick: clearing it there left a lock on ch1 that nothing would complete. None is
+        "nothing to complete"."""
         ib = self.inbound
         with ib.ledger.lock:
             st1 = ib.ledger.channels.get(ch1)
@@ -1371,6 +1372,9 @@ class RouteHub:
         ch1, lock_id = st1.params.channel_id, lock1.get("lockId")
         with self.out.lock:
             out = False
+            # (the record as it is now: ch1's lock is matched against it below, also a lock from before
+            # AGP-088, which is this ch2's by the lock the record holds)
+            was = OutChannel(**{**oc.__dict__, "stale": list(oc.stale)})
             if oc.pending:
                 # a ch2 already resolved for good (its close or refund confirmed) can pay nothing more
                 out = not oc.final and is_ch2_lock(oc.pending, ch1, lock_id)
@@ -1391,7 +1395,7 @@ class RouteHub:
             st1 = ib.ledger.channels[ch1]
             ex = st1.extra or {}
             rl = ex.get("route_lock")
-            if rl and is_lock(rl, lock_id, oc):
+            if rl and is_lock(rl, lock_id, was):
                 ex["route_lock"] = None
                 if out:
                     rl = {**rl, "voided": round(time.time(), 3)}
@@ -2281,7 +2285,10 @@ class RouteHub:
     def watch_tick(self) -> list:
         actions = []
         tip = self.rpc.getblockcount()
-        actions += self.name_legacy_locks()
+        try:
+            actions += self.name_legacy_locks()
+        except Exception as e:  # noqa: BLE001 - one step never stops the rest
+            self._watch_error("ch1", "name_legacy_locks", e)
         skipped = []
         for origin, oc in list(self.out.chans.items()):
             try:

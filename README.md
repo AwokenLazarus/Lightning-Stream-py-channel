@@ -102,6 +102,45 @@ Tests: `tests/security/test_agp087_hub_b_client.py`, `test_agp087_transport.py`,
 receipt (now the next call goes through); `tests/test_agp068.py` and `tests/test_x402_envelopes.py`
 build a channel by hand and now say which call it sent.
 
+## Fix wave 5, the hub and the routed client (AGP-094)
+
+The hub and routed-client items of the third closure audit (AGP-093), as xbt-rs agp-094 (its README
+has the table, one rule a row). `xbt402/hub.py`, `route.py`, `route_client.py`.
+
+- **The hub asks before it pre-signs (item 1).** A lock that needs a ch2 pre-signature is first put
+  to the provider as the lock's own request, marked `route.check` and without `adaptor`
+  (`RouteHub._check_lock`). The provider runs every check and answers `{"check": lockId}`; a refusal
+  there (a client's bad `lockAuth`, session or amount) leaves nothing written off, held or blocked:
+  `502 route_failed` with `providerError` (`no_answer` when it did not answer). `bad_adaptor` is the
+  yes of a provider from before the check. Once it said yes the provider pays that invoice over that
+  channel alone (`RouteSession.bound`; another channel is refused `lock_outstanding`) and does not
+  end its window before `validUntil`. A refused lock the ch2's floor covers (nothing pre-signed) is
+  dropped. The hub counts a lock only if the provider counted it (`routedSat`). An invoice must be
+  valid for the hub's reveal timeout (it was half a second).
+- **`spend_final_depth` (item 2)**, 6 by default, at least 1: a hold is given back, a ch2 record
+  made final and a refund fee taken back when the spend is that deep (`_spend_depth`), not one block.
+  Until then a spend in a block is treated as one in the mempool (its secrets are read), except that
+  the hub's own refund is not bumped. The depth is `find_spend_at`'s; with no spender found it is
+  counted from the block where the watcher first saw the funding spent (`gone_at`). The test rigs
+  mean one confirmation and say `spend_final_depth=1`.
+- **Item 12.** A ch1 lock from a ledger before AGP-088 is given its ch2 at the start and on every
+  tick (`name_legacy_locks`), and until then matches only a ch2 that holds it. The hub's view of ch1
+  lists the last 16 completed written-off locks with their `t + r` (`completed`); `RoutePayer` stops
+  counting a held lock that one of them proves completed. The cap check takes nothing off for a ch2
+  a changed payTo replaces, and that ch2 is `retired`. A completion ch1's ledger did not take leaves
+  the lock on the ch2 record (`ch1_not_written`); `refill_owed` is written with the close; a lock
+  pending on an archived open ch2 is written off and that ch2 closed as retired.
+- **The routed client's open (items 5, 18).** B1 already opened ch1 in stages through
+  `XbtChannelClient._ensure_open` (AGP-090). New: a ch1 the hub has not opened signs no lock, a ch1
+  already bound in the signer is not bound again, `open` says `resumed`, `RoutePayer.forget_unfunded`.
+  Not in B1: asking the wallet for an earlier send (`fund` is a bare callable).
+- **Item 13.** B1's watcher loops already caught a tick that raised (`RouteHub.watch`,
+  `watcher.Watcher._loop`): nothing changed.
+
+Tests: `tests/security/test_agp094_hub.py`, `test_agp093_hub.py`. Changed: two lines that asserted
+`route_blocked` after a provider refused for a channel-level reason (`test_agp053_make_before_break.py`,
+`test_agp057_refill_ahead.py`): refused at the check now, so nothing is written off.
+
 ## Fix wave 4, the hub (AGP-088)
 
 The hub items of the second closure audit (AGP-087), as xbt-rs agp-088 (its README has the table).
