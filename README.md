@@ -164,6 +164,32 @@ Tests and words only; no code of B1 changed.
   docstrings in `route_client.py` say the same. xbt-rs `RoutePayer` has an open of its own and still
   refuses `open_unresolved` there.
 
+## The hub's returns (AGP-104)
+
+Before this, two kinds of coin the hub got back stayed on keys only its state files know: the hub's
+remainder when a provider closed a ch2 (paid to that ch2's own payer key), and what clients paid,
+when a ch1 closed (paid to that ch1's own payee key). `sweep_payee` existed and nothing called it.
+
+**Rule R1: no coin of the hub's rests on a key only its state files know.** With
+`RouteHub(..., return_to=...)` (`python -m xbt402.hub` passes its wallet's `getnewaddress`): every
+ch2 the hub funds, and every rollover's next ch2, names a return address as its `payerSpk`; a refund
+pays it too; the watcher sweeps a closed ch1's payout there once the close is `spend_final_depth`
+deep; and what a ledger from before left on a ch2's own key is swept there after the upgrade.
+`_return_spk()` is the one function every return goes through. Without `return_to` nothing changes.
+
+**Rule R2: one signed sweep per output.** A sweep is written to the ledger before it is sent
+(`payee_sweep_intent` on a ch1, `sweep` on a ch2 record), the same bytes are sent again each block
+until the chain has them, and it is never signed again at another fee or to another address
+(`sweep_payee` called by hand gets the written one back). A sweep is final six blocks deep.
+
+Also: `capital_sat` (the liquidity cap as one setting, with one spare `ch2_capacity` kept for
+funding ahead), and `ch2_expiry_blocks` ships as 1,153, a default seller's floor (was 1,100, raised
+to 1,153 on every such open). The limits, the status page and the start-up checks (xbt-rs only) are
+in xbt-rs `README.md`, "The hub's returns, status and start-up checks (AGP-104)".
+
+Tests: `tests/security/test_agp104_returns.py` (18; xbt-rs has the same names). On regtest:
+xbt-rs `scripts/hub_returns_regtest.sh` runs this hub through a full cycle.
+
 ## Fix wave 5, the hub and the routed client (AGP-094)
 
 The hub and routed-client items of the third closure audit (AGP-093), as xbt-rs agp-094 (its README

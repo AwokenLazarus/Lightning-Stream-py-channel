@@ -138,11 +138,11 @@ from .hub_keys import WRAP_KEY_FILE, WrapKey
 from .route import (HUB_ROUTE_PATH, HUB_VIEW_PATH, ROLLOVER_PATH, ROUTE_LOCK_PATH, TERMS_PATH, FeeQuote, Invoice, canon_origin,
                     fee_due, find_spend, find_spend_at, hub_channel_message, next_cum, route_ok)
 from .rpc import RPCError
-from .tx import Tx, address_to_spk, segwit_address
+from .tx import Tx, TxIn, TxOut, address_to_spk, p2wpkh_spk, segwit_address
 from .x402_channel import (XbtChannelClient, XbtChannelProvider, b64json, binding_url, closing, request_auth, request_digest_v2,
                            same_origin_url,
                            safe_code, unb64json)
-from .channel import channel_auth_key
+from .channel import channel_auth_key, sign_p2wpkh
 
 
 @dataclass
@@ -196,12 +196,25 @@ class OutChannel:
     # AGP-094: the tip when the watcher first saw this funding spent in a block, for a spend whose depth
     # the scan does not give (0: not seen so, or the funding is unspent again)
     gone_at: int = 0
+    # AGP-104: the sweep of what a close or refund left on this ch2's own payer key (a ch2 from before it
+    # named a return address): {txid, hex, outpoint, value, fee, swept, dest_spk, at, gone_at, final,
+    # skipped} (empty: none yet). See RouteHub.sweep_tick
+    sweep: dict = field(default_factory=dict)
 
     def p(self) -> ChannelParams:
         return ChannelParams(**self.params)
 
 
 LIVE = ("funding", "funded", "open")                        # the hub's coins are committed
+SWEEP_VSIZE = 110            # AGP-104: a sweep is one P2WPKH input and one output (the close's CPFP child's size)
+# a closed ch1 whose payout is not on the chain this many blocks past its expiry is not looked at again:
+# its close never confirmed (the payer's refund took the funding)
+SWEEP_GIVE_UP_BLOCKS = 144
+
+
+def own_key(p: ChannelParams) -> bool:
+    """AGP-104: this ch2 pays its remainder to its own payer key (it named no return address)."""
+    return p.payer_spk == p2wpkh_spk(bytes.fromhex(p.payer_pub)).hex()
 WATCH_WAIT_ONE, WATCH_WAIT_BUDGET = 0.25, 1.0    # a watcher tick waits for one busy provider's mutex, and for all (AGP-053)
 ROLLOVER_GONE = "the rollover that funds this ch2 is in no block and not in the mempool"   # AGP-053
 # the watcher reconciles these until final. AGP-088: `rolled` too. A ch2 is rolled on the provider's answer
@@ -485,7 +498,7 @@ class HubConfig:
     delta: int = 144
     reveal_timeout: float = 10.0
     ch2_capacity: int = 100_000
-    ch2_expiry_blocks: int = 1_100
+    ch2_expiry_blocks: int = 1_153       # AGP-104: a default seller's floor (1,008 + minConf 1 + margin 144); was 1,100, raised to it
     liquidity_cap_sat: int = 0
     close_fee: int = 600                 # ch1 terms (the hub is ch1's payee)
     ch1_close_fee_payer: str = "payer"
@@ -513,6 +526,20 @@ class HubConfig:
     rollover_relay_grace: float = 60.0
     refill_ahead_locks: int = 4
     spend_final_depth: int = 6
+    # AGP-104: the operator's one number (0: unset). It is the liquidity cap (set it or liquidity_cap_sat,
+    # not two different values), and with funding ahead on (refill_ahead_locks > 0) a seller is admitted
+    # only while its ch2 and one spare ch2_capacity fit under it, so one seller's next ch2 can always be
+    # funded ahead
+    capital_sat: int = 0
+
+    def liquidity_cap(self) -> int:
+        """The hub's own coins in ch2s never pass this (0: no cap): capital_sat, else liquidity_cap_sat."""
+        return int(self.capital_sat) or int(self.liquidity_cap_sat)
+
+    def spare_sat(self) -> int:
+        """AGP-104: the room capital_sat keeps free of first fundings, so a next ch2 can be funded ahead:
+        one ch2_capacity (0 without capital_sat, or with funding ahead off)."""
+        return int(self.ch2_capacity) if self.capital_sat and self.refill_ahead_locks else 0
 
     @classmethod
     def from_dict(cls, d: dict) -> "HubConfig":
@@ -537,6 +564,13 @@ class HubConfig:
         # AGP-094: 0 would call a spend in the mempool final
         if isinstance(self.spend_final_depth, bool) or not isinstance(self.spend_final_depth, int) or self.spend_final_depth < 1:
             raise ValueError("spend_final_depth must be at least 1")
+        if self.capital_sat:
+            if self.liquidity_cap_sat and self.liquidity_cap_sat != self.capital_sat:
+                raise ValueError(f"capital_sat {self.capital_sat} and liquidity_cap_sat {self.liquidity_cap_sat} differ: set one")
+            need = self.ch2_capacity + self.spare_sat()
+            if self.capital_sat < need:
+                raise ValueError(f"capital_sat {self.capital_sat} holds no seller: one ch2 ({self.ch2_capacity}) and the "
+                                 f"spare for funding ahead ({self.spare_sat()}) need {need}")
 
     def funding_policy(self) -> FundingPolicy:
         return FundingPolicy(**{"close_margin": self.close_margin, **self.policy})
@@ -547,7 +581,8 @@ class RouteHub:
                  config: HubConfig = None, *, http: Callable = None, policy: FundingPolicy = None,
                  fee_strategy: Callable = None, refill: Callable[[str], "OutChannel"] = None,
                  refund_to: Callable[[], str] = None, wallet=None,
-                 refill_ahead: Callable[[str], "OutChannel"] = None, wrap_key: WrapKey = None, **overrides):
+                 refill_ahead: Callable[[str], "OutChannel"] = None, wrap_key: WrapKey = None,
+                 return_to: Callable[[], str] = None, **overrides):
         """`config` (a HubConfig) holds the operator's choices; keyword `overrides` set single fields
         (fee_ppm=..., liquidity_cap_sat=...). `fee_strategy`, if given, is a callable(hub) ->
         (fee_base_msat, fee_ppm) that replaces the configured one. `refill(origin)` funds the ch2 that
@@ -559,7 +594,13 @@ class RouteHub:
         `wallet` is an RPC handle on the fund wallet (default `rpc`): listtransactions/gettransaction,
         how the watcher finds a funding send whose fund call failed (AGP-045). `wrap_key` seals the ch2 keys in
         ch2.json (AGP-073 K1; default `<datadir>/hub-wrap-key`, made 0600 on first run): a state file sealed
-        under another key is refused (`keystore`)."""
+        under another key is refused (`keystore`).
+
+        AGP-104 (rule R1: no coin of the hub's rests on a key only its state files know): `return_to()`
+        gives an address the operator controls. With it, every ch2 funded from now on pays its remainder
+        there (its payerSpk), a refund does too, and the watcher sweeps there what closes left on
+        per-channel keys (sweep_tick). None (the default): as before, a provider's close pays the ch2's
+        own payer key, a ch1's payout stays on its payee key, and nothing is swept."""
         cfg = config or HubConfig()
         if isinstance(fee_strategy, dict):              # a configured strategy, not a callable
             overrides["fee_strategy"], fee_strategy = fee_strategy, None
@@ -580,7 +621,7 @@ class RouteHub:
         self.max_lock_sat, self.max_unguarded_lock_sat, self.delta = cfg.max_lock_sat, cfg.max_unguarded_lock_sat, cfg.delta
         self.reveal_timeout, self.close_margin, self.close_fee = cfg.reveal_timeout, cfg.close_margin, cfg.close_fee
         self.ch2_capacity, self.ch2_expiry_blocks = cfg.ch2_capacity, cfg.ch2_expiry_blocks
-        self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap_sat
+        self.rollover_margin, self.liquidity_cap_sat = cfg.rollover_margin, cfg.liquidity_cap()
         self.zero_conf_rollover = bool(cfg.zero_conf_rollover)
         self._zc_tried: set = set()  # (chan, tip): a rollover child's unconfirmed open, tried once a block
         self._ahead_tried: set = set()    # (origin, tip): an ahead refill that failed, tried once a block (AGP-057)
@@ -591,6 +632,8 @@ class RouteHub:
         self._refill = refill
         self._refill_ahead = refill_ahead
         self.refund_to = refund_to
+        self.return_to = return_to
+        self._sweep_tip = None            # the tip of the last sweep pass (AGP-104): sweeps are looked at once a block
         self.wallet = wallet if wallet is not None else rpc
         self._quote: Optional[FeeQuote] = None
         self._quote_seq = int(time.time())
@@ -1598,8 +1641,11 @@ class RouteHub:
         (AGP-057): the record is the origin's next ch2 (`next_chans`), beside its live one."""
         secret = secrets.randbelow(adaptor.N - 1) + 1
         pub = ecc.pubkey(secret).hex()
-        p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), network=self.network,
-                                 close_fee_payer=self.config.ch2_close_fee_payer)
+        # AGP-104 (R1): the remainder of this ch2 returns to an address the operator controls. A hook that
+        # fails funds nothing: a ch2 is never funded on its own key because the wallet was away
+        ret = self._return_spk()
+        p = ChannelParams.derive(terms["payTo"], pub, expiry, int(terms["extra"]["closeFeeSat"]), ret.hex() if ret else "",
+                                 network=self.network, close_fee_payer=self.config.ch2_close_fee_payer)
         p.capacity = cap
         self._preflight_ch2(origin, terms, p)
         tip = self.rpc.getblockcount()
@@ -1633,8 +1679,12 @@ class RouteHub:
                 # AGP-094: nothing is taken off for the ch2 this replaces (its /terms now name another
                 # payTo). It goes to the archive unspent and committed_sat goes on counting it there,
                 # so taking it off here funded one ch2 past the cap
-                if self.committed_sat() + cap > self.liquidity_cap_sat:
-                    raise ChannelError("liquidity_cap", f"{self.committed_sat()} + {cap} sat > liquidity_cap_sat "
+                # AGP-104: a first funding leaves capital_sat's spare free; one funded ahead uses it
+                spare = 0 if ahead else self.config.spare_sat()
+                if self.committed_sat() + cap + spare > self.liquidity_cap_sat:
+                    what = "capital_sat" if self.config.capital_sat else "liquidity_cap_sat"
+                    kept = f" + {spare} kept for funding ahead" if spare else ""
+                    raise ChannelError("liquidity_cap", f"{self.committed_sat()} + {cap} sat{kept} > {what} "
                                                         f"{self.liquidity_cap_sat}")
             if ahead:
                 self.out.next_chans[origin] = oc
@@ -1904,10 +1954,18 @@ class RouteHub:
             if kept.p().expiry - tip < open_expiry_floor(min_exp, min_conf, margin):
                 return self.close_ch2(oc, refill=True)
             secret, expiry = int(kept.secret, 16), kept.p().expiry
+            ret = kept.p().payer_spk      # the script every earlier attempt named (the provider may hold any)
         else:
             secret = secrets.randbelow(adaptor.N - 1) + 1
+            # AGP-104 (R1): the next ch2 returns where this one does; a ch2 on its own key (from before
+            # AGP-104) takes a return address for its next one
+            if own_key(p):
+                spk = self._return_spk()
+                ret = spk.hex() if spk else ""
+            else:
+                ret = p.payer_spk
         pub = ecc.pubkey(secret).hex()
-        nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, network=self.network,
+        nxt = ChannelParams.derive(oc.pay_to, pub, expiry, p.close_fee, ret, network=self.network,
                                    close_fee_payer=p.close_fee_payer)
         tx = p.rollover_tx(amount, nxt.spk, next_cap)
         txid = tx.txid()
@@ -2171,7 +2229,9 @@ class RouteHub:
                 dest = Tx.parse(bytes.fromhex(oc.refund_hex)).outputs[0].script_pubkey
                 f = self._bumped_fee(oc, dest)
             else:
-                dest = address_to_spk(self.refund_to(), self.hrp) if self.refund_to else None
+                # AGP-104 (R1): a ch2 that names its own key (from before it named a return address) is
+                # refunded to one; any other refund pays its payerSpk
+                dest = address_to_spk(self.refund_to(), self.hrp) if self.refund_to else (self._return_spk() if own_key(p) else None)
                 f = self.refund_fee(p, dest)
             if bump and f <= oc.refund_fee:
                 # at the cap: nothing higher to sign; send what we have and look again in refund_bump_blocks
@@ -2349,7 +2409,263 @@ class RouteHub:
             actions += [{"event": "ch1_close", "txid": t} for t in self.inbound.close_due()]
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"hub watcher ch1: {e}\n")
+        # AGP-104 (R1): what closes left on per-channel keys goes to the return address
+        try:
+            actions += self.sweep_tick(tip)
+        except Exception as e:  # noqa: BLE001
+            self._sweep_error("tick", "", e)
         return actions
+
+    # --- returns (AGP-104) ---------------------------------------------------------------------------
+
+    def _return_spk(self) -> Optional[bytes]:
+        """AGP-104: THE address a coin the hub gets back is paid to, as a script (None: no `return_to`
+        hook). Every return goes through here: a ch2's payerSpk at funding and at rollover, a refund of
+        a ch2 that names its own key, and both sweeps. Witness v0 only (P2WPKH or P2WSH): what every
+        provider takes as a payerSpk and what a sweep can pay."""
+        if self.return_to is None:
+            return None
+        try:
+            spk = address_to_spk(self.return_to(), self.hrp)
+        except ChannelError:
+            raise
+        except Exception as e:  # noqa: BLE001 - the wallet is away, or what it gave is no address
+            raise ChannelError("return_address", f"no return address: {e}")
+        if not (len(spk) in (22, 34) and spk[0] == 0 and spk[1] == len(spk) - 2):
+            raise ChannelError("return_address", "the return address must be a witness v0 address (bech32 P2WPKH or P2WSH)")
+        return spk
+
+    def _sweep_fee(self) -> tuple:
+        """(the fee of a sweep now, the least a sweep ever costs): a refund's rate (the node's estimate
+        for refund_conf_target, at least refund_min_feerate) or this node's mempool floor if higher, on
+        SWEEP_VSIZE, never above refund_max_fee_sat."""
+        floor = math.ceil(float(self.config.refund_min_feerate) * SWEEP_VSIZE)
+        rate = float(self.config.refund_min_feerate)
+        try:
+            est = self.rpc.estimatesmartfee(int(self.config.refund_conf_target)) or {}
+            if est.get("feerate"):
+                rate = max(rate, float(est["feerate"]) * 1e8 / 1000)
+        except Exception:  # noqa: BLE001 - no estimate: the floor
+            pass
+        try:
+            mi = self.rpc.getmempoolinfo() or {}
+            rate = max(rate, max(float(mi.get("mempoolminfee") or 0), float(mi.get("minrelaytxfee") or 0)) * 1e8 / 1000)
+        except Exception:  # noqa: BLE001
+            pass
+        return min(math.ceil(rate * SWEEP_VSIZE), max(int(self.config.refund_max_fee_sat), floor)), floor
+
+    def _deep(self, txid: str, vout: int) -> bool:
+        """The output is in the confirmed set, spend_final_depth blocks deep."""
+        u = self.rpc.gettxout(txid, int(vout), False)
+        return bool(u) and int(u.get("confirmations") or 0) >= max(1, int(self.config.spend_final_depth))
+
+    def _sweep_look(self, sw: dict, funding: tuple, note: dict, tip: int) -> str:
+        """Rule R2: what the chain shows of the sweep `sw` (txid, outpoint), which was written ahead:
+        "final" (spend_final_depth deep), "wait" (in the mempool or a recent block), or "resend" (its
+        input is unspent and this node does not have it: the same bytes go out again). `funding`: the
+        channel funding whose spend put the coin on the outpoint. `note["gone_at"]`: the tip when the
+        sweep's own output was first seen spent again (a wallet that spends what it was paid early)."""
+        depth = max(1, int(self.config.spend_final_depth))
+        if self._deep(sw["txid"], 0):
+            return "final"
+        if self.rpc.gettxout(sw["txid"], 0, True) is not None:
+            note["gone_at"] = 0
+            return "wait"
+        stx, svout = sw["outpoint"].rsplit(":", 1)
+        if self.rpc.gettxout(stx, int(svout), True) is not None:
+            note["gone_at"] = 0          # the coin is still where the sweep takes it from: the sweep left the mempool
+            return "resend"
+        if self.rpc.gettxout(funding[0], int(funding[1]), True) is not None:
+            note["gone_at"] = 0          # the spend the coin came from left the chain (a reorg): it comes back first
+            return "wait"
+        # the coin left the outpoint and the sweep's output is not there: only this sweep was ever signed
+        # for it, so it confirmed and what it paid was spent on. Counted from here
+        if not note.get("gone_at"):
+            note["gone_at"] = tip
+        return "final" if tip - int(note["gone_at"]) + 1 >= depth else "wait"
+
+    def _ev(self, ev: dict) -> list:
+        self.events.append(ev)
+        return [ev]
+
+    def _sweep_ch1(self, ch1: str, tip: int) -> list:
+        """AGP-104 (R1): one closed ch1. Its close paid the hub on that channel's own payee key; once
+        that output is spend_final_depth deep it is swept to the return address (sweep_payee: written
+        ahead, then sent), and the sweep is watched until it is that deep itself. An output under the
+        least a sweep costs plus dust is left (`skipped`)."""
+        led = self.inbound.ledger
+        with led.lock:
+            st = led.channels.get(ch1)
+            ex = dict((st.extra or {}) if st else {})
+        note = dict(ex.get("sweep") or {})
+        if st is None or not st.closed_txid or note.get("final"):
+            return []
+
+        def save(**kv):
+            with led.lock:
+                cur = led.channels.get(ch1)
+                cur.extra = {**(cur.extra or {}), "sweep": {**((cur.extra or {}).get("sweep") or {}), **kv}}
+                led.save(cur)
+
+        def skip(why, value):
+            save(final=True, skipped=why)
+            return self._ev({"event": "ch1_sweep_skipped", "chan": ch1, "value": value, "why": why})
+        i = ex.get("payee_sweep_intent")
+        if i and i.get("hex"):
+            was = int(note.get("gone_at") or 0)
+            look = self._sweep_look(i, (st.params.funding_txid, st.params.funding_vout), note, tip)
+            if int(note.get("gone_at") or 0) != was:
+                save(gone_at=int(note.get("gone_at") or 0))
+            if look == "final":
+                save(final=True)
+                return self._ev({"event": "ch1_swept", "chan": ch1, "txid": i["txid"], "swept": i.get("swept"), "fee": i.get("fee")})
+            if look == "resend":
+                try:
+                    self.rpc.sendrawtransaction(i["hex"])
+                except Exception as e:  # noqa: BLE001 - tried again next block
+                    return self._ev({"event": "ch1_sweep_failed", "chan": ch1, "txid": i["txid"], "error": str(e)[:200]})
+                return self._ev({"event": "ch1_sweep_resent", "chan": ch1, "txid": i["txid"]})
+            return []
+        if ex.get("payee_sweep"):
+            save(final=True)             # swept by an operator's tool before the hub swept
+            return []
+        found = self.inbound.payee_output(ch1)
+        if found is None:
+            return skip("the close pays nothing to this channel's key", 0)
+        txid, vout, value = found
+        if not self._deep(txid, vout):
+            # not six deep yet. Given up only when this node shows no such output at all, long after the
+            # payer's refund became valid: one that is there and shallow is waited for
+            if tip > st.params.expiry + SWEEP_GIVE_UP_BLOCKS and self.rpc.gettxout(txid, vout, True) is None:
+                return skip("its close is not on the chain", value)
+            return []
+        fee, floor = self._sweep_fee()
+        if value < floor + DUST:
+            return skip("under the cost of a sweep plus dust", value)
+        if value < fee + DUST:
+            return []                    # the fee is above what this output bears now: looked at again next block
+        dest = self._return_spk()
+        if dest is None:
+            return []
+        rec = self.inbound.sweep_payee(ch1, dest, fee)
+        return self._ev({"event": "ch1_sweep", "chan": ch1, "txid": rec["txid"], "value": value, "fee": fee, "swept": rec["swept"]})
+
+    @staticmethod
+    def _sweepable(r: dict) -> bool:
+        """AGP-104: a ch2 record that may hold coins on its own payer key: its funding's spend is final,
+        it was closed by the provider or refunded, and it named no return address."""
+        p = r.get("params") or {}
+        return (bool(r.get("final")) and r.get("state") in ("closed", "refunded") and bool(p.get("funding_txid"))
+                and p.get("payer_spk") == p2wpkh_spk(bytes.fromhex(p["payer_pub"])).hex() and not (r.get("sweep") or {}).get("final"))
+
+    def _sweep_ch2(self, oc: OutChannel, tip: int) -> list:
+        """AGP-104 (R1): one ch2 record whose close or refund is final and which named no return address
+        (a ledger from before AGP-104, or a hub that ran without the hook): what that spend left on the
+        ch2's own payer key is swept to the return address, written ahead and watched as a ch1's sweep is.
+        The caller saves the record."""
+        p = oc.p()
+
+        def skip(why):
+            oc.sweep = {**oc.sweep, "final": True, "skipped": why}
+            return []
+        if oc.sweep.get("hex"):
+            look = self._sweep_look(oc.sweep, (p.funding_txid, p.funding_vout), oc.sweep, tip)
+            if look == "final":
+                oc.sweep = {**oc.sweep, "final": True}
+                return self._ev({"event": "ch2_swept", "provider": oc.origin, "chan": p.channel_id, "txid": oc.sweep["txid"],
+                                 "swept": oc.sweep.get("swept"), "fee": oc.sweep.get("fee")})
+            if look == "resend":
+                try:
+                    self.rpc.sendrawtransaction(oc.sweep["hex"])
+                except Exception as e:  # noqa: BLE001 - tried again next block
+                    return self._ev({"event": "ch2_sweep_failed", "provider": oc.origin, "chan": p.channel_id,
+                                     "txid": oc.sweep["txid"], "error": str(e)[:200]})
+                return self._ev({"event": "ch2_sweep_resent", "provider": oc.origin, "chan": p.channel_id, "txid": oc.sweep["txid"]})
+            return []
+        depth, src = max(1, int(self.config.spend_final_depth)), None
+        for t in [x for x in (oc.close_txid, oc.refund_txid) if x]:
+            for n in range(3):
+                u = self.rpc.gettxout(t, n, False)
+                if u and u["scriptPubKey"].get("hex") == p.payer_spk and int(u.get("confirmations") or 0) >= depth:
+                    src = (t, n, round(float(u["value"]) * 1e8))
+        if src is None and oc.state == "closed" and not oc.close_txid:
+            # closed by a spend this node never showed: one look at the UTXO set for this key
+            hits = (self.rpc.scantxoutset("start", [f"raw({p.payer_spk})"]) or {}).get("unspents") or []
+            if hits:
+                src = (hits[0]["txid"], int(hits[0]["vout"]), round(float(hits[0]["amount"]) * 1e8))
+        if src is None:
+            return skip("nothing on its own key")
+        stx, svout, value = src
+        fee, floor = self._sweep_fee()
+        if value < floor + DUST:
+            return skip("under the cost of a sweep plus dust")
+        if value < fee + DUST:
+            return []
+        dest = self._return_spk()
+        if dest is None:
+            return []
+        tx = Tx(version=2, inputs=[TxIn(bytes.fromhex(stx)[::-1], svout, 0xFFFFFFFD)], outputs=[TxOut(value - fee, dest)], locktime=0)
+        sign_p2wpkh(int(oc.secret, 16), tx, [TxOut(value, bytes.fromhex(p.payer_spk))])
+        txid = tx.txid()
+        # write-ahead (R2): the one sweep of this output, before it is sent
+        with self.out.lock:
+            oc.sweep = {"txid": txid, "hex": tx.hex(), "outpoint": f"{stx}:{svout}", "value": value, "fee": fee,
+                        "swept": value - fee, "dest_spk": dest.hex(), "at": tip}
+            self._sweep_saved(oc)
+        if self.stop_at == "sweep":
+            raise ChannelError("test_stop", "sweep")
+        try:
+            self.rpc.sendrawtransaction(tx.hex())
+        except Exception as e:  # noqa: BLE001 - tried again next block
+            return self._ev({"event": "ch2_sweep_failed", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "error": str(e)[:200]})
+        return self._ev({"event": "ch2_sweep", "provider": oc.origin, "chan": p.channel_id, "txid": txid, "value": value,
+                         "fee": fee, "swept": value - fee})
+
+    def _sweep_saved(self, oc: OutChannel):
+        """Write `oc` back where the sweep pass took it from (a live record is the object itself)."""
+        i = getattr(oc, "_archived_at", None)
+        if i is not None:
+            self.out.archived[i] = asdict(oc)
+        self.out.save()
+
+    def sweep_tick(self, tip: int) -> list:
+        """AGP-104 (rule R1): sweep what closes left on per-channel keys to the return address, and watch
+        the sweeps already out (rule R2). Once a block, and only with a return hook set. Every closed
+        ch1 not yet swept for good, then every ch2 record that named no return address. Errors are per
+        channel (`sweep_error`) and are tried again next block."""
+        if self.return_to is None or self._sweep_tip == tip:
+            return []
+        self._sweep_tip = tip
+        acts = []
+        with self.inbound.ledger.lock:
+            ch1s = [c for c, st in self.inbound.ledger.channels.items()
+                    if st.closed_txid and not ((st.extra or {}).get("sweep") or {}).get("final")]
+        for ch1 in ch1s:
+            try:
+                acts += self._sweep_ch1(ch1, tip)
+            except Exception as e:  # noqa: BLE001 - one channel never stops the rest
+                self._sweep_error("ch1", ch1, e)
+        with self.out.lock:
+            live = [oc for oc in self.out.chans.values() if self._sweepable(asdict(oc))]
+            old = [i for i, r in enumerate(self.out.archived) if self._sweepable(r)]
+        todo = [(oc, None) for oc in live]
+        for i in old:
+            oc = OutChannel(**self.out.archived[i])
+            oc._archived_at = i
+            todo.append((oc, i))
+        for oc, i in todo:
+            try:
+                acts += self._sweep_ch2(oc, tip)
+            except Exception as e:  # noqa: BLE001
+                self._sweep_error("ch2", oc.p().channel_id, e)
+            with self.out.lock:
+                self._sweep_saved(oc)
+        return acts
+
+    def _sweep_error(self, what: str, chan: str, e: Exception):
+        msg = str(e)[:200]
+        sys.stderr.write(f"hub watcher sweep {what} {chan}: {msg}\n")
+        self.events.append({"event": "sweep_error", "what": what, "chan": chan, "error": msg})
 
     def _watch_next(self, origin: str, oc: OutChannel, tip: int) -> list:
         """AGP-057: one origin's next ch2. A `funding` one is reconciled like any (the fund hook failed); a
@@ -3015,8 +3331,10 @@ def main(argv=None, serve: bool = True):
     if not conf.get("wrap_key_file"):
         sys.stderr.write(f"hub: ch2 wrap key {wrap_path} (beside the state it seals: set wrap_key_file to keep it apart)\n")
     os.makedirs(datadir, exist_ok=True)
+    # AGP-104: every coin the hub gets back is paid to the hub's wallet: a ch2's remainder and its refund
+    # (AGP-037), the sweep of a closed ch1. bech32 whatever the wallet default (AGP-044)
     hub = RouteHub(rpc, secret, conf["network"], datadir, fund, cfg, wallet=wallet,
-                   refund_to=lambda: wallet.getnewaddress("", "bech32"),   # bech32 whatever the wallet default (AGP-044)
+                   return_to=lambda: wallet.getnewaddress("", "bech32"),
                    wrap_key=WrapKey.load_or_create(wrap_path))
     for origin in conf.get("connect", []):
         if origin.rstrip("/") not in hub.out.chans:

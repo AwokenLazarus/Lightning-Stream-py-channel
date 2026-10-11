@@ -119,7 +119,9 @@ class HubB(unittest.TestCase):
         prov = XbtChannelProvider(node, 0xB0B, R.NET, tempfile.mktemp(suffix=".sqlite"), lambda m, p: 1, lambda m, p, b: (200, {}, b""))
         ex = prov.terms()["extra"] if hasattr(prov, "terms") else None
         cfg = HubConfig()
-        self.assertEqual(cfg.ch2_expiry_blocks, 1_100)
+        # (AGP-104: the shipped ch2_expiry_blocks is that floor now, 1,153, where it was 1,100 and was raised
+        # to it for every default seller. What is asked did not change, and neither did this)
+        self.assertEqual(cfg.ch2_expiry_blocks, 1_153)
         floor = prov.policy.min_expiry_blocks + prov.policy.min_conf + prov.close_margin
         self.assertEqual((prov.policy.min_expiry_blocks, prov.policy.min_conf, prov.close_margin, floor), (1_008, 1, 144, 1_153))
         if ex is not None:

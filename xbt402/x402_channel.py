@@ -1221,11 +1221,44 @@ class XbtChannelProvider:
             self.ledger.save(st)
             return child.txid()
 
+    def _payee_found(self, st, close, vout: int) -> tuple:
+        """(txid, vout, sats): the close's payee output `vout`, or the output of the CPFP child (the
+        latest, or one it replaced) that moved it to the same key and that this node shows (AGP-067)."""
+        base = close.outputs[vout].value
+        from_txid, value = st.closed_txid, base
+        bump = (st.extra or {}).get("close_bump") or {}
+        if int(bump.get("fee") or 0) > 0:
+            kids = [(bump.get("txid") or "", int(bump.get("fee") or 0))] + [(t, int(f)) for t, f in bump.get("replaced") or []]
+            for kid, kfee in reversed([k for k in kids if k[0]]):
+                if self.rpc.gettxout(kid, 0, True) is not None:
+                    from_txid, vout, value = kid, 0, max(0, base - kfee)
+        return from_txid, vout, value
+
+    def payee_output(self, chan: str) -> Optional[tuple]:
+        """AGP-104: where this closed channel's payout is now, (txid, vout, sats): the close's payee
+        output, or the CPFP child's. None: the channel has no recorded close, or its close pays nothing
+        to the payee key."""
+        from .tx import Tx
+        with self.ledger.lock:
+            st = self.ledger.channels.get(canonical_chan(chan))
+            if not st:
+                raise ChannelError("unknown_channel")
+            if not st.closed_txid or not (st.extra or {}).get("close_hex"):
+                return None
+            close = Tx.parse(bytes.fromhex(st.extra["close_hex"]))
+            payee_spk = bytes.fromhex(st.params.payee_spk)
+            vout = next((n for n, o in enumerate(close.outputs) if o.script_pubkey == payee_spk), None)
+            return None if vout is None else self._payee_found(st, close, vout)
+
     def sweep_payee(self, chan: str, dest_spk: bytes, fee: int) -> dict:
         """Move this channel's payee close output, P2WPKH(P) with p = payTo_secret + t, to
         `dest_spk` (witness v0 only: P2WPKH or P2WSH), signed SIGHASH_ALL|UNIFIED (0x21). p is used
         here and never returned or written anywhere. Reads the close from the ledger (the exact close
-        hex this provider sent), so it needs no txindex. Idempotent: a sweep already made is returned."""
+        hex this provider sent), so it needs no txindex. Idempotent: a sweep already made is returned.
+
+        AGP-104 rule: one signed sweep per output. A sweep written ahead (`payee_sweep_intent`) whose
+        send failed is the one sent again, with the destination and fee it was signed for, whatever this
+        call names: signing another would spend the same output twice."""
         from .channel import sign_p2wpkh
         from .tx import Tx, TxIn, TxOut
         dest_spk = bytes(dest_spk)
@@ -1245,15 +1278,19 @@ class XbtChannelProvider:
             vout = next((n for n, o in enumerate(close.outputs) if o.script_pubkey == payee_spk), None)
             if vout is None:
                 raise ChannelError("no_payee_output", "the close pays nothing to the payee key")
-            # AGP-067: a CPFP child (the latest, or one it replaced) moved the output to the same key
-            base = close.outputs[vout].value
-            from_txid, value = st.closed_txid, base
-            bump = (st.extra or {}).get("close_bump") or {}
-            if int(bump.get("fee") or 0) > 0:
-                kids = [(bump.get("txid") or "", int(bump.get("fee") or 0))] + [(t, int(f)) for t, f in bump.get("replaced") or []]
-                for kid, kfee in reversed([k for k in kids if k[0]]):
-                    if self.rpc.gettxout(kid, 0, True) is not None:
-                        from_txid, vout, value = kid, 0, max(0, base - kfee)
+            from_txid, vout, value = self._payee_found(st, close, vout)
+            intent = (st.extra or {}).get("payee_sweep_intent") or {}
+            if intent.get("hex") and intent.get("outpoint") == f"{from_txid}:{vout}":
+                tx = Tx.parse(bytes.fromhex(intent["hex"]))
+                try:
+                    self.rpc.sendrawtransaction(intent["hex"])
+                except Exception as e:  # noqa: BLE001 - node errors become protocol errors
+                    if not self._tx_known(tx.txid(), tx):
+                        raise ChannelError("sweep_failed", str(e))
+                rec = {k: v for k, v in intent.items() if k != "hex"}
+                st.extra = {**st.extra, "payee_sweep": rec}
+                self.ledger.save(st)
+                return rec
             if value - int(fee) < DUST:
                 raise ChannelError("bad_amount", f"fee {fee} leaves dust from {value}")
             if self.rpc.gettxout(from_txid, vout, True) is None:
