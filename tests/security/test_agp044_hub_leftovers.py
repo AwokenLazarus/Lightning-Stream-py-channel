@@ -57,6 +57,7 @@ class W:
     def new_hub(self, **cfg):
         opts = dict(fee_base_msat=100, fee_ppm=2_000, max_lock_sat=20_000, max_unguarded_lock_sat=500, delta=36,
                     reveal_timeout=1.0, ch2_capacity=100_000, ch2_expiry_blocks=1_000, close_margin=36,
+                    spend_final_depth=1,                      # (AGP-094: one confirmation, as written)
                     policy=FundingPolicy(min_capacity=20_000, min_expiry_blocks=500, max_expiry_blocks=8_640, close_margin=36))
         opts.update(cfg)
         h = RouteHub(self.node, 0x4B4B, R.NET, self.datadir, self.fund, http=self.net.http, **opts)

@@ -56,7 +56,8 @@ def hub_at(node, net, datadir, **kw):
     """A hub over an existing datadir (a restart)."""
     crashed(datadir)
     return RouteHub(node, 0x4B4B, R.NET, datadir, node.fund_address, http=net.http, close_margin=36, delta=36,
-                    ch2_capacity=100_000, ch2_expiry_blocks=1_000, **kw)
+                    ch2_capacity=100_000, ch2_expiry_blocks=1_000,
+                    **{"spend_final_depth": 1, **kw})          # (AGP-094: one confirmation, as written)
 
 
 class _World(unittest.TestCase):

@@ -50,7 +50,7 @@ class Wrapped:
 
     def serve(self, method, path, headers, body, url):
         r = self.inner.serve(method, path, headers, body, url)
-        if path == ROUTE_LOCK_PATH:
+        if path == ROUTE_LOCK_PATH and not R.is_lock_check(path, body):   # (AGP-094: the lock, not the hub's check of it)
             with self.cv:
                 if self.armed:
                     self.entered = True
