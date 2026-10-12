@@ -1,6 +1,6 @@
 """Hash-locked conditional increment (XBT-055 / B4 merge into B1).
 
-A Spillman state that already pays `uncond` to the payee plus `cond` to a P2WSH hashlock:
+A Spilman state that already pays `uncond` to the payee plus `cond` to a P2WSH hashlock:
 
     OP_IF    OP_SHA256 <H> OP_EQUALVERIFY <P> OP_CHECKSIG
     OP_ELSE  <Δ> OP_CSV OP_DROP <A> OP_CHECKSIG

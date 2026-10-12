@@ -1,4 +1,4 @@
-"""xbt402 Spillman-style unidirectional channel: funding script, state (commitment) txs,
+"""xbt402 Spilman-style unidirectional channel: funding script, state (commitment) txs,
 payee close and payer refund. Every channel signature is SIGHASH_ALL|UNIFIED (0x21).
 
 Funding output is P2WSH of
@@ -13,7 +13,7 @@ Funding output is P2WSH of
 - pay path  (any time):        witness = [payer_sig, payee_sig, 0x01, script]
 - refund    (height >= expiry): witness = [payer_sig, <empty>, script], nLockTime = expiry
 
-The CLTV branch replaces the presigned refund of the original Spillman design, so the payer
+The CLTV branch replaces the presigned refund of the original Spilman design, so the payer
 needs nothing from the payee before funding, and segwit makes the funding txid final.
 """
 from dataclasses import dataclass, asdict
