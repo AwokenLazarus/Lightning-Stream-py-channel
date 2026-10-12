@@ -130,8 +130,8 @@ OP_ENDIF <A> OP_CHECKSIG
 
 `closeFeePayer` (fixed at open, absent = `"payer"`) splits the close fee: `"payer"` gives
 `payerFee = closeFeeSat, payeeFee = 0` (the client pays, as on any plain channel); `"payee"` gives
-`payerFee = 0, payeeFee = closeFeeSat` (the server pays its own settlement; used on hub-funded routed
-channels). `cum` is always what the client has paid.
+`payerFee = 0, payeeFee = closeFeeSat` (the server pays its own settlement). `cum` is always what the
+client has paid.
 
 The client signs it `SIGHASH_ALL|UNIFIED` (`0x21`), strict DER, low S.
 
@@ -529,7 +529,7 @@ paths `/x402/xbt-channel/*` are unchanged, so existing channels and keys are una
 | Spec file | `specs/schemes/batch-settlement/scheme_batch_settlement_xbt.md` (not `_bitcoin`; that is PR #3544) |
 | Error prefix | `invalid_batch_settlement_xbt_*` |
 | `extra.assetTransferMethod` | `"channel"` (emitted) |
-| Control paths | `/x402/xbt-channel/open`, `/close`, `/rollover`, `/terms`, `/lock` (advertised in `extra`) |
+| Control paths | `/x402/xbt-channel/open`, `/close`, `/rollover`, `/terms` (advertised in `extra`) |
 | Key-derivation tag | `xbt-channel/payee/v2` (unchanged) |
 
 **Mapping to what `batch-settlement` requires of a network binding:**

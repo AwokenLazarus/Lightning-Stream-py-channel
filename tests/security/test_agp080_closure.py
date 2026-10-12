@@ -1,6 +1,6 @@
 """AGP-080: the closure audit's (AGP-077) B1 side paths.
   * X1: a seller-supplied openUrl / closeUrl stays on the seller's origin (`origin + "@evil.example/open"`
-    named another host), in the client, the routed client and the hub; the client transport does not
+    named another host), in the client; the client transport does not
     follow redirects (the B2 wallet pays through it, so a 3xx from an allowlisted origin reached any host);
   * WM: the library Payer advances its watermark on a 0xA3 state, so it never signs a plain state
     below one (B1's Payer signs no conditional states: those are B2's and the Rust signer's).

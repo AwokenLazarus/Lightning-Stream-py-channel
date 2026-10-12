@@ -13,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 
-import test_agp084_hub_leftovers as L  # noqa: E402  (errored_spend, rollover_req, down, code_of)
+import test_agp084_errored_spend as L  # noqa: E402  (errored_spend, rollover_req, down, code_of)
 
 from xbt402.x402_channel import MAX_KEPT_INTENTS  # noqa: E402
 

@@ -7,8 +7,8 @@ reference implementation (`xbt402`) implements this text, and `vectors.json` is 
 
 **v1.2-draft additions**, 2026-09-28: who pays a state's close fee is a channel term,
 `closeFeePayer` (§12). Absent means `"payer"`, the v1.1 format, so v1.2 is wire-compatible with v1.1:
-a v1.1 party never sees the field and every v1.1 byte (states, vectors, 402s) is unchanged. Hub-funded
-routed channels use `"payee"`: the provider pays its own settlement. [Changes in v1.2](#changes-in-v12).
+a v1.1 party never sees the field and every v1.1 byte (states, vectors, 402s) is unchanged. Under
+`"payee"` the provider pays its own settlement. [Changes in v1.2](#changes-in-v12).
 
 **v1.3-draft (AGP-068)**, 2026-10-08. Not wire-compatible with v1.2. `extra.derivation` is `"v3"`, so a
 v1.2 client (which requires `"v2"`) refuses the offer before it funds. The payee-key algorithm is
@@ -149,7 +149,7 @@ being served). Under **prepay** the client risks one call. Neither can take more
 | `derivation` | `v2` | `extra` | The payee-key derivation of §5.1. v1.0 had no such field (its derivation omitted the network). A client MUST refuse any other value **before funding**. |
 | `DUST` | 546 sat | protocol | Smallest output either side creates, and smallest signed `cum`. Above the node's own floors (Knots 29.4.2, default `dustrelayfee`): 294 sat for P2WPKH, 330 for P2WSH and P2TR. |
 | `closeFeeSat` | 600 sat (reference) | `extra` | Fixed at open, paid out of the side `closeFeePayer` names (the client's by default). A close is 170–171 vB with P2WPKH client change, so about 3.5 sat/vB (183 vB, 3.3 sat/vB, with P2WSH or P2TR change; 139–140 vB without change; a conditional close, §6.5, is 214 vB, 2.8 sat/vB). Clients SHOULD refuse offers above a cap (reference: 2,000). |
-| `closeFeePayer` | `"payer"` (default) or `"payee"` | `extra`, open | v1.2 (§12). Fixed at open. Absent means `"payer"`. Hub-funded routed channels: `"payee"`. |
+| `closeFeePayer` | `"payer"` (default) or `"payee"` | `extra`, open | v1.2 (§12). Fixed at open. Absent means `"payer"`. |
 | `minCapacity`, `maxCapacity` | 20,000 / 10,000,000 sat (reference) | `extra` | Provider policy. |
 | `minExpiryBlocks`, `maxExpiryBlocks` | 1,008 / 8,640 (reference) | `extra` | Blocks from the tip at open (about 7 and 60 days). |
 | `closeMarginBlocks` | 144 (reference) | `extra` | The provider stops serving and MUST close at `expiry − closeMarginBlocks`. |
@@ -658,8 +658,7 @@ never strands coins. A later derivation would be `"v3"` under the same rule.
 
 Other candidates for a later version: advertise the large-channel confirmation rule in `extra`
 (`largeCapacity`, `minConfLarge`); a taproot variant `xbt-channel-tr` (MuSig2 key path, script leaves
-without `OP_IF`, smaller and more private closes); hash-locked outputs inside states so a hub can route
-payments without custody.
+without `OP_IF`, smaller and more private closes).
 
 ## 12. v1.2: who pays the close fee (`closeFeePayer`)
 A channel's terms name who pays `closeFeeSat`, fixed at open:
@@ -672,24 +671,19 @@ A channel's terms name who pays `closeFeeSat`, fixed at open:
 A client output below 546 is omitted (added to the fee) in both. `cum` keeps its meaning: the
 cumulative amount the client has paid. Only the split of the fee moves.
 
-**Why.** On a routed path (hub routing, AGP-019/021) the hub funds and pays the hub → provider channel.
-Under payer-pays it paid every provider settlement's close fee, 5% of each payout at a 20× settle
-threshold, and had to price that into its routing fee. Under payee-pays each provider pays its own
-settlement, decides when a settlement is worth it, and hub fees price only liquidity and routing.
+**Why.** Under payer-pays the client pays every provider settlement's close fee, 5% of each payout at a
+20× settle threshold. Under payee-pays each provider pays its own settlement and decides when a
+settlement is worth it.
 
 **Negotiation.** The funding script does not depend on `closeFeePayer`, so it is agreed at the open
 and both sides build every later transaction from it.
-- A provider advertises it in its 402 `extra` for plain channels (absent: `"payer"`), and in its
-  `GET /x402/xbt-channel/terms` for hub-funded channels (the reference: `"payee"`).
-- The client (or hub) sends `channel.closeFeePayer` in the open (§7.2). A provider MUST accept `"payer"`,
-  which only costs the client, and MUST refuse `"payee"` (`bad_fee_payer`) unless it offered it for that
-  kind of channel.
+- A provider advertises it in its 402 `extra` (absent: `"payer"`), and in its
+  `GET /x402/xbt-channel/terms`, which always names it.
+- The client sends `channel.closeFeePayer` in the open (§7.2). A provider MUST accept `"payer"`,
+  which only costs the client, and MUST refuse `"payee"` (`bad_fee_payer`) unless it offered it.
 - The provider echoes a non-default value, with `minCum`, and the client MUST check the echo before
   signing: a v1.1 provider ignores the field, opens a payer-pays channel, and would refuse every state
   a payee-pays client signs. The reference client stops there; its refund returns the funds at `expiry`.
-- A hub advertises both hops in `extra.routing`: `ch1CloseFeePayer` (client → hub, the reference:
-  `"payer"`, as for any plain channel) and `ch2CloseFeePayer` (hub → provider, `"payee"`). A hub
-  configured for payee-pays refuses to fund a channel to a provider whose `/terms` do not offer it.
 
 **Security.**
 1. *The payee cannot lower the client's output.* Under `"payee"` the client's output is
@@ -713,8 +707,8 @@ and both sides build every later transaction from it.
    provider's output pays, and a verifier MUST refuse it. The next channel inherits `closeFeePayer`.
 5. *Settlement policy.* The provider's threshold counts its own fee: it settles once its **net** payout
    `cum − closeFeeSat` is at least `settleMultiple × closeFeeSat` (fees at most 1/settleMultiple of the
-   payout; reference 20), or near its close margin. Because the fee is now the provider's, a client or
-   hub could make it pay many fees on small payouts by rolling over early and often: a provider MUST NOT
+   payout; reference 20), or near its close margin. Because the fee is now the provider's, a client
+   could make it pay many fees on small payouts by rolling over early and often: a provider MUST NOT
    co-sign a payee-pays rollover below its threshold unless the channel is within
    `rolloverGraceBlocks` (advertised in `/terms`, reference 36) of its close margin, and answers
    `settle_early`. A cooperative close the client asks for is still honoured (the client would
@@ -724,15 +718,7 @@ and both sides build every later transaction from it.
    never the hash-lock output. So a conditional state needs `uncond ≥ minCum`. A client that reclaims
    `condAmount` through the CSV branch (the provider never revealed `k`) gets all of it and pays none
    of the provider's close fee. The claim fee still comes out of `condAmount` as in v1.1.
-7. *Adaptor-locked states (routing).* A routed lock is an adaptor pre-signature over an ordinary `0x21`
-   state, so it is over the payee-pays state of that channel: the provider pre-verifies it against
-   `state_tx(cum)` built from its own terms, and a pre-signature made for the other fee payer fails
-   pre-verify (`bad_adaptor`). A routed channel's cumulative state is `max(routed + d, minCum)`, and
-   the hub pre-pays that floor once per channel. The hub's worst case for a provider that closes at the
-   floor stays what it was in v1.1: v1.1 floored at 546 and the hub paid the 600-sat close fee on top,
-   v1.2 floors at 1,146 and the provider pays the fee out of it, so both lose the hub
-   `1,146 − routed` sat per channel.
-8. *Close report.* The close answer (§7.5) and `/x402/settle` (§7.6) report `cum` / `amount` as the
+7. *Close report.* The close answer (§7.5) and `/x402/settle` (§7.6) report `cum` / `amount` as the
    gross state the client paid, with `payeeFee` and `payeeNet` alongside; `unpaidMsat` is
    `spentMsat − cum × 1000`. A fully paid payee-pays channel reports `unpaidMsat: "0"`, never the
    provider's close fee: a client that trusts `unpaidMsat` must not think it owes the fee. (The
@@ -761,7 +747,7 @@ Everything else (scripts, keys, sighash, auth, envelopes) is unchanged.
 - v1.2, `payeePays`: a payee-pays channel's five states from `minCum` to `capacity` (one with the client's
   change at exactly 546, one where it is dropped), a close, the `0xA3` state, a rollover, a conditional
   state at `uncond = minCum`, the v1.1 signature for the same `cum` refused (`bad_sig`), a state below
-  `minCum` refused (`bad_amount`), the provider's `/terms` and a hub-bound open echoing
+  `minCum` refused (`bad_amount`), the provider's `/terms` and an open echoing
   `closeFeePayer` and `minCum`, and (`payeePays.close`) ten 150-sat calls closed at `cum` 1,500: the
   close transaction, the close answer `{cum:"1500", unpaidMsat:"0", payeeFee:"600", payeeNet:"900"}` and
   the same close through `/x402/settle` (`amount` 1500, the fee fields in `extra`).
@@ -780,9 +766,8 @@ and the pure-Python backend.
 Not breaking (absent `closeFeePayer` is v1.1):
 - **`closeFeePayer`** (§12): `"payer"` or `"payee"`, in `extra`, `/terms`, the open and its answer;
   the state, `0xA3`, rollover and conditional formats under `"payee"`; `minCum`; the settlement
-  threshold on the provider's net payout; `settle_early`; `bad_fee_payer`; the hub's
-  `extra.routing.ch1CloseFeePayer` / `ch2CloseFeePayer`. Hub-funded routed channels default to `"payee"`.
-- **Payee-pays close report** (§7.5, §7.6, §12 item 8): `cum` / `amount` are the gross state, with
+  threshold on the provider's net payout; `settle_early`; `bad_fee_payer`.
+- **Payee-pays close report** (§7.5, §7.6, §12 item 7): `cum` / `amount` are the gross state, with
   `payeeFee` and `payeeNet`; `unpaidMsat` = spent − gross. Payer-pays answers are unchanged.
 - **Test vectors** (§13): the `payeePays` section; every v1.1 section unchanged.
 
@@ -857,7 +842,7 @@ Codes in the 402 `error` field and in `400 {"error"}` answers of the control end
 `bad_hashlock`, `conditional_outstanding`, `insufficient_payment`, `channel_exhausted`,
 `coinbase_funding`, `bad_funding`, `unknown_funding`, `bad_capacity`, `bad_expiry`, `bad_payer_spk`,
 `wrong_network`, `duplicate_channel`, `close_failed` (close and watcher only); v1.2: `bad_fee_payer`
-(open), `settle_early` (a routed channel's rollover, §12).
+(open), `settle_early` (a payee-pays channel's rollover, §12).
 
 The facilitator answers (§7.6) carry the upstream-style name of the same code in
 `invalidReason` / `errorReason`: `invalid_batch_settlement_xbt_<code>`, except `unsupported_scheme_or_network` →

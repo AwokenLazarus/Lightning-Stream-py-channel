@@ -88,15 +88,6 @@ class ThePaths(unittest.TestCase):
         self.assertEqual(r.get(), 200, "control: the seller's own spelling is paid")
         self.assertEqual(sorted(r.c.channels), [O])
 
-    def test_a_routed_session_is_not_started_at_such_a_url(self):
-        import routehelp as R
-        node, net = R.RouteNode(), R.Net()
-        pay = R.payer(node, net)
-        asked = []
-        pay.http = lambda *a, **k: asked.append(a)
-        self.refused(lambda: pay.shard("http://127.1:8402/v1/chunk"))
-        self.assertEqual(asked, [])
-
 
 if __name__ == "__main__":
     unittest.main()

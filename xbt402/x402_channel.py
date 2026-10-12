@@ -51,7 +51,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional
 
@@ -367,27 +367,11 @@ def settlement_response(receipt: dict, network: str, payer: str, success: bool) 
             "extra": {"chargedAmount": receipt["charged"], "receipt": receipt}}
 
 
-def locks_open(st) -> bool:
-    """A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
-    (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
-    have to pay on its ch2. Closing ch1 now would close below it, and so would rolling it over: both
-    spend its funding (AGP-078)."""
-    ex = st.extra or {}
-    if ex.get("route_lock"):
-        return True
-    def above(s) -> bool:
-        try:
-            return int(s["cum"]) > st.best_cum
-        except (KeyError, TypeError, ValueError):
-            return True
-    return any(above(s) for s in ex.get("stale_locks") or [])
-
-
 def intent_open(st) -> bool:
     """A close or rollover of this channel was signed and written ahead (`close_intent`, M8) and is not
     recorded as its close yet: the node answered the broadcast with an error, or we stopped before its
     answer. That transaction is complete and can still confirm, so the channel takes no state above it
-    (AGP-084): no paid call, no routed lock. It ends when the node shows the spend (`_adopt_intent`: the
+    (AGP-084): no paid call. It ends when the node shows the spend (`_adopt_intent`: the
     latest intent or one it replaced, AGP-085),
     when the watcher gets a close through, or when the client rolls over or closes again."""
     return not st.closed_txid and bool((st.extra or {}).get("close_intent"))
@@ -503,12 +487,11 @@ class XbtChannelProvider:
                  close_fee: int = 600, close_margin: int = 144, policy: FundingPolicy = None,
                  charge: Callable = None, hrp: str = "bcrt", height_ttl: float = 2.0, claim_fee: int = 300,
                  max_body: int = MAX_BODY, route_max_body: Dict[str, int] = None, settle_multiple: int = 20,
-                 close_fee_payer: str = "payer", route_close_fee_payer: str = "payee", rollover_grace: int = 36,
-                 rollover_zero_conf_max: int = None, route_wal: str = None, settle_lock_multiple: int = 4,
+                 close_fee_payer: str = "payer", rollover_grace: int = 36,
                  close_bump_max_fee: int = 10_000, close_min_feerate: float = 1.0, close_bump_blocks: int = 3):
         if billing not in ("postpay", "prepay"):
             raise ValueError("billing is postpay or prepay")
-        if close_fee_payer not in FEE_PAYERS or route_close_fee_payer not in FEE_PAYERS:
+        if close_fee_payer not in FEE_PAYERS:
             raise ValueError("close fee payer is payer or payee")
         if int(max_body) < 1:
             raise ValueError("max_body must be >= 1")
@@ -518,10 +501,9 @@ class XbtChannelProvider:
         self._payees: Dict[str, Payee] = {}     # per channel: its secret and params, derived once (L13)
         self.ledger, self.price, self.handler, self.charge = Ledger(ledger_path), price, handler, charge
         self.billing, self.close_fee, self.close_margin, self.hrp = billing, close_fee, close_margin, hrp
-        # v1.2 closeFeePayer: plain channels keep payer-pays (v1.1) unless configured; channels a hub
-        # funds to this provider (routed ch2) default to payee-pays (2026-09-28): the provider
-        # pays its own settlement, so settle_due counts it against the net payout
-        self.close_fee_payer, self.route_close_fee_payer = close_fee_payer, route_close_fee_payer
+        # v1.2 closeFeePayer: channels keep payer-pays (v1.1) unless configured. Under payee-pays the
+        # provider pays its own settlement, so settle_due counts it against the net payout
+        self.close_fee_payer = close_fee_payer
         self.rollover_grace = int(rollover_grace)   # blocks before the close margin a rollover is due anyway
         self.claim_fee = claim_fee      # sats the hash-lock claim pays out of condAmount (M6)
         # AGP-067 (review C1): the watcher bumps a close still unconfirmed before expiry with a CPFP child
@@ -535,24 +517,8 @@ class XbtChannelProvider:
         self._auth_keys: Dict[str, bytes] = {}
         self.max_body = int(max_body)
         self.route_max_body = dict(route_max_body or {})
-        # AGP-021 hub routing: routed paths, their sessions and the adaptor-locked ch2 states
-        from .route import RouteSeller
         self.settle_multiple = int(settle_multiple)   # settle once the net payout >= this x closeFee (settle_due)
-        # AGP-053 make-before-break: a hub-bound channel's rollover child is taken unconfirmed (its parent
-        # is our own confirmed channel, and only we can sign a conflicting spend of it before its expiry),
-        # up to this cum while it stays unconfirmed. None: two settlements' worth; 0: never (open at minConf)
-        self.rollover_zero_conf_max = (2 * self.settle_multiple * int(close_fee) if rollover_zero_conf_max is None
-                                       else int(rollover_zero_conf_max))
-        # AGP-056: a hub rolls a ch2 over at settle_lock_multiple x the largest lock when that is above
-        # our threshold (locks larger than settleMultiple x closeFee), so the default cap follows it: two
-        # such settlements' worth. An explicit rollover_zero_conf_max is used as it is
-        self._zc_max_fixed = rollover_zero_conf_max is not None
-        self.settle_lock_multiple = int(settle_lock_multiple)
-        # AGP-054 route_wal: a path makes each routed session's meter (seq, calls, accrued) durable
-        # before its ROUTE-STATE leaves, written ahead while the handler runs (offer_route precharge)
-        self.routes = RouteSeller(self, (ledger_path[:-5] if ledger_path.endswith(".json") else ledger_path)
-                                  + ".routes.json", wal_path=route_wal)
-        # AGP-059: direct calls between their reservation and their settlement, per channel; and the
+        # AGP-059: calls between their reservation and their settlement, per channel; and the
         # (chan, msat) reservations refunded now, which a crash mid-call left recorded: never charged
         self._in_call: dict = {}
         self.recovered_reservations = self._recover_reservations()
@@ -582,34 +548,13 @@ class XbtChannelProvider:
         else:
             self._in_call.pop(chan, None)
 
-    def offer_route(self, path: str, window: float = 1.0, lock_wait: float = 2.0, invoice_ttl: float = 15.0,
-                    hubs="any", amsat_per_call: int = 0, unit: str = "call", credit_msat: int = 0,
-                    charge: Callable = None, precharge: Callable = None):
-        """Sell `path` through hubs (AGP-021). Its 402 carries `extra.route`: the signed price quote and,
-        for a client that names its route key (ROUTE-CLIENT header), a session with a fresh lock point
-        T per window, signed by payTo. Calls carry ROUTE-AUTH and are metered in amsat
-        (`amsat_per_call`, or `charge(method, path, status, body) -> amsat`); each window's accrued
-        amount is paid by one adaptor-locked ch2 state from a hub. A session is served while its
-        unpaid charges are younger than `window + lock_wait` (the lock wait is configurable).
-
-        With a `route_wal` (AGP-054), `precharge(method, path, body) -> amsat` is what the call will
-        bill, known before it runs (a flat path needs none: amsat_per_call). Its session's meter is
-        then written ahead while the handler runs, and the answer waits only for what is left of that
-        fsync. A charge that differs from it costs one more fsync; None or an exception: no overlap."""
-        o = self.routes.offer(path, window=window, lock_wait=lock_wait, invoice_ttl=invoice_ttl, hubs=hubs,
-                              amsat_per_call=amsat_per_call, unit=unit, credit_msat=credit_msat)
-        o.charge = charge
-        o.precharge = precharge
-        return o
-
     def terms(self) -> dict:
-        """GET /x402/xbt-channel/terms: the requirements a hub needs to open (and roll over) a
-        hub-funded channel to this provider without a paid call first."""
+        """GET /x402/xbt-channel/terms: this provider's requirements without a paid call first (the
+        price is 0), with its settlement terms. `closeFeePayer` is always named here, "payer" too."""
         req = self.requirements(0)
         req["extra"]["settleMultiple"] = self.settle_multiple
-        req["extra"]["closeFeePayer"] = self.route_close_fee_payer    # for hub-funded channels (v1.2)
+        req["extra"]["closeFeePayer"] = self.close_fee_payer
         req["extra"]["rolloverGraceBlocks"] = self.rollover_grace
-        req["extra"]["routes"] = sorted(self.routes.offers)
         return req
 
     def body_limit(self, path: str, max_body: int = None) -> int:
@@ -661,12 +606,11 @@ class XbtChannelProvider:
         ecc._decode_pub(payer_pub)
         payer_spk = check_payout_spk(c["payerSpk"]) if c.get("payerSpk") else ""
         # v1.2 closeFeePayer: payer-pays (v1.1, the default) is always accepted, since it only costs the
-        # payer; payee-pays only where this provider offered it (hub-bound channels: /terms; plain
-        # channels: its 402). The funding script does not depend on it, so it is fixed here, at open,
-        # and every state both sides build from these params carries it.
+        # payer; payee-pays only where this provider offered it (its 402 and /terms). The funding
+        # script does not depend on it, so it is fixed here, at open, and every state both sides build
+        # from these params carries it.
         fee_payer = c.get("closeFeePayer", "payer")
-        offered = self.route_close_fee_payer if req.get("hub") else self.close_fee_payer
-        if fee_payer not in ("payer", offered):
+        if fee_payer not in ("payer", self.close_fee_payer):
             raise ChannelError("bad_fee_payer", f"closeFeePayer {fee_payer!r} not offered for this channel")
         # v1.1 derivation only: a redeemScript built with the v1.0 tweak (no network) fails here
         p = ChannelParams.derive(self.pay_to, payer_pub.hex(), int(c["expiry"]), self.close_fee, payer_spk,
@@ -677,48 +621,15 @@ class XbtChannelProvider:
             return self._open_preflight(p, c)
         chan = canonical_chan(f"{c['txid']}:{int(c['vout'])}")
         p.funding_txid, p.funding_vout, p.capacity = chan.split(":")[0], int(c["vout"]), int(c["capacity"])
-        hub = ""
-        if req.get("hub"):
-            # a hub-funded routing channel (AGP-021): the hub's payTo signs the channel id, and only
-            # locks relayed for that hub are completed on this channel
-            from .route import hub_channel_message
-            hub = str(req["hub"].get("payTo", ""))
-            if not ecc.verify(bytes.fromhex(hub), hub_channel_message(p.channel_id), bytes.fromhex(req["hub"]["sig"])):
-                raise ChannelError("bad_sig", "hub binding not signed by the hub's payTo")
         with self.ledger.lock:
             if p.channel_id in self.ledger.channels:
                 raise ChannelError("duplicate_channel")
-            zc = None
-            try:
-                confs = check_funding(self.rpc, p, self.policy)
-            except ChannelError as e:
-                zc = self._zero_conf_child(p, hub) if e.code == "unconfirmed" else None
-                if zc is not None:
-                    confs = check_funding(self.rpc, p, replace(self.policy, zero_conf_max=p.capacity))
-                elif e.code == "unconfirmed" and hub:
-                    # AGP-057: not a child we take unconfirmed. A block that came while we looked makes it
-                    # neither: the funding read above had no confirmation yet, and the parent is now spent
-                    # in that block. Look at the funding once more (still unconfirmed: the same refusal)
-                    confs = check_funding(self.rpc, p, self.policy)
-                else:
-                    raise
+            confs = check_funding(self.rpc, p, self.policy)
             st = self.ledger.channels[p.channel_id] = ChannelState(p)
-            if hub:
-                st.extra = {"hub": hub}
-                # a rollover child carries its line's largest lock on (AGP-056: the next child's cap)
-                big = max((int((s.extra or {}).get("max_lock", 0)) for s in self.ledger.channels.values()
-                           if (s.extra or {}).get("rollover_to") == p.channel_id and (s.extra or {}).get("hub") == hub),
-                          default=0)
-                if big:
-                    st.extra["max_lock"] = big
-            if zc:
-                st.extra["zero_conf"] = zc
             self.ledger.save(st)
         out = {"chan": p.channel_id, "expiry": p.expiry, "maxCum": str(p.max_amount), "confirmations": confs}
         if p.close_fee_payer != "payer":
             out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
-        if zc:
-            out["zeroConf"] = {"parent": zc["parent"], "maxCum": str(zc["maxCum"]), "until": zc["until"]}
         return out
 
     def _open_preflight(self, p: ChannelParams, c: dict) -> dict:
@@ -737,68 +648,6 @@ class XbtChannelProvider:
         if p.close_fee_payer != "payer":
             out.update(closeFeePayer=p.close_fee_payer, minCum=str(p.min_amount))
         return out
-
-    def _zero_conf_child(self, p: ChannelParams, hub: str) -> Optional[dict]:
-        """AGP-053: the unconfirmed channel `p` is the rollover child of one of our hub-bound channels
-        (the tx we co-signed and broadcast, `rollover_to`), bound to the same hub, whose own funding is
-        confirmed (conf_for) and which is before its close margin: take it now, bounded (`zero_conf` on
-        the child). Before the parent's expiry only this provider can sign a spend of the parent other
-        than that rollover, so the child exists unless we replace it ourselves, or the rollover is still
-        unconfirmed at the parent's expiry (the payer's refund): locks are taken until `until` only."""
-        if not hub or self.rollover_zero_conf_max <= 0:
-            return None
-        cid = p.channel_id
-        parent = next((s for s in self.ledger.channels.values()
-                       if (s.extra or {}).get("rollover_to") == cid and (s.extra or {}).get("hub") == hub), None)
-        if parent is None:
-            return None
-        pp = parent.params
-        need = self.policy.conf_for(pp.capacity)
-        until = pp.expiry - self.close_margin
-        if self.height() >= until or not self._confirmed(pp.funding_txid, pp.funding_vout, need):
-            return None
-        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
-            return None
-        return {"parent": pp.channel_id, "need": need, "maxCum": self.zero_conf_max_for(parent), "until": until,
-                "confirmed": False}
-
-    def zero_conf_max_for(self, parent: ChannelState) -> int:
-        """The most a rollover child of `parent` takes while unconfirmed: rollover_zero_conf_max, and by
-        default (AGP-056) at least 2 x settle_lock_multiple x the largest lock the parent's line took, so
-        a provider paid in locks larger than its settle threshold is not capped below one lock."""
-        if self._zc_max_fixed:
-            return self.rollover_zero_conf_max
-        big = int((parent.extra or {}).get("max_lock", 0))
-        return max(self.rollover_zero_conf_max, 2 * self.settle_lock_multiple * big)
-
-    def _confirmed(self, txid: str, vout: int, need: int) -> bool:
-        """The output is in a block with `need` confirmations (spent in the mempool or not)."""
-        utxo = self.rpc.gettxout(txid, vout, False)
-        return utxo is not None and utxo.get("confirmations", 0) >= need
-
-    def _zc_confirmed(self, st: ChannelState, live: bool = False) -> bool:
-        """Not an unconfirmed rollover child (AGP-053): a plain channel, or a child that confirmed (as
-        the watcher last saw it, or `live` from the node now; the caller holds the ledger lock)."""
-        zc = (st.extra or {}).get("zero_conf")
-        if not zc or zc.get("confirmed"):
-            return True
-        if live and self._confirmed(st.params.funding_txid, st.params.funding_vout, self.policy.conf_for(st.params.capacity)):
-            st.extra = {**st.extra, "zero_conf": {**zc, "confirmed": True}}
-            self.ledger.save(st)
-            return True
-        return False
-
-    def _zero_conf_ok(self, st: ChannelState, h: int) -> bool:
-        """An unconfirmed rollover child (AGP-053) is served while it is in the mempool, its parent
-        still has its confirmations (a reorg of the parent ends it), and before the parent's margin."""
-        zc = (st.extra or {}).get("zero_conf")
-        if not zc or h >= zc["until"]:
-            return False
-        p = st.params
-        if self.rpc.gettxout(p.funding_txid, p.funding_vout, True) is None:
-            return False
-        ptxid, pvout = zc["parent"].split(":")
-        return self._confirmed(ptxid, int(pvout), zc["need"])
 
     def settle_due(self, p: ChannelParams, cum: int, tip: int = None, margin: int = 0) -> bool:
         """This provider's settlement policy (cmp CONTRACT "Settlement policy", AGP-023): settle once
@@ -878,10 +727,6 @@ class XbtChannelProvider:
                           bytes.fromhex(req["sig"])):
             raise ChannelError("bad_sig", "close request not signed by the payer")
         with self.ledger.lock:
-            # AGP-064 (H1): a hub's route() writes its lock and lets go of the ledger before it forwards,
-            # so a close here could otherwise land between the two
-            if not st.closed_txid and locks_open(st):
-                raise ChannelError("lock_pending", "a routed lock is open on this channel")
             # AGP-084: an earlier spend the node has after all is this channel's close, before a new
             # close replaces its intent
             self._adopt_intent(st)
@@ -898,19 +743,12 @@ class XbtChannelProvider:
         cooperative close's answer: chan, txid, cum, unpaidMsat (and payeeFee/payeeNet under payee-pays).
 
         Refused with a ChannelError, nothing changed: unknown_channel; channel_closed (already closed
-        or rolled over); lock_pending (a routed lock is open on it); hub_channel (a hub-funded ch2:
-        its hub rolls it over or closes it, and the margin close still protects it); call_in_flight
-        (a paid call is being served: the best state does not cover it yet); no_state (nothing
-        signed)."""
+        or rolled over); call_in_flight (a paid call is being served: the best state does not cover
+        it yet); no_state (nothing signed)."""
         st = self._channel(chan)
         with self.ledger.lock:
-            ex = st.extra or {}
             if st.closed_txid:
                 raise ChannelError("channel_closed", f"closed by {st.closed_txid}")
-            if locks_open(st):
-                raise ChannelError("lock_pending", "a routed lock is open on this channel")
-            if ex.get("hub"):
-                raise ChannelError("hub_channel", "a hub-funded channel is rolled over or closed by its hub")
             if self._in_call.get(st.params.channel_id):
                 raise ChannelError("call_in_flight", "a paid call is being served on this channel")
             if not (st.best_sig or st.cond_sig):
@@ -1219,26 +1057,14 @@ class XbtChannelProvider:
         # AGP-084: a close the node answered with an error is sent again every tick. The channel takes
         # no state until then, so it is the same close. Never a rollover: its client was told it failed
         # and may no longer hold the next channel's key
-        if intent_open(st) and not st.extra["close_intent"].get("next") and not locks_open(st):
+        if intent_open(st) and not st.extra["close_intent"].get("next"):
             out.append(self._close_locked(st))
             if st.extra.get("cond_close"):
                 self._claim(st)
             return
         utxo = self.rpc.gettxout(p.funding_txid, p.funding_vout, False)
         st.suspended = utxo is None or utxo.get("confirmations", 0) < self.policy.conf_for(p.capacity)
-        zc = (st.extra or {}).get("zero_conf")
-        if zc:
-            # AGP-053: confirmed (again, after a reorg) or not; unconfirmed, it is served under its rules
-            zc = {**zc, "confirmed": not st.suspended}
-            st.extra = {**st.extra, "zero_conf": zc}
-            if st.suspended and self._zero_conf_ok(st, h):
-                st.suspended = False
         if (st.best_sig or st.cond_sig) and h >= p.expiry - self.close_margin:
-            # AGP-064: a lock in flight (seconds: the hub's revealTimeout) is let finish, in the first half
-            # of the margin only. Never for a written-off lock: a skipped margin close lets the payer
-            # refund the whole channel at expiry
-            if (st.extra or {}).get("route_lock") and h < p.expiry - (self.close_margin + 1) // 2:
-                return
             out.append(self._close_locked(st))
             if st.extra.get("cond_close"):
                 self._claim(st)           # raises (recorded in close_error) if the claim did not go out
@@ -1479,13 +1305,9 @@ class XbtChannelProvider:
         channel, one tx that pays this provider `amount` (at least its best state) and funds the next
         channel with the rest less the close fee (ChannelParams.rollover_tx). The payer's signature
         over that exact tx is the authorisation. The next channel opens through extra.openUrl once it
-        confirms. Refused `lock_pending`, as a close is, while a routed lock is open on the channel,
-        whatever `amount`."""
+        confirms."""
         st = self._channel(req["chan"])
         p = st.params
-        with self.ledger.lock:
-            if not self._zc_confirmed(st, live=True):
-                raise ChannelError("unconfirmed", "the channel's funding (a rollover) is not confirmed yet")
         amount, nxt = int(req["amount"]), req["next"]
         payer_pub = bytes.fromhex(nxt["payerPub"])
         ecc._decode_pub(payer_pub)
@@ -1518,10 +1340,6 @@ class XbtChannelProvider:
             self._adopt_intent(st)
             if st.closed_txid:
                 raise ChannelError("channel_closing", "already settled")
-            # AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
-            # ledger lock that is held until the rollover is sent: route() writes its lock under it too
-            if locks_open(st):
-                raise ChannelError("lock_pending", "a routed lock is open on this channel")
             if amount < st.best_cum:
                 raise ChannelError("bad_amount", f"a rollover pays at least the best state {st.best_cum}")
             txid = tx.txid()
@@ -1541,123 +1359,6 @@ class XbtChannelProvider:
             self.ledger.save(st)
         return {"chan": p.channel_id, "txid": txid, "amount": amount, "nextChan": f"{txid}:1",
                 "nextCapacity": next_cap}
-
-    def _route_lock(self, method: str, bind: str, headers: dict, body: bytes):
-        """POST /x402/xbt-channel/lock: a hub's adaptor-locked state on its ch2 to us. Authenticated
-        like a paid call (the hub's channel HMAC covers the JSON body with the route terms)."""
-        def err(code, detail="", status=400):
-            return status, {"Content-Type": "application/json"}, json.dumps({"error": code, "detail": detail}).encode()
-        hdr = {k.upper(): v for k, v in headers.items()}.get("PAYMENT-SIGNATURE")
-        try:
-            pl = unb64json(hdr)["payload"]
-            route = json.loads(body)["route"]
-            if not isinstance(pl, dict) or not isinstance(route, dict):
-                raise TypeError("objects expected")
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return err("bad_payload")
-        with self.ledger.lock:
-            try:
-                st = self.ledger.channels.get(canonical_chan(pl.get("chan")))
-            except ChannelError:
-                st = None
-            if not st:
-                return err("unknown_channel")
-            if not self._authentic(st, pl, method, bind, body):
-                return err("bad_auth", status=401)
-            st.seq = int(pl["seq"])                               # spent, whatever happens next
-            # AGP-078 (review T4): the seq is durable before any answer that did not write it (or the
-            # error that ended the request) leaves. Kept only in memory it came back after a restart,
-            # and the refused header authenticated again
-            try:
-                resp, saved = self._lock_authed(st, pl, route, err)
-            except BaseException:
-                self.ledger.save(st)
-                raise
-            if not saved:
-                self.ledger.save(st)
-            return resp
-
-    def _lock_authed(self, st, pl: dict, route: dict, err):
-        """A /lock whose auth passed and whose seq is in `st` (the ledger lock is the caller's): the
-        answer, and whether `st` was written to disk on the way to it."""
-        # AGP-084: nor on a ch2 whose close or rollover the node errored on (it can still confirm)
-        if closing(st) or self.height() >= st.params.expiry - self.close_margin:
-            return err("channel_closing"), False
-        if st.suspended:
-            # AGP-057: `suspended` is the watcher's last look, and a block that came during that look
-            # leaves a rollover child suspended although it confirmed (the parent was then spent in a
-            # block, so it was no zero-conf child either). A hub looks at the chain itself before it
-            # sends a lock: so do we before refusing one on an unconfirmed child
-            zc = (st.extra or {}).get("zero_conf")
-            if not (zc and not zc.get("confirmed") and self._zc_confirmed(st, live=True)):
-                return err("unconfirmed"), False
-            st.suspended = False
-        if not self._zc_confirmed(st):
-            # AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
-            zc = st.extra["zero_conf"]
-            try:
-                cum = int(pl.get("cum"))
-            except (TypeError, ValueError):
-                return err("bad_payload"), False
-            # past a bound: look at the chain first (it may have confirmed since the watcher's tick)
-            if (self.height() >= zc["until"] or cum > zc["maxCum"]) and not self._zc_confirmed(st, live=True):
-                if self.height() >= zc["until"]:
-                    return err("unconfirmed", "rollover unconfirmed at the parent's close margin"), False
-                return err("zero_conf_cap", f"cum {cum} > {zc['maxCum']} while the rollover is unconfirmed"), False
-        # what the checks above changed (a child seen confirmed) is written with the seq: by
-        # complete_lock when it answers, by the caller when it refuses
-        try:
-            out = self.routes.complete_lock(st, pl, route)
-        except ChannelError as e:
-            return err(e.code, str(e)), False
-        return ((202 if "held" in out else 200), {"Content-Type": "application/json"}, json.dumps(out).encode()), True
-
-    def _routed_call(self, method: str, path: str, path_key: str, hdr: str, body: bytes, url: str):
-        from .route import AMSAT_PER_MSAT  # noqa: F401
-        o = self.routes.offers[path_key]
-        s, error = self.routes.begin_call(path_key, hdr, method, binding_url(url, path), body)
-        if error:
-            st, h, b = self._payment_required(url, self.price(method, path), error)
-            doc = json.loads(b)
-            doc["accepts"][0]["extra"]["route"] = self.routes.route_extra(path_key)
-            if s is not None:
-                rs = self.routes.refusal_state(s)
-                if rs is not None:
-                    doc["routeState"] = rs
-            h["PAYMENT-REQUIRED"] = b64json(doc)
-            return 402, h, json.dumps(doc).encode()
-        ticket = None
-        if self.routes.wal is not None:
-            expect = int(o.amsat_per_call) if not getattr(o, "charge", None) else None
-            if getattr(o, "precharge", None):
-                try:
-                    expect = o.precharge(method, path, body)
-                except Exception:  # noqa: BLE001 - a bad hint only costs the overlap
-                    expect = None
-            if expect is not None:
-                ticket = self.routes.reserve(s, int(expect))
-        try:
-            status, hdrs, out = self.handler(method, path, body)
-        except BaseException:
-            self.routes.cancel(s, ticket)
-            raise
-        if unsafe_headers(hdrs):
-            status, hdrs, out = 500, {}, b"handler returned a header with CR/LF"
-        charge = int(o.amsat_per_call)
-        if getattr(o, "charge", None):
-            charge = int(o.charge(method, path, status, out))
-        if status >= 500:
-            charge = 0
-        try:
-            state = self.routes.end_call(s, max(0, charge), ticket)
-        except ChannelError as e:
-            if e.code != "route_wal_failed":
-                raise
-            return 500, {"Content-Type": "application/json"}, json.dumps(
-                {"error": "route_wal_failed", "detail": "the route meter is not durable: this call is not billed"}).encode()
-        hdrs = dict(hdrs)
-        hdrs["ROUTE-STATE"] = b64json(state)
-        return status, hdrs, out
 
     def offer_conditional(self, path: str, price: int, plaintext: bytes, k: bytes = None):
         """Prepare a hash-locked deliverable for `path`. Returns (H, ciphertext, k). The 402 carries
@@ -1694,10 +1395,6 @@ class XbtChannelProvider:
                 return 400, {"Content-Type": "application/json"}, json.dumps(
                     {"error": getattr(e, "code", "bad_request"), "detail": str(e)}).encode()
         bind = binding_url(url, path)
-        if path == "/x402/xbt-channel/lock":
-            if method != "POST":
-                return 405, {}, b"method not allowed"
-            return self._route_lock(method, bind, headers, body)
         if path == "/x402/xbt-channel/terms" and method == "GET":
             return 200, {"Content-Type": "application/json"}, json.dumps(self.terms()).encode()
         if path.startswith("/x402/xbt-channel/"):
@@ -1713,20 +1410,9 @@ class XbtChannelProvider:
         url = url or path
         uh = {k.upper(): v for k, v in headers.items()}
         path_key = path.split("?", 1)[0]
-        if path_key in self.routes.offers and uh.get("ROUTE-AUTH") and not uh.get("PAYMENT-SIGNATURE"):
-            return self._routed_call(method, path, path_key, uh["ROUTE-AUTH"], body, url)
         price = self.price(method, path)
         hdr = uh.get("PAYMENT-SIGNATURE")
         cond_offers = getattr(self, "_cond", {})
-        if not hdr and path_key in self.routes.offers:
-            status, h, b = self._payment_required(url, price, "payment_required")
-            doc = json.loads(b)
-            try:
-                doc["accepts"][0]["extra"]["route"] = self.routes.route_extra(path_key, uh.get("ROUTE-CLIENT", ""))
-            except (ValueError, TypeError):
-                return 400, {}, b"bad ROUTE-CLIENT key"
-            h["PAYMENT-REQUIRED"] = b64json(doc)
-            return 402, h, json.dumps(doc).encode()
         if not hdr:
             status, h, b = self._payment_required(url, price, "payment_required")
             if path_key in cond_offers:
@@ -2163,9 +1849,8 @@ class XbtChannelClient:
     def http(method, url, body=b"", headers=None, timeout=30):
         """One request, one answer. A 3xx is returned as the answer and never followed (AGP-080 X1, as
         the Rust transport): a payer that checked the origin against an allowlist must not be sent on
-        to another host, least of all with its PAYMENT-SIGNATURE header. `timeout` (AGP-105: the hub's
-        check of a lock asks with its revealTimeoutSec) is urllib's: for the connect and for each read,
-        not for the whole answer."""
+        to another host, least of all with its PAYMENT-SIGNATURE header. `timeout` is urllib's: for
+        the connect and for each read, not for the whole answer."""
         req = urllib.request.Request(url, body or None, headers or {}, method=method)
         try:
             with _NO_REDIRECT.open(req, timeout=timeout) as r:
@@ -2232,8 +1917,6 @@ class XbtChannelClient:
         if ch.stage == "funded":
             self._post_open(ch)
         return ch
-
-    _open = _ensure_open        # the routed client opens its ch1 through the same function
 
     def _key_channel(self, origin: str, acc: dict):
         """Terms, a key and the preflight for a new channel, on the books before anything is funded."""

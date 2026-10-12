@@ -1,9 +1,15 @@
 # Limits
 
-This is the Python reference for the channel, the HTTP 402 wire, the routed client and the hub.
-The limits of the design, and what no review has covered, are stated once, in `docs/LIMITS.md` of
-the Rust workspace (Lightning Stream). Every sentence there about the channel, the transport, the
-routed client and the hub holds here too, unless this file says otherwise. Read that file first.
+This is the Python reference for the on-chain one-way channel and its HTTP 402 wire. The limits
+of the design, and what no review has covered, are stated once, in `docs/LIMITS.md` of the Rust
+workspace (Lightning Stream). Every sentence there about the channel and the transport holds here
+too, unless this file says otherwise. Read that file first.
+
+Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning (stream tickets
+on ordinary XBT Lightning channels, in design). The channel this repository implements is
+**frozen**: kept and tested, off the main path, with no new work. The hub and the routed client
+were retired on that day and removed from this tree; the limits stated for them here went with
+them. That code is in the git history, last at commit `dfd6791`.
 
 Status: reference, test networks only. Nobody outside the project has reviewed the fixes that
 followed the external review of October 2026.
@@ -16,14 +22,10 @@ passes while the limit holds and fails when someone lifts it.
 ### Funding
 
 - The wallet hook is a bare function (`fund`): it cannot say whether a call that raised had
-  already sent. A retry after such a call pays the same script again, in the library client and in
-  the routed client; the key is on the books, so every output is refundable after the expiry, but
+  already sent. A retry after such a call pays the same script again; the key is on the books, so every output is refundable after the expiry, but
   the client holds a refund for the last one only and its budget counts one. An embedder whose
   `fund` can fail after it sent must make it answer the send it made when asked again for the same
-  address. The Rust routed client asks its wallet instead and does not fund twice. *(test)*
-- A hub channel that was recorded and never funded, and is too near its expiry, is derived again
-  and funded by the same call; the Rust routed client refuses to open until its owner removes the
-  record.
+  address. *(test)*
 - A signer here does not record what it funded, so a funding whose answer was lost is not found
   again through the signer, as it is in the Rust workspace.
 
@@ -42,17 +44,14 @@ passes while the limit holds and fails when someone lifts it.
   undo the last save.
 - Keys cannot be wiped from memory in Python.
 
-### Hub
+### Retired with the hub
 
-- The Python hub has no start-up checks and no status page: it does not refuse a node on the
-  wrong chain, and `python -m xbt402.hub` leaves the funding fee to the node wallet (on a node
-  with no estimate, its fallback rate).
-- The hub's question to a provider about a lock is bounded per socket read by the shipped
-  transport, not for the whole answer.
-- The two hub limits the Rust tests pin (a close mined, reorganised out and mined again with a
-  scan that gives no depth; a completion the hub's own ledger did not take on a close already six
-  blocks deep) hold here from reading; no Python test pins them.
-- Nine of the 22 hub tests of the fifth fix round have no twin here.
+- An open request that still carries a `hub` field is opened as an ordinary channel; the field is
+  ignored. `/x402/xbt-channel/lock` answers 404.
+- A provider ledger written by an earlier version, with channels a hub funded or routed locks
+  recorded on them, loads, and those channels are treated as ordinary ones.
+- `/x402/xbt-channel/terms` of a provider with default settings now says `closeFeePayer: "payer"`;
+  it said `"payee"`, the default for channels a hub funded.
 
 ### Server
 
@@ -61,11 +60,12 @@ passes while the limit holds and fails when someone lifts it.
 
 ## Open items
 
-None is marked in this repository. The two open items of the project are in the Rust workspace's
-`docs/LIMITS.md`; both are in the agent wallets.
+None is marked in this repository. The open items of the project are in the Rust workspace's
+`docs/LIMITS.md`.
 
 ## Not reviewed by anyone
 
-The project's audits read the Python hub where it mirrors the Rust changes, not whole, and did not
-read the MCP server beyond the lines a fix changed.
+The project's audits did not read the MCP server beyond the lines a fix changed. Nobody has
+reviewed the removal of the hub (2026-10-11): what was cut from the provider and the signer, and
+how records of the removed features are treated.
 Nothing here has run against a real network.
