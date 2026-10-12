@@ -245,7 +245,8 @@ ANNEX_TAG = 0x50          # the first byte of a taproot annex (BIP341)
 def unified_sighash(tx: Tx, prevouts: List[TxOut], index: int, script_type: int,
                     script_code: bytes, hash_type: int, leaf_hash: Optional[bytes] = None, *,
                     annex: Optional[bytes] = None, codesep_pos: int = NO_CODESEP) -> bytes:
-    """Port of Knots hf-sighash-opt-in `UnifiedSighash` (see bitkey-xbt xbt_unified.rs).
+    """Port of Bitcoin Knots' unified opt-in signature hash (`SIGHASH_UNIFIED`, by Kyle Santiago:
+    Knots branch hf-sighash-opt-in, specified in Knots' doc/unified-sighash.md; MIT, see NOTICE).
 
     Commits to every input's amount and scriptPubKey (like BIP341) for every script type.
     SHA-256d Bitcoin verifies a different message, so these signatures never replay there.

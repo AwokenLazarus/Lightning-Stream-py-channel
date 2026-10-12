@@ -39,6 +39,18 @@ Regtest scripts take a Bitcoin Knots 29.4.2 build (BLAKE2b) from the environment
 export XBT_BIN=/path/to/knots-29.4.2 XBT402_DATADIR=$(mktemp -d)
 ```
 
+## Credits
+
+The channel is Jeremy Spilman's one-way payment channel (bitcoin-development list, 20 April
+2013), in the `CHECKLOCKTIMEVERIFY` form BIP 65 (Peter Todd) describes. The wire is x402 v2
+(created by Coinbase, kept by the x402 Foundation), under the name of its `batch-settlement`
+scheme; the binding to XBT is ours and upstream does not define it. The consensus rules are
+Bitcoin Knots' (maintained by Luke Dashjr): the BLAKE2b proof of work is his, and the unified
+signature hash that `xbt402/tx.py` ports is Kyle Santiago's. Signing runs in libsecp256k1. The
+references, and the prior art of the design that replaced this channel, are in the Rust
+repository's [`docs/REFERENCES.md`](https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/REFERENCES.md).
+Code and data from others, with their licences: `NOTICE`.
+
 ## Licence
 
 MIT OR Apache-2.0. See `LICENSE-MIT`, `LICENSE-APACHE` and `NOTICE`.

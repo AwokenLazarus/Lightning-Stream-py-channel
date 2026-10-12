@@ -1,4 +1,4 @@
-"""x402 v2 scheme `batch-settlement` (XBT channel binding; `xbt-channel` accepted as an alias): HTTP 402 payments over XBT Spillman channels (xbt402 v1.1).
+"""x402 v2 scheme `batch-settlement` (XBT channel binding; `xbt-channel` accepted as an alias): HTTP 402 payments over XBT Spilman channels (xbt402 v1.1).
 
 Spec: docs/x402/xbt402-spec-v1.1-draft.md (was ~/notes/projects/lazarus-xbt/Research/P-003/B1 xbt402
 HTTP 402 payment channels.md). v1.1: the payee key commits to the network. v1.3 (AGP-068,

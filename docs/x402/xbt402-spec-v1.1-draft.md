@@ -71,7 +71,7 @@ Companion documents in this directory:
 xbt402 lets a client (typically an AI agent) pay an HTTP API per request, in XBT, with no on-chain
 transaction per request and no intermediary holding funds.
 
-It is a unidirectional payment channel in the style Jeremy Spillman described for Bitcoin in 2013,
+It is a unidirectional payment channel in the style Jeremy Spilman described for Bitcoin in 2013 (bitcoin-development list, 20 April 2013, "Anti DoS for tx replacement"; the `CHECKLOCKTIMEVERIFY` form is the one BIP 65 describes),
 carried in the headers of the x402 v2 protocol:
 1. The client locks funds once in an output that the provider and the client can spend together,
    and that returns to the client alone after a block height (`expiry`).

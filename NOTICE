@@ -14,8 +14,10 @@ It includes or builds on the work below. Each keeps its own licence and copyrigh
 `tests/data/unified_sighash.json` is copied unchanged from Bitcoin Knots,
 `src/test/data/unified_sighash.json` (branch `29.x-knots`,
 <https://github.com/bitcoinknots/bitcoin>). `tests/data/unified_sighash_ext.json` extends it with
-annex and codeseparator cases generated from the same Knots interpreter. Both are used under the
-MIT licence:
+annex and codeseparator cases whose hashes were computed by Knots' Python implementation
+(`test/functional/test_framework/script.py`). The unified opt-in signature hash and its vectors
+are by Kyle Santiago (Knots pull request 357, in Knots from 29.4.1; specified in Knots'
+`doc/unified-sighash.md`). Both files are used under the MIT licence:
 
 ```text
 The MIT License (MIT)
@@ -42,6 +44,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+### Bitcoin Knots and Bitcoin Core: rules ported into the Python
+
+`xbt402/tx.py` `unified_sighash` is our port of Knots' unified signature hash, and
+`tests/security/sechelp.py` `is_strict_der` is a port of Bitcoin Core's
+`IsValidSignatureEncoding` (BIP 66, Pieter Wuille). Both are under the MIT licence above.
+
 ### libsecp256k1
 
 Signing and verification of real keys goes through `coincurve`, which builds libsecp256k1
@@ -50,6 +58,17 @@ The pure-Python backend is a test oracle, not a constant-time implementation.
 
 ## Python libraries
 
-The tests and the demos install the packages in `requirements.txt` (coincurve, starlette, uvicorn,
-httpx, cryptography, mcp, anyio). They are not vendored. Their licence texts must accompany any
-distribution that includes them.
+The tests and the demos install the packages in `requirements.txt`: coincurve (MIT or
+Apache-2.0), starlette, uvicorn and httpx (BSD-3-Clause). Two files need a package that
+`requirements.txt` does not list: `xbt402/mcp_server.py` imports `mcp` (MIT) and
+`scripts/sealed_key.py` imports `cryptography` (Apache-2.0 or BSD-3-Clause). None is vendored.
+Their licence texts must accompany any distribution that includes them.
+
+## Standards and prior work
+
+Not code in this repository, but the design depends on them and the credit is theirs: Jeremy
+Spilman's one-way payment channel (2013) and BIP 65; x402 (<https://github.com/x402-foundation/x402>,
+Apache-2.0), created by Coinbase; BIP 66, 143, 173, 340 and 341; RFC 6979; Bitcoin Knots
+(<https://github.com/bitcoinknots/bitcoin>) for the BLAKE2b proof of work (Luke Dashjr), the
+unified signature hash and the reduced-data rules of BIP 110 (Dathon Ohm). References:
+<https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/REFERENCES.md>.
