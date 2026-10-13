@@ -4,13 +4,17 @@ Python reference for the on-chain one-way channel of Lightning Stream: HTTP 402 
 over a one-way payment channel, carried as the x402 v2 scheme `batch-settlement` (the `xbt-channel`
 name is accepted as an input alias for one release).
 
-**This channel is frozen.** On 2026-10-11 Lightning Stream was redirected onto Lightning: it adds
-stream tickets to ordinary XBT Lightning channels (in design, not built; see the Rust repository).
-The channel here is kept and tested, off the main path, with no new work. The hub, which routed
-payments between such channels, was retired the same day and removed from this tree: Lightning's
-routing does that job. Its code is in the git history, last at commit `dfd6791`.
+**This repository is an archived reference.** On 2026-10-11 Lightning Stream was redirected onto
+Lightning: it adds stream tickets to ordinary XBT Lightning channels, and tickets and a lottery now
+run end to end on regtest in the Rust repository. The on-chain channel was frozen that day, and in
+October 2026 it was removed from the Rust repository (its code there is in the git history, last
+at commit `2a31170`). This Python tree is what remains of the channel in public: the reference it
+was written against, with its tests and vectors, kept as it is and no longer developed. Nothing in
+the Rust repository is checked against it any more. The hub, which routed payments between such
+channels, was retired on 2026-10-11 and removed from this tree: Lightning's routing does that job.
+Its code is in the git history, last at commit `dfd6791`.
 
-**Status: reference, test networks only.** It has had an internal review, and it carries the fixes that followed an external review of the Rust tree and four follow-up audits of our own; some findings end as stated limits (`docs/LIMITS.md`; the open items are listed in the Rust repository). None of this is an independent audit. Do not
+**Status: archived reference, test networks only.** It has had an internal review, and it carries the fixes that followed an external review of the Rust tree and four follow-up audits of our own; some findings end as stated limits (`docs/LIMITS.md`; the open items are listed in the Rust repository). None of this is an independent audit. Do not
 use it with mainnet funds. The Rust implementation is [Lightning Stream](https://github.com/AwokenLazarus/Lightning-Stream).
 
 | Path | What |
